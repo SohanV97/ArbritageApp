@@ -1,0 +1,11 @@
+{
+  "name": "arbritage-app",
+  "private": true,
+  "scripts": {
+    "start": "npm start --prefix Arbritage_App",
+    "install:app": "npm install --prefix Arbritage_App",
+    "android": "npm run android --prefix Arbritage_App",
+    "ios": "npm run ios --prefix Arbritage_App",
+    "web": "npm run web --prefix Arbritage_App"
+  }
+}

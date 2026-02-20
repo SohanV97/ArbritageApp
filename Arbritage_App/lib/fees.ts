@@ -1,9 +1,5 @@
 import type { Venue } from './market-types';
 
-const POLYMARKET_FEELESS_MARKET_TYPES = new Set<string>([
-  // Placeholder for any specific tags or categories if you decide to filter later.
-]);
-
 export type PolymarketMarketKind = 'fee_free' | 'sports' | 'short_term_crypto';
 
 export interface PolymarketFeeParams {
