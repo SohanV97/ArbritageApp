@@ -1,3 +1,8 @@
+/**
+ * Polymarket API client (Gamma + CLOB).
+ * - API key: set EXPO_PUBLIC_POLYMARKET_API_KEY in Arbritage_App/.env → app.config.js extra.polymarketApiKey → sent as header POLY_API_KEY (optional for read).
+ * - Events: GET {POLYMARKET_GAMMA_API}/events?limit=&closed=false. Each event has markets with outcomePrices (JSON string "[yes, no]" 0–1), outcomes "[\"Yes\",\"No\"]".
+ */
 import Constants from 'expo-constants';
 import type { UnifiedMarket } from '@/lib/market-types';
 import type { PolymarketMarketKind } from '@/lib/fees';
@@ -51,12 +56,16 @@ interface ClobPriceRow {
   [key: string]: unknown;
 }
 
+/** outcomePrices maps 1:1 to outcomes: index 0 = Yes, 1 = No. Enforce yes+no ≈ 100. */
 function parseOutcomePrices(outcomePrices: string | undefined): { yes: number; no: number } {
   if (!outcomePrices) return { yes: 50, no: 50 };
   try {
     const arr = JSON.parse(outcomePrices) as string[];
-    const yes = Math.round(parseFloat(arr[0] ?? '0.5') * 100);
-    const no = Math.round(parseFloat(arr[1] ?? '0.5') * 100);
+    let yes = Math.round(parseFloat(arr[0] ?? '0.5') * 100);
+    let no = Math.round(parseFloat(arr[1] ?? '0.5') * 100);
+    yes = Math.max(1, Math.min(99, yes));
+    no = Math.max(1, Math.min(99, no));
+    if (yes + no < 99 || yes + no > 101) no = 100 - yes;
     return { yes, no };
   } catch {
     return { yes: 50, no: 50 };
