@@ -1,11 +1,9 @@
 import { useCallback, useState } from 'react';
 import type { ArbitrageOpportunity } from '@/lib/market-types';
-import type { PolymarketMarketWithKind } from '@/api/polymarket';
-import { getPolymarketMarkets } from '@/api/polymarket';
-import { getKalshiMarkets } from '@/api/kalshi';
+import { getPolymarketBasketballMarkets } from '@/api/polymarket';
+import { getKalshiBasketballMarkets } from '@/api/kalshi';
 import { matchMarkets } from '@/lib/matchMarkets';
 import { findArbitrageOpportunities, type PairWithKind } from '@/lib/arbitrage';
-import { isSportsMarket } from '@/lib/sports';
 
 export interface ArbStats {
   pmTotal: number;
@@ -26,13 +24,11 @@ export function useArbitrageOpportunities(options?: { minEdgePercent?: number })
     setError(null);
     try {
       const [pmMarkets, kalshiMarkets] = await Promise.all([
-        getPolymarketMarkets(80),
-        getKalshiMarkets(),
+        getPolymarketBasketballMarkets(120),
+        getKalshiBasketballMarkets(),
       ]);
-      const sportsPm = pmMarkets.filter((m) => isSportsMarket(m.question));
-      const sportsKalshi = kalshiMarkets.filter((m) =>
-        isSportsMarket(m.question, 'symbol' in m ? m.symbol : undefined)
-      );
+      const sportsPm = pmMarkets;
+      const sportsKalshi = kalshiMarkets;
 
       const pairs = matchMarkets(sportsPm, sportsKalshi, {
         minTitleSimilarity: 0.12,

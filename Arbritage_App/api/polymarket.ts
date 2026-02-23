@@ -49,6 +49,12 @@ interface GammaEvent {
   [key: string]: unknown;
 }
 
+interface GammaSportMetadata {
+  sport?: string;
+  tags?: string;
+  [key: string]: unknown;
+}
+
 /** CLOB price response */
 interface ClobPriceRow {
   price: string;
@@ -107,6 +113,22 @@ export async function fetchPolymarketEvents(limit = 100): Promise<GammaEvent[]> 
   const url = `${POLYMARKET_GAMMA_API}/events?limit=${limit}&closed=false`;
   const res = await fetch(url, { headers: polymarketHeaders() });
   if (!res.ok) throw new Error(`Polymarket Gamma: ${res.status}`);
+  const data = (await res.json()) as GammaEvent[];
+  return Array.isArray(data) ? data : [];
+}
+
+export async function fetchPolymarketSportsMetadata(): Promise<GammaSportMetadata[]> {
+  const url = `${POLYMARKET_GAMMA_API}/sports`;
+  const res = await fetch(url, { headers: polymarketHeaders() });
+  if (!res.ok) throw new Error(`Polymarket Gamma sports: ${res.status}`);
+  const data = (await res.json()) as GammaSportMetadata[];
+  return Array.isArray(data) ? data : [];
+}
+
+async function fetchPolymarketEventsByTag(tagId: string, limit = 100): Promise<GammaEvent[]> {
+  const url = `${POLYMARKET_GAMMA_API}/events?tag_id=${encodeURIComponent(tagId)}&limit=${limit}&active=true&closed=false`;
+  const res = await fetch(url, { headers: polymarketHeaders() });
+  if (!res.ok) throw new Error(`Polymarket Gamma tag ${tagId}: ${res.status}`);
   const data = (await res.json()) as GammaEvent[];
   return Array.isArray(data) ? data : [];
 }
@@ -192,4 +214,49 @@ export function normalizePolymarketMarkets(events: GammaEvent[]): PolymarketMark
 export async function getPolymarketMarkets(limit = 80): Promise<PolymarketMarketWithKind[]> {
   const events = await fetchPolymarketEvents(limit);
   return normalizePolymarketMarkets(events);
+}
+
+export async function getPolymarketBasketballMarkets(limit = 120): Promise<PolymarketMarketWithKind[]> {
+  const sports = await fetchPolymarketSportsMetadata();
+  const basketballSports = sports.filter((s) => {
+    const name = (s.sport ?? '').toLowerCase();
+    return name.includes('nba') || name.includes('college basketball') || name.includes('ncaab');
+  });
+
+  const tagIds = new Set<string>();
+  for (const s of basketballSports) {
+    const raw = (s.tags ?? '').trim();
+    if (!raw) continue;
+    raw
+      .split(',')
+      .map((t) => t.trim())
+      .filter(Boolean)
+      .forEach((t) => tagIds.add(t));
+  }
+
+  // Fallback: if sports metadata doesn't include tags, just return empty rather than fetching everything.
+  if (tagIds.size === 0) return [];
+
+  const allEvents: GammaEvent[] = [];
+  for (const tagId of tagIds) {
+    try {
+      const events = await fetchPolymarketEventsByTag(tagId, limit);
+      allEvents.push(...events);
+    } catch {
+      // ignore individual tag failures
+    }
+  }
+
+  // De-dupe by id/slug
+  const seen = new Set<string>();
+  const deduped: GammaEvent[] = [];
+  for (const e of allEvents) {
+    const key = e.id ?? e.slug;
+    if (!key) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(e);
+  }
+
+  return normalizePolymarketMarkets(deduped);
 }

@@ -40,6 +40,16 @@ function normalize(s?: string | null): string {
   return (s ?? '').toLowerCase();
 }
 
+function includesKeyword(haystack: string, keyword: string): boolean {
+  if (!keyword) return false;
+  // For short acronyms (nba, nfl, mlb, etc.) avoid substring matches like "bontenbal".
+  if (/^[a-z0-9]+$/.test(keyword) && keyword.length <= 5) {
+    const re = new RegExp(`\\b${keyword}\\b`, 'i');
+    return re.test(haystack);
+  }
+  return haystack.includes(keyword);
+}
+
 /**
  * Heuristic check: does this look like a sports market?
  * Uses league/team/market-structure keywords in the question and optional slug/symbol.
@@ -49,7 +59,7 @@ export function isSportsMarket(question: string, symbolOrSlug?: string): boolean
   const sym = normalize(symbolOrSlug);
 
   for (const kw of SPORTS_KEYWORDS) {
-    if (q.includes(kw) || sym.includes(kw)) {
+    if (includesKeyword(q, kw) || includesKeyword(sym, kw)) {
       return true;
     }
   }
