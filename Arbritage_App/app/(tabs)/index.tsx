@@ -196,7 +196,7 @@ export default function HomeScreen() {
           <ThemedText type="defaultSemiBold" style={styles.debugSection}>
             Polymarket (first 20)
           </ThemedText>
-          {pmMarkets.slice(0, 20).map((m) => (
+          {pmMarkets.slice(0, 100).map((m) => (
             <Pressable key={m.id} onPress={() => openUrl(m.url)} style={styles.debugRow}>
               <ThemedText numberOfLines={1} style={styles.debugRowText}>
                 {m.question}
@@ -206,7 +206,7 @@ export default function HomeScreen() {
           <ThemedText type="defaultSemiBold" style={styles.debugSection}>
             Kalshi (first 20)
           </ThemedText>
-          {kalshiMarkets.slice(0, 20).map((m) => (
+          {kalshiMarkets.slice(0, 200).map((m) => (
             <Pressable key={m.id} onPress={() => openUrl(m.url)} style={styles.debugRow}>
               <ThemedText numberOfLines={1} style={styles.debugRowText}>
                 {m.question}

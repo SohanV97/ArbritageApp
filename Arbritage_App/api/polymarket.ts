@@ -36,12 +36,20 @@ interface GammaMarket {
   [key: string]: unknown;
 }
 
+interface GammaTag {
+  id?: string;
+  label?: string;
+  slug?: string;
+  [key: string]: unknown;
+}
+
 interface GammaEvent {
   id?: string;
   title?: string;
   slug?: string;
   markets?: GammaMarket[];
   end_date_iso?: string;
+  tags?: GammaTag[];
   [key: string]: unknown;
 }
 
@@ -89,7 +97,6 @@ export function normalizePolymarketMarkets(events: GammaEvent[]): PolymarketMark
     const endDate = event.end_date_iso;
     
     for (const m of markets) {
-      // LOGICAL RULE 1: Must be exactly TWO outcomes
       let outcomesArr: string[] = [];
       try {
         outcomesArr = JSON.parse(m.outcomes ?? '["Yes","No"]');
@@ -106,7 +113,6 @@ export function normalizePolymarketMarkets(events: GammaEvent[]): PolymarketMark
         ? rawQuestion 
         : `${eventTitle}: ${rawQuestion}`;
       
-      // If the buttons are team names (e.g. "PHI", "IND"), stamp them into the title
       const isYesNo = outcomesArr[0].toLowerCase() === 'yes' || outcomesArr[1].toLowerCase() === 'no';
       if (!isYesNo) {
         question = `${question} [${outcomesArr[0]} vs ${outcomesArr[1]}]`;
@@ -148,53 +154,49 @@ export function normalizePolymarketMarkets(events: GammaEvent[]): PolymarketMark
 function isPureMoneyline(market: PolymarketMarketWithKind): boolean {
   const q = market.question.toLowerCase();
 
-  // LOGICAL RULE 2: MUST HAVE A MATCHUP INDICATOR
+  // 1. MUST HAVE A MATCHUP INDICATOR
   if (![' vs ', ' vs. ', ' versus ', ' @ ', ' at '].some(t => q.includes(t))) return false;
 
-  // LOGICAL RULE 3: NUKE FUTURES, PROPS, AND LEFTOVER JUNK
+  // 2. NUKE FUTURES, PROPS, AND LEFTOVER JUNK
   const junk = [
     'championship', 'title', 'season', 'award', 'mvp', 'rookie', 'draft',
     'conference winner', 'division winner', 'defensive',
     'coach of the year', 'make the playoffs', 'win the', 'series winner', 
     'points', 'rebounds', 'assists', 'score', 'stats', 'most valuable',
     'half', 'quarter', 'margin', 'seed',
-    ' fc', 'fc ', ' sc', 'sc ', 'club', 'draw', 'tie', 'wnba', 'women', 'league',
+    ' fc', 'fc ', ' sc', 'sc ', 'club', 'draw', 'tie', 'league',
     'nhl', 'hockey', 'nfl', 'football', 'mlb', 'baseball', 'tennis', 'csgo',
     'will be traded', 'trade destination'
   ];
   if (junk.some(word => q.includes(word))) return false;
 
-  // LOGICAL RULE 4: NUKE SPREADS AND TOTALS
+  // 3. NUKE SPREADS AND TOTALS
   if (['spread', 'over/under', 'cover', 'total', 'over', 'under'].some(word => q.includes(word))) return false;
   if (/(?:\s|^)[+-]\d+(\.\d+)?(?:\s|$)/.test(q)) return false;
+
+  // 4. THE TIME MACHINE CHECK
+  if (market.resolutionTime) {
+    const expirationMs = Date.parse(market.resolutionTime);
+    if (expirationMs < Date.now()) return false;
+  }
 
   return true;
 }
 
 // ==========================================
-// MAIN PAGINATED FETCHER
+// MAIN PAGINATED FETCHER (DUAL-PRONGED)
 // ==========================================
 
 export async function getPolymarketBasketballMarkets(): Promise<PolymarketMarketWithKind[]> {
-  // 1. Fetch Leagues from /sports to get dynamic series_ids
-  const sports = await fetchPolymarketSportsMetadata();
-  const seriesIds = new Set<string>();
-  
-  // Hardcode known NBA series_id (10345) based on documentation to guarantee it never fails.
-  seriesIds.add('10345');
-
-  for (const s of sports) {
-    const name = (s.sport ?? '').toLowerCase();
-    const isHoops = name.includes('nba') || name.includes('ncaab') || name.includes('college basketball') || name.includes('basketball');
-    if (isHoops && s.series) {
-      seriesIds.add(String(s.series));
-    }
-  }
-
   const allEvents: GammaEvent[] = [];
   const limit = 100;
 
-  // 2. Fetch Paginated Events directly by their series_id
+  // =========================================================
+  // PRONG 1: FETCH NBA BY SERIES_ID
+  // =========================================================
+  const seriesIds = new Set<string>();
+  seriesIds.add('10345');
+
   for (const seriesId of seriesIds) {
     let offset = 0;
     while (true) {
@@ -202,39 +204,113 @@ export async function getPolymarketBasketballMarkets(): Promise<PolymarketMarket
         const url = `${POLYMARKET_GAMMA_API}/events?series_id=${encodeURIComponent(seriesId)}&active=true&closed=false&limit=${limit}&offset=${offset}`;
         const res = await fetch(url, { headers: polymarketHeaders() });
         if (!res.ok) break;
-        
         const events = (await res.json()) as GammaEvent[];
         if (!Array.isArray(events) || events.length === 0) break;
-        
+
         allEvents.push(...events);
-        
         if (events.length < limit) break;
         offset += limit;
       } catch (e) {
-        console.error(`[Polymarket] Error fetching series ${seriesId} at offset ${offset}`, e);
-        break; 
+        break;
       }
     }
   }
 
-  // De-dupe events
+  // =========================================================
+  // PRONG 2: FETCH CBB BY TAG_ID
+  // =========================================================
+  const tagIds = new Set<string>();
+
+  const sports = await fetchPolymarketSportsMetadata();
+  for (const s of sports) {
+    const name = (s.sport ?? '').toLowerCase();
+    if (name.includes('cbb') || name.includes('ncaab') || name.includes('college basketball')) {
+      if (s.tags) {
+        s.tags.split(',').forEach(t => tagIds.add(t.trim()));
+      }
+    }
+  }
+
+  try {
+    const tagUrl = `${POLYMARKET_GAMMA_API}/tags`;
+    const res = await fetch(tagUrl, { headers: polymarketHeaders() });
+    if (res.ok) {
+      const allTags = (await res.json()) as GammaTag[];
+      allTags.forEach(t => {
+        const slug = (t.slug ?? '').toLowerCase();
+        if (slug === 'cbb' || slug === 'ncaab' || slug === 'mens-college-basketball') {
+          if (t.id) tagIds.add(t.id);
+        }
+      });
+    }
+  } catch (e) {}
+
+  for (const tagId of tagIds) {
+    let offset = 0;
+    while (true) {
+      try {
+        const url = `${POLYMARKET_GAMMA_API}/events?tag_id=${encodeURIComponent(tagId)}&active=true&closed=false&limit=${limit}&offset=${offset}`;
+        const res = await fetch(url, { headers: polymarketHeaders() });
+        if (!res.ok) break;
+        const events = (await res.json()) as GammaEvent[];
+        if (!Array.isArray(events) || events.length === 0) break;
+
+        allEvents.push(...events);
+        if (events.length < limit) break;
+        offset += limit;
+      } catch (e) {
+        break;
+      }
+    }
+  }
+
+  // =========================================================
+  // DOCS LOGIC: STRICT EVENT-LEVEL SCRUBBING
+  // =========================================================
+
   const seen = new Set<string>();
   const dedupedEvents: GammaEvent[] = [];
+
   for (const e of allEvents) {
     const key = e.id ?? e.slug;
     if (!key || seen.has(key)) continue;
+
+    let isWomensGame = false;
+
+    // 1. Logically inspect the official API tags array.
+    // If a market maker cross-tagged a women's game into the men's feed, this catches it.
+    if (Array.isArray(e.tags)) {
+      for (const t of e.tags) {
+        const slug = (t.slug ?? '').toLowerCase();
+        if (slug.includes('women') || slug === 'ncaaw' || slug === 'wbb' || slug === 'wnba') {
+          isWomensGame = true;
+          break;
+        }
+      }
+    }
+
+    // 2. Secondary API Title check.
+    // This is the fail-safe to catch lazy market makers who didn't assign tags at all but used (W).
+    const titleText = (e.title ?? '').toLowerCase();
+    if (titleText.includes('(w)') || titleText.includes('women')) {
+      isWomensGame = true;
+    }
+
+    // Immediately drop the event if it triggered any women's flags.
+    if (isWomensGame) {
+      continue;
+    }
+
     seen.add(key);
     dedupedEvents.push(e);
   }
 
-  console.log(`[Polymarket] Checkpoint 1: Paginated & fetched ${dedupedEvents.length} active basketball events.`);
+  console.log(`[Polymarket] Checkpoint 1: Fetched ${dedupedEvents.length} strictly Men's basketball events.`);
 
-  // 3. Extract the markets from the events
   const normalized = normalizePolymarketMarkets(dedupedEvents);
 
-  // 4. Structural filter
   const filtered = normalized.filter(isPureMoneyline);
-  console.log(`[Polymarket] Checkpoint 2: Verified daily moneyline games = ${filtered.length}`);
+  console.log(`[Polymarket] Checkpoint 2: Verified upcoming Men's moneyline games = ${filtered.length}`);
 
   return filtered;
 }
