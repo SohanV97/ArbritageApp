@@ -1,5 +1,6 @@
 import { useCallback, useState } from 'react';
 import type { ArbitrageOpportunity } from '@/lib/market-types';
+import type { UnifiedMarket } from '@/lib/market-types';
 import { getPolymarketBasketballMarkets } from '@/api/polymarket';
 import { getKalshiBasketballMarkets } from '@/api/kalshi';
 import { matchMarkets } from '@/lib/matchMarkets';
@@ -15,6 +16,8 @@ export interface ArbStats {
 
 export function useArbitrageOpportunities(options?: { minEdgePercent?: number }) {
   const [opportunities, setOpportunities] = useState<ArbitrageOpportunity[]>([]);
+  const [pmMarkets, setPmMarkets] = useState<UnifiedMarket[]>([]);
+  const [kalshiMarkets, setKalshiMarkets] = useState<UnifiedMarket[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [stats, setStats] = useState<ArbStats | null>(null);
@@ -48,6 +51,8 @@ export function useArbitrageOpportunities(options?: { minEdgePercent?: number })
       }
       // #endregion
       setOpportunities(opps);
+      setPmMarkets(sportsPm);
+      setKalshiMarkets(sportsKalshi);
       setStats({
         pmTotal: pmMarkets.length,
         pmSports: sportsPm.length,
@@ -59,11 +64,13 @@ export function useArbitrageOpportunities(options?: { minEdgePercent?: number })
       const message = e instanceof Error ? e.message : String(e);
       setError(message);
       setOpportunities([]);
+      setPmMarkets([]);
+      setKalshiMarkets([]);
       setStats(null);
     } finally {
       setLoading(false);
     }
   }, [options?.minEdgePercent]);
 
-  return { opportunities, loading, error, refresh, stats };
+  return { opportunities, pmMarkets, kalshiMarkets, loading, error, refresh, stats };
 }

@@ -26,7 +26,9 @@ function allocationForRisk(
   const priceSumDollars = (legA.priceCents + legB.priceCents) / 100;
   if (priceSumDollars <= 0) return null;
   const n = riskDollars / priceSumDollars;
-  const kind: PolymarketMarketKind = pair.polymarket.polymarketFeeKind ?? 'fee_free';
+  const kind: PolymarketMarketKind =
+    (pair.polymarket as unknown as { polymarketFeeKind?: PolymarketMarketKind })
+      .polymarketFeeKind ?? 'fee_free';
 
   const feeA =
     legA.venue === 'polymarket'
@@ -109,10 +111,11 @@ function OpportunityCard({
 }
 
 export default function HomeScreen() {
-  const { opportunities, loading, error, refresh, stats } = useArbitrageOpportunities({
+  const { opportunities, pmMarkets, kalshiMarkets, loading, error, refresh, stats } = useArbitrageOpportunities({
     minEdgePercent: 0,
   });
   const [riskInput, setRiskInput] = useState('100');
+  const [showFetched, setShowFetched] = useState(false);
 
   useEffect(() => {
     refresh();
@@ -171,10 +174,45 @@ export default function HomeScreen() {
         <Pressable style={styles.refreshButton} onPress={refresh} disabled={loading}>
           <ThemedText type="defaultSemiBold">{loading ? 'Refreshing…' : 'Refresh'}</ThemedText>
         </Pressable>
+        <Pressable style={styles.refreshButton} onPress={() => setShowFetched((v) => !v)}>
+          <ThemedText type="defaultSemiBold">
+            {showFetched ? 'Hide fetched markets' : 'Show fetched markets'}
+          </ThemedText>
+        </Pressable>
       </ThemedView>
       {error ? (
         <ThemedView style={styles.error}>
           <ThemedText style={styles.errorText}>{error}</ThemedText>
+        </ThemedView>
+      ) : null}
+      {showFetched ? (
+        <ThemedView style={styles.debugBox}>
+          <ThemedText type="defaultSemiBold" style={styles.debugTitle}>
+            Fetched basketball markets
+          </ThemedText>
+          <ThemedText style={styles.debugSubtitle}>
+            Polymarket: {pmMarkets.length} · Kalshi: {kalshiMarkets.length}
+          </ThemedText>
+          <ThemedText type="defaultSemiBold" style={styles.debugSection}>
+            Polymarket (first 20)
+          </ThemedText>
+          {pmMarkets.slice(0, 20).map((m) => (
+            <Pressable key={m.id} onPress={() => openUrl(m.url)} style={styles.debugRow}>
+              <ThemedText numberOfLines={1} style={styles.debugRowText}>
+                {m.question}
+              </ThemedText>
+            </Pressable>
+          ))}
+          <ThemedText type="defaultSemiBold" style={styles.debugSection}>
+            Kalshi (first 20)
+          </ThemedText>
+          {kalshiMarkets.slice(0, 20).map((m) => (
+            <Pressable key={m.id} onPress={() => openUrl(m.url)} style={styles.debugRow}>
+              <ThemedText numberOfLines={1} style={styles.debugRowText}>
+                {m.question}
+              </ThemedText>
+            </Pressable>
+          ))}
         </ThemedView>
       ) : null}
     </>
@@ -261,6 +299,33 @@ const styles = StyleSheet.create({
     alignSelf: 'flex-start',
     paddingVertical: 8,
     paddingHorizontal: 12,
+  },
+  debugBox: {
+    marginHorizontal: 16,
+    marginBottom: 8,
+    padding: 12,
+    borderRadius: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: 'rgba(0,0,0,0.15)',
+    gap: 6,
+  },
+  debugTitle: {
+    fontSize: 14,
+  },
+  debugSubtitle: {
+    fontSize: 12,
+    opacity: 0.85,
+  },
+  debugSection: {
+    marginTop: 6,
+    fontSize: 13,
+  },
+  debugRow: {
+    paddingVertical: 4,
+  },
+  debugRowText: {
+    fontSize: 12,
+    opacity: 0.9,
   },
   error: {
     marginHorizontal: 16,

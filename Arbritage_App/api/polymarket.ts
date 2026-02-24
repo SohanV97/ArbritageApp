@@ -1,7 +1,5 @@
 /**
  * Polymarket API client (Gamma + CLOB).
- * - API key: set EXPO_PUBLIC_POLYMARKET_API_KEY in Arbritage_App/.env → app.config.js extra.polymarketApiKey → sent as header POLY_API_KEY (optional for read).
- * - Events: GET {POLYMARKET_GAMMA_API}/events?limit=&closed=false. Each event has markets with outcomePrices (JSON string "[yes, no]" 0–1), outcomes "[\"Yes\",\"No\"]".
  */
 import Constants from 'expo-constants';
 import type { UnifiedMarket } from '@/lib/market-types';
@@ -20,7 +18,6 @@ function polymarketHeaders(): Record<string, string> {
   return headers;
 }
 
-/** Raw market from Gamma API (snake_case and camelCase variants) */
 interface GammaMarket {
   id?: string;
   condition_id?: string;
@@ -39,7 +36,6 @@ interface GammaMarket {
   [key: string]: unknown;
 }
 
-/** Raw event from Gamma API (can contain markets) */
 interface GammaEvent {
   id?: string;
   title?: string;
@@ -52,17 +48,10 @@ interface GammaEvent {
 interface GammaSportMetadata {
   sport?: string;
   tags?: string;
+  series?: string;
   [key: string]: unknown;
 }
 
-/** CLOB price response */
-interface ClobPriceRow {
-  price: string;
-  size: string;
-  [key: string]: unknown;
-}
-
-/** outcomePrices maps 1:1 to outcomes: index 0 = Yes, 1 = No. Enforce yes+no ≈ 100. */
 function parseOutcomePrices(outcomePrices: string | undefined): { yes: number; no: number } {
   if (!outcomePrices) return { yes: 50, no: 50 };
   try {
@@ -78,43 +67,9 @@ function parseOutcomePrices(outcomePrices: string | undefined): { yes: number; n
   }
 }
 
-function inferPolymarketFeeKind(m: GammaMarket): PolymarketMarketKind {
-  const slug = (m.slug ?? m.market_slug ?? '').toLowerCase();
-  const title = (m.question ?? '').toLowerCase();
-  if (
-    slug.includes('5min') ||
-    slug.includes('15min') ||
-    title.includes('5-minute') ||
-    title.includes('15-minute')
-  ) {
-    return 'short_term_crypto';
-  }
-  if (
-    slug.includes('ncaab') ||
-    slug.includes('serie-a') ||
-    title.includes('ncaab') ||
-    title.includes('serie a')
-  ) {
-    return 'sports';
-  }
-  return 'fee_free';
-}
-
 export interface PolymarketMarketWithKind extends UnifiedMarket {
   polymarketFeeKind: PolymarketMarketKind;
-  /** Yes-side CLOB token ID for fee-rate API */
   yesTokenId?: string;
-}
-
-/**
- * Fetch events with nested markets from Gamma API (binary markets only).
- */
-export async function fetchPolymarketEvents(limit = 100): Promise<GammaEvent[]> {
-  const url = `${POLYMARKET_GAMMA_API}/events?limit=${limit}&closed=false`;
-  const res = await fetch(url, { headers: polymarketHeaders() });
-  if (!res.ok) throw new Error(`Polymarket Gamma: ${res.status}`);
-  const data = (await res.json()) as GammaEvent[];
-  return Array.isArray(data) ? data : [];
 }
 
 export async function fetchPolymarketSportsMetadata(): Promise<GammaSportMetadata[]> {
@@ -125,44 +80,6 @@ export async function fetchPolymarketSportsMetadata(): Promise<GammaSportMetadat
   return Array.isArray(data) ? data : [];
 }
 
-async function fetchPolymarketEventsByTag(tagId: string, limit = 100): Promise<GammaEvent[]> {
-  const url = `${POLYMARKET_GAMMA_API}/events?tag_id=${encodeURIComponent(tagId)}&limit=${limit}&active=true&closed=false`;
-  const res = await fetch(url, { headers: polymarketHeaders() });
-  if (!res.ok) throw new Error(`Polymarket Gamma tag ${tagId}: ${res.status}`);
-  const data = (await res.json()) as GammaEvent[];
-  return Array.isArray(data) ? data : [];
-}
-
-/**
- * Fetch single market by slug from Gamma.
- */
-export async function fetchPolymarketMarketBySlug(slug: string): Promise<GammaMarket | null> {
-  const url = `${POLYMARKET_GAMMA_API}/markets?slug=${encodeURIComponent(slug)}`;
-  const res = await fetch(url, { headers: polymarketHeaders() });
-  if (!res.ok) return null;
-  const data = (await res.json()) as GammaMarket[];
-  return Array.isArray(data) && data.length > 0 ? data[0] : null;
-}
-
-/**
- * Get CLOB fee rate in bps for a token (0 = fee-free).
- */
-export async function fetchPolymarketFeeRateBps(tokenId: string): Promise<number> {
-  try {
-    const url = `${POLYMARKET_CLOB_API}/fee-rate?token_id=${encodeURIComponent(tokenId)}`;
-    const res = await fetch(url, { headers: polymarketHeaders() });
-    if (!res.ok) return 0;
-    const data = (await res.json()) as { feeRateBps?: string; fee_rate_bps?: number };
-    const bps = data.feeRateBps ?? data.fee_rate_bps;
-    return typeof bps === 'string' ? parseInt(bps, 10) : Number(bps) || 0;
-  } catch {
-    return 0;
-  }
-}
-
-/**
- * Build unified markets from Gamma events (one market per binary event or per sub-market).
- */
 export function normalizePolymarketMarkets(events: GammaEvent[]): PolymarketMarketWithKind[] {
   const out: PolymarketMarketWithKind[] = [];
   for (const event of events) {
@@ -170,29 +87,45 @@ export function normalizePolymarketMarkets(events: GammaEvent[]): PolymarketMark
     const eventTitle = event.title ?? '';
     const eventSlug = event.slug ?? event.id ?? '';
     const endDate = event.end_date_iso;
+    
     for (const m of markets) {
-      const outcomes = (m.outcomes ?? '["Yes","No"]').toLowerCase();
-      if (!outcomes.includes('yes') || !outcomes.includes('no')) continue;
+      // LOGICAL RULE 1: Must be exactly TWO outcomes
+      let outcomesArr: string[] = [];
+      try {
+        outcomesArr = JSON.parse(m.outcomes ?? '["Yes","No"]');
+      } catch {
+        outcomesArr = ["Yes", "No"];
+      }
+      
+      if (outcomesArr.length !== 2) continue;
+
       const { yes, no } = parseOutcomePrices(m.outcomePrices);
-      const question = m.question ?? m.groupItemTitle ?? eventTitle;
+      
+      const rawQuestion = m.question ?? m.groupItemTitle ?? '';
+      let question = rawQuestion.toLowerCase().includes(eventTitle.toLowerCase()) 
+        ? rawQuestion 
+        : `${eventTitle}: ${rawQuestion}`;
+      
+      // If the buttons are team names (e.g. "PHI", "IND"), stamp them into the title
+      const isYesNo = outcomesArr[0].toLowerCase() === 'yes' || outcomesArr[1].toLowerCase() === 'no';
+      if (!isYesNo) {
+        question = `${question} [${outcomesArr[0]} vs ${outcomesArr[1]}]`;
+      }
+      
       const slug = m.slug ?? m.market_slug ?? m.condition_id ?? m.conditionId ?? m.id ?? '';
       const conditionId = m.condition_id ?? m.conditionId ?? m.id ?? '';
-      const tokenIds = m.clobTokenIds;
+      
       let yesTokenId: string | undefined;
       try {
-        if (typeof tokenIds === 'string') {
-          const arr = JSON.parse(tokenIds) as string[];
-          yesTokenId = arr[0];
+        if (typeof m.clobTokenIds === 'string') {
+          yesTokenId = (JSON.parse(m.clobTokenIds) as string[])[0];
         }
-      } catch {
-        // ignore
-      }
-      const marketUrl = slug
-        ? `https://polymarket.com/event/${eventSlug}${slug !== eventSlug ? `?slug=${slug}` : ''}`
-        : `https://polymarket.com/event/${eventSlug}`;
-      const polymarketFeeKind = inferPolymarketFeeKind(m);
+      } catch {}
+
+      const marketUrl = `https://polymarket.com/event/${eventSlug}`;
+      
       out.push({
-        id: `pm-${conditionId || slug || question}`,
+        id: `pm-${conditionId || slug}`,
         venue: 'polymarket',
         question,
         yesPriceCents: yes,
@@ -200,7 +133,7 @@ export function normalizePolymarketMarkets(events: GammaEvent[]): PolymarketMark
         resolutionTime: m.end_date_iso ?? m.endDateIso ?? endDate,
         url: marketUrl,
         rulesDescription: undefined,
-        polymarketFeeKind,
+        polymarketFeeKind: 'sports',
         yesTokenId,
       });
     }
@@ -208,55 +141,104 @@ export function normalizePolymarketMarkets(events: GammaEvent[]): PolymarketMark
   return out;
 }
 
-/**
- * Fetch Polymarket binary markets as unified shape (from events endpoint).
- */
-export async function getPolymarketMarkets(limit = 80): Promise<PolymarketMarketWithKind[]> {
-  const events = await fetchPolymarketEvents(limit);
-  return normalizePolymarketMarkets(events);
+// ==========================================
+// STRICT STRUCTURAL MONEYLINE FILTER
+// ==========================================
+
+function isPureMoneyline(market: PolymarketMarketWithKind): boolean {
+  const q = market.question.toLowerCase();
+
+  // LOGICAL RULE 2: MUST HAVE A MATCHUP INDICATOR
+  if (![' vs ', ' vs. ', ' versus ', ' @ ', ' at '].some(t => q.includes(t))) return false;
+
+  // LOGICAL RULE 3: NUKE FUTURES, PROPS, AND LEFTOVER JUNK
+  const junk = [
+    'championship', 'title', 'season', 'award', 'mvp', 'rookie', 'draft',
+    'conference winner', 'division winner', 'defensive',
+    'coach of the year', 'make the playoffs', 'win the', 'series winner', 
+    'points', 'rebounds', 'assists', 'score', 'stats', 'most valuable',
+    'half', 'quarter', 'margin', 'seed',
+    ' fc', 'fc ', ' sc', 'sc ', 'club', 'draw', 'tie', 'wnba', 'women', 'league',
+    'nhl', 'hockey', 'nfl', 'football', 'mlb', 'baseball', 'tennis', 'csgo',
+    'will be traded', 'trade destination'
+  ];
+  if (junk.some(word => q.includes(word))) return false;
+
+  // LOGICAL RULE 4: NUKE SPREADS AND TOTALS
+  if (['spread', 'over/under', 'cover', 'total', 'over', 'under'].some(word => q.includes(word))) return false;
+  if (/(?:\s|^)[+-]\d+(\.\d+)?(?:\s|$)/.test(q)) return false;
+
+  return true;
 }
 
-export async function getPolymarketBasketballMarkets(limit = 120): Promise<PolymarketMarketWithKind[]> {
+// ==========================================
+// MAIN PAGINATED FETCHER
+// ==========================================
+
+export async function getPolymarketBasketballMarkets(): Promise<PolymarketMarketWithKind[]> {
+  // 1. Fetch Leagues from /sports to get dynamic series_ids
   const sports = await fetchPolymarketSportsMetadata();
-  const basketballSports = sports.filter((s) => {
+  const seriesIds = new Set<string>();
+  
+  // Hardcode known NBA series_id (10345) based on documentation to guarantee it never fails.
+  seriesIds.add('10345');
+
+  for (const s of sports) {
     const name = (s.sport ?? '').toLowerCase();
-    return name.includes('nba') || name.includes('college basketball') || name.includes('ncaab');
-  });
-
-  const tagIds = new Set<string>();
-  for (const s of basketballSports) {
-    const raw = (s.tags ?? '').trim();
-    if (!raw) continue;
-    raw
-      .split(',')
-      .map((t) => t.trim())
-      .filter(Boolean)
-      .forEach((t) => tagIds.add(t));
-  }
-
-  // Fallback: if sports metadata doesn't include tags, just return empty rather than fetching everything.
-  if (tagIds.size === 0) return [];
-
-  const allEvents: GammaEvent[] = [];
-  for (const tagId of tagIds) {
-    try {
-      const events = await fetchPolymarketEventsByTag(tagId, limit);
-      allEvents.push(...events);
-    } catch {
-      // ignore individual tag failures
+    const isHoops = name.includes('nba') || name.includes('ncaab') || name.includes('college basketball') || name.includes('basketball');
+    if (isHoops && s.series) {
+      seriesIds.add(String(s.series));
     }
   }
 
-  // De-dupe by id/slug
-  const seen = new Set<string>();
-  const deduped: GammaEvent[] = [];
-  for (const e of allEvents) {
-    const key = e.id ?? e.slug;
-    if (!key) continue;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    deduped.push(e);
+  const allEvents: GammaEvent[] = [];
+  const limit = 100;
+
+  // 2. Fetch Paginated Events directly by their series_id
+  for (const seriesId of seriesIds) {
+    let offset = 0;
+    while (true) {
+      try {
+        const url = `${POLYMARKET_GAMMA_API}/events?series_id=${encodeURIComponent(seriesId)}&active=true&closed=false&limit=${limit}&offset=${offset}`;
+        const res = await fetch(url, { headers: polymarketHeaders() });
+        if (!res.ok) break;
+        
+        const events = (await res.json()) as GammaEvent[];
+        if (!Array.isArray(events) || events.length === 0) break;
+        
+        allEvents.push(...events);
+        
+        if (events.length < limit) break;
+        offset += limit;
+      } catch (e) {
+        console.error(`[Polymarket] Error fetching series ${seriesId} at offset ${offset}`, e);
+        break; 
+      }
+    }
   }
 
-  return normalizePolymarketMarkets(deduped);
+  // De-dupe events
+  const seen = new Set<string>();
+  const dedupedEvents: GammaEvent[] = [];
+  for (const e of allEvents) {
+    const key = e.id ?? e.slug;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    dedupedEvents.push(e);
+  }
+
+  console.log(`[Polymarket] Checkpoint 1: Paginated & fetched ${dedupedEvents.length} active basketball events.`);
+
+  // 3. Extract the markets from the events
+  const normalized = normalizePolymarketMarkets(dedupedEvents);
+
+  // 4. Structural filter
+  const filtered = normalized.filter(isPureMoneyline);
+  console.log(`[Polymarket] Checkpoint 2: Verified daily moneyline games = ${filtered.length}`);
+
+  return filtered;
+}
+
+export async function getPolymarketMarkets(): Promise<PolymarketMarketWithKind[]> {
+  return getPolymarketBasketballMarkets();
 }
