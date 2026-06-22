@@ -6,8 +6,8 @@ import type { OpportunitiesResponse } from './api/opportunities/route';
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
-function fmt(cents: number) {
-  return `${cents}¢`;
+function fmtUsd(dollars: number) {
+  return `$${dollars.toFixed(2)}`;
 }
 
 function pct(cents: number) {
@@ -22,6 +22,11 @@ function timeAgo(iso: string) {
   const s = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
   if (s < 60) return `${s}s ago`;
   return `${Math.round(s / 60)}m ago`;
+}
+
+function fmtDate(iso: string | undefined) {
+  if (!iso) return null;
+  return new Date(iso).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
 }
 
 // ─── sub-components ─────────────────────────────────────────────────────────
@@ -56,9 +61,19 @@ function EdgeBadge({ ep }: { ep: number }) {
   );
 }
 
-function OpportunityCard({ opp }: { opp: ArbitrageOpportunity }) {
+function OpportunityCard({ opp, contracts }: { opp: ArbitrageOpportunity; contracts: number }) {
+  const [showDebug, setShowDebug] = useState(false);
   const { pair, legA, legB, totalCostCents, edgePercent } = opp;
   const isArb = edgePercent >= 0.5;
+
+  // Scale from 1-contract (cents) to N-contract (dollars)
+  const totalCostDollars = (totalCostCents / 100) * contracts;
+  const payoutDollars = contracts;
+  const profitDollars = (edgePercent / 100) * contracts;
+
+  const pmDate = fmtDate(pair.polymarket.resolutionTime);
+  const kalDate = fmtDate(pair.kalshi.resolutionTime);
+  const datesMatch = pair.polymarket.resolutionTime?.slice(0, 10) === pair.kalshi.resolutionTime?.slice(0, 10);
 
   return (
     <div
@@ -107,7 +122,7 @@ function OpportunityCard({ opp }: { opp: ArbitrageOpportunity }) {
                 {pct(leg.priceCents)}
               </span>
               <span className="text-xs text-[--text-muted] font-mono">
-                fee {fmt(leg.feeCents)}
+                fee {fmtUsd((leg.feeCents / 100) * contracts)}
               </span>
             </div>
           </a>
@@ -122,28 +137,63 @@ function OpportunityCard({ opp }: { opp: ArbitrageOpportunity }) {
         <div className="flex gap-6">
           <div>
             <p className="text-xs text-[--text-muted]">Total cost</p>
-            <p className="text-sm font-bold font-mono">{fmt(totalCostCents)}</p>
+            <p className="text-sm font-bold font-mono">{fmtUsd(totalCostDollars)}</p>
           </div>
           <div>
             <p className="text-xs text-[--text-muted]">Payout</p>
-            <p className="text-sm font-bold font-mono">100¢</p>
+            <p className="text-sm font-bold font-mono">{fmtUsd(payoutDollars)}</p>
           </div>
           <div>
-            <p className="text-xs text-[--text-muted]">Profit / $100 bet</p>
+            <p className="text-xs text-[--text-muted]">Profit</p>
             <p
               className="text-sm font-bold font-mono"
               style={{ color: edgePercent >= 0.5 ? '#4ade80' : '#8b949e' }}
             >
-              ${((edgePercent / 100) * 100).toFixed(2)}
+              {fmtUsd(profitDollars)}
             </p>
           </div>
         </div>
-        <div className="text-xs text-[--text-muted] text-right">
-          {pair.kalshi.resolutionTime
-            ? new Date(pair.kalshi.resolutionTime).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })
-            : ''}
+
+        {/* Dates */}
+        <div className="text-xs text-[--text-muted] text-right flex flex-col gap-0.5">
+          <span style={{ color: datesMatch ? 'var(--text-muted)' : '#f87171' }}>
+            PM: {pmDate ?? '—'}
+          </span>
+          <span style={{ color: datesMatch ? 'var(--text-muted)' : '#f87171' }}>
+            KAL: {kalDate ?? '—'}
+          </span>
         </div>
       </div>
+
+      {/* Debug toggle */}
+      <button
+        onClick={() => setShowDebug(v => !v)}
+        style={{ color: 'var(--text-muted)', borderColor: 'var(--border)' }}
+        className="text-xs underline text-left w-fit"
+      >
+        {showDebug ? 'Hide' : 'Show'} matched questions
+      </button>
+
+      {showDebug && (
+        <div
+          style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}
+          className="rounded-lg px-4 py-3 flex flex-col gap-2"
+        >
+          <div>
+            <span className="text-xs font-semibold" style={{ color: '#a78bfa' }}>Polymarket</span>
+            <p className="text-xs font-mono mt-0.5" style={{ color: 'var(--text-muted)' }}>{pair.polymarket.question}</p>
+          </div>
+          <div>
+            <span className="text-xs font-semibold" style={{ color: '#60a5fa' }}>Kalshi</span>
+            <p className="text-xs font-mono mt-0.5" style={{ color: 'var(--text-muted)' }}>{pair.kalshi.question}</p>
+          </div>
+          {!datesMatch && (
+            <p className="text-xs" style={{ color: '#f87171' }}>
+              Date mismatch — may not be the same game.
+            </p>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -155,6 +205,7 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [lastFetch, setLastFetch] = useState<string | null>(null);
   const [filter, setFilter] = useState<'all' | 'arb' | 'near'>('all');
+  const [contracts, setContracts] = useState(100);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -188,21 +239,36 @@ export default function Home() {
   return (
     <div className="min-h-screen px-4 py-8 max-w-4xl mx-auto">
       {/* Header */}
-      <div className="flex items-start justify-between mb-8">
+      <div className="flex items-start justify-between mb-8 gap-4">
         <div>
           <h1 className="text-2xl font-bold tracking-tight">MLB Arb Finder</h1>
           <p className="text-sm text-[--text-muted] mt-1">
             Kalshi × Polymarket · live moneyline arbitrage
           </p>
         </div>
-        <button
-          onClick={load}
-          disabled={loading}
-          style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}
-          className="px-4 py-2 rounded-lg text-sm font-medium hover:border-[#8b949e] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          {loading ? 'Refreshing…' : 'Refresh'}
-        </button>
+        <div className="flex items-center gap-3 flex-shrink-0">
+          {/* Contracts input */}
+          <div className="flex items-center gap-2">
+            <label className="text-xs text-[--text-muted] whitespace-nowrap">Contracts</label>
+            <input
+              type="number"
+              min={1}
+              max={10000}
+              value={contracts}
+              onChange={e => setContracts(Math.max(1, parseInt(e.target.value) || 1))}
+              style={{ background: 'var(--surface)', border: '1px solid var(--border)', color: 'var(--foreground)' }}
+              className="w-20 px-2 py-1.5 rounded-lg text-sm font-mono text-right"
+            />
+          </div>
+          <button
+            onClick={load}
+            disabled={loading}
+            style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}
+            className="px-4 py-2 rounded-lg text-sm font-medium hover:border-[#8b949e] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {loading ? 'Refreshing…' : 'Refresh'}
+          </button>
+        </div>
       </div>
 
       {/* Stats bar */}
@@ -288,7 +354,11 @@ export default function Home() {
 
       <div className="flex flex-col gap-4">
         {filtered.map((opp, i) => (
-          <OpportunityCard key={`${opp.pair.polymarket.id}-${i}`} opp={opp} />
+          <OpportunityCard
+            key={`${opp.pair.polymarket.id}-${i}`}
+            opp={opp}
+            contracts={contracts}
+          />
         ))}
       </div>
 
@@ -296,6 +366,7 @@ export default function Home() {
       <div className="mt-12 pt-6 border-t border-[--border] text-xs text-[--text-muted] flex flex-wrap gap-x-6 gap-y-2">
         <span>Prices refresh every 90s</span>
         <span>Fees included in edge calculation</span>
+        <span>Contracts = max payout in dollars per pair</span>
         <span>Always verify prices before placing trades</span>
       </div>
     </div>

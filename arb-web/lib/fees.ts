@@ -23,18 +23,14 @@ export function estimatePolymarketFeeCents(
   const p = Math.max(0, Math.min(1, priceCents / 100));
   const base = p * (1 - p);
   const feeUsd = contracts * params.feeRate * Math.pow(base, params.exponent);
-  const roundedUsd = Math.max(0, Math.round(feeUsd * 10000) / 10000);
-  if (roundedUsd < 0.0001) return 0;
-  return Math.round(roundedUsd * 100);
+  // Return fractional cents so edge calculations stay accurate for small positions
+  return Math.max(0, feeUsd * 100);
 }
 
 export function estimateKalshiFeeCents(priceCents: number, contracts: number): number {
   if (contracts <= 0) return 0;
-  const p = Math.max(0, Math.min(1, priceCents / 100));
-  const maxPotentialProfitCents = Math.round(contracts * (100 - priceCents));
-  const shape = p * (1 - p);
-  const feeCents = maxPotentialProfitCents * 0.015 * shape * 4;
-  return Math.ceil(feeCents);
+  // Kalshi charges 3% of profit on winning contracts; use worst-case (assume this leg wins)
+  return Math.ceil(0.03 * (100 - priceCents) * contracts);
 }
 
 export function estimateFeeCentsForVenue(

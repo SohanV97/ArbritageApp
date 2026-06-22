@@ -96,7 +96,10 @@ export function matchMarkets(
 
     for (const k of kalshiMarkets) {
       const kDay = parseResolutionDay(k.resolutionTime);
-      if (requireSameDay && (pmDay == null || kDay == null || pmDay !== kDay)) continue;
+      // Only enforce date check when both dates are present; allow ±1 calendar day for UTC/ET offset
+      if (requireSameDay && pmDay !== null && kDay !== null) {
+        if (Math.abs(Date.parse(pmDay) - Date.parse(kDay)) > 86_400_000) continue;
+      }
 
       const kTokens = tokenize(k.question);
       const kTeams = getTeams(k.question);

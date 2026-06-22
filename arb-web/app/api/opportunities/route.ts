@@ -30,7 +30,7 @@ export async function GET() {
     const pairs = matchMarkets(pmMarkets, kalshiMarkets, {
       minTitleSimilarity: 0.35,
       minOverlapTokens: 2,
-      requireSameDay: false,
+      requireSameDay: true,
     });
 
     const typedPairs: PairWithKind[] = pairs.map(p => {
