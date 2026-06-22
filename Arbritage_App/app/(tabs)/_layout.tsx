@@ -12,8 +12,9 @@ export default function TabLayout() {
   return (
     <Tabs
       screenOptions={{
-        tabBarActiveTintColor: Colors[colorScheme ?? 'light'].tint,
+        tabBarActiveTintColor: Colors[colorScheme === 'dark' ? 'dark' : 'light'].tint,
         headerShown: false,
+        // @ts-expect-error – HoverEffectProps.color type conflict between @react-navigation/elements and expo-router's bundled bottom-tabs
         tabBarButton: HapticTab,
       }}>
       <Tabs.Screen

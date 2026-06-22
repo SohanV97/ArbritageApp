@@ -4,7 +4,7 @@
 import Constants from 'expo-constants';
 import type { UnifiedMarket } from '@/lib/market-types';
 import type { PolymarketMarketKind } from '@/lib/fees';
-import { POLYMARKET_GAMMA_API, POLYMARKET_CLOB_API } from '@/constants/config';
+import { POLYMARKET_GAMMA_API } from '@/constants/config';
 
 function getPolymarketApiKey(): string | null {
   const key = Constants.expoConfig?.extra?.polymarketApiKey;
@@ -157,16 +157,15 @@ function isPureMoneyline(market: PolymarketMarketWithKind): boolean {
   // 1. MUST HAVE A MATCHUP INDICATOR
   if (![' vs ', ' vs. ', ' versus ', ' @ ', ' at '].some(t => q.includes(t))) return false;
 
-  // 2. NUKE FUTURES, PROPS, AND LEFTOVER JUNK
+  // 2. FILTER FUTURES, PROPS, AND NON-GAME MARKETS
   const junk = [
-    'championship', 'title', 'season', 'award', 'mvp', 'rookie', 'draft',
-    'conference winner', 'division winner', 'defensive',
-    'coach of the year', 'make the playoffs', 'win the', 'series winner', 
-    'points', 'rebounds', 'assists', 'score', 'stats', 'most valuable',
-    'half', 'quarter', 'margin', 'seed',
-    ' fc', 'fc ', ' sc', 'sc ', 'club', 'draw', 'tie', 'league',
-    'nhl', 'hockey', 'nfl', 'football', 'mlb', 'baseball', 'tennis', 'csgo',
-    'will be traded', 'trade destination'
+    'championship', 'award', 'mvp', 'rookie', 'draft', 'most valuable',
+    'division winner', 'pennant', 'wild card', 'make the playoffs', 'series winner',
+    'strikeout', 'home run', 'batting', 'earned run', 'hits allowed', 'run line',
+    'margin', 'inning', 'score', 'stats',
+    'draw', 'tie', ' fc', 'fc ',
+    'nhl', 'hockey', 'nba', 'basketball', 'nfl', 'football', 'tennis', 'soccer', 'csgo',
+    'will be traded', 'trade destination',
   ];
   if (junk.some(word => q.includes(word))) return false;
 
@@ -187,15 +186,23 @@ function isPureMoneyline(market: PolymarketMarketWithKind): boolean {
 // MAIN PAGINATED FETCHER (DUAL-PRONGED)
 // ==========================================
 
-export async function getPolymarketBasketballMarkets(): Promise<PolymarketMarketWithKind[]> {
+export async function getPolymarketBaseballMarkets(): Promise<PolymarketMarketWithKind[]> {
   const allEvents: GammaEvent[] = [];
   const limit = 100;
+  const sports = await fetchPolymarketSportsMetadata();
 
   // =========================================================
-  // PRONG 1: FETCH NBA BY SERIES_ID
+  // PRONG 1: FETCH MLB BY SERIES_ID (discovered from /sports)
   // =========================================================
   const seriesIds = new Set<string>();
-  seriesIds.add('10345');
+  for (const s of sports) {
+    const name = (s.sport ?? '').toLowerCase();
+    if (name.includes('mlb') || name.includes('baseball')) {
+      if (s.series) {
+        s.series.split(',').forEach(id => { const t = id.trim(); if (t) seriesIds.add(t); });
+      }
+    }
+  }
 
   for (const seriesId of seriesIds) {
     let offset = 0;
@@ -206,28 +213,22 @@ export async function getPolymarketBasketballMarkets(): Promise<PolymarketMarket
         if (!res.ok) break;
         const events = (await res.json()) as GammaEvent[];
         if (!Array.isArray(events) || events.length === 0) break;
-
         allEvents.push(...events);
         if (events.length < limit) break;
         offset += limit;
-      } catch (e) {
-        break;
-      }
+      } catch { break; }
     }
   }
 
   // =========================================================
-  // PRONG 2: FETCH CBB BY TAG_ID
+  // PRONG 2: FETCH MLB BY TAG_ID
   // =========================================================
   const tagIds = new Set<string>();
 
-  const sports = await fetchPolymarketSportsMetadata();
   for (const s of sports) {
     const name = (s.sport ?? '').toLowerCase();
-    if (name.includes('cbb') || name.includes('ncaab') || name.includes('college basketball')) {
-      if (s.tags) {
-        s.tags.split(',').forEach(t => tagIds.add(t.trim()));
-      }
+    if (name.includes('mlb') || name.includes('baseball')) {
+      if (s.tags) s.tags.split(',').forEach(t => { const tr = t.trim(); if (tr) tagIds.add(tr); });
     }
   }
 
@@ -238,12 +239,12 @@ export async function getPolymarketBasketballMarkets(): Promise<PolymarketMarket
       const allTags = (await res.json()) as GammaTag[];
       allTags.forEach(t => {
         const slug = (t.slug ?? '').toLowerCase();
-        if (slug === 'cbb' || slug === 'ncaab' || slug === 'mens-college-basketball') {
+        if (slug === 'mlb' || slug === 'baseball' || slug === 'major-league-baseball') {
           if (t.id) tagIds.add(t.id);
         }
       });
     }
-  } catch (e) {}
+  } catch {}
 
   for (const tagId of tagIds) {
     let offset = 0;
@@ -254,67 +255,31 @@ export async function getPolymarketBasketballMarkets(): Promise<PolymarketMarket
         if (!res.ok) break;
         const events = (await res.json()) as GammaEvent[];
         if (!Array.isArray(events) || events.length === 0) break;
-
         allEvents.push(...events);
         if (events.length < limit) break;
         offset += limit;
-      } catch (e) {
-        break;
-      }
+      } catch { break; }
     }
   }
 
-  // =========================================================
-  // DOCS LOGIC: STRICT EVENT-LEVEL SCRUBBING
-  // =========================================================
-
+  // Deduplicate
   const seen = new Set<string>();
   const dedupedEvents: GammaEvent[] = [];
-
   for (const e of allEvents) {
     const key = e.id ?? e.slug;
     if (!key || seen.has(key)) continue;
-
-    let isWomensGame = false;
-
-    // 1. Logically inspect the official API tags array.
-    // If a market maker cross-tagged a women's game into the men's feed, this catches it.
-    if (Array.isArray(e.tags)) {
-      for (const t of e.tags) {
-        const slug = (t.slug ?? '').toLowerCase();
-        if (slug.includes('women') || slug === 'ncaaw' || slug === 'wbb' || slug === 'wnba') {
-          isWomensGame = true;
-          break;
-        }
-      }
-    }
-
-    // 2. Secondary API Title check.
-    // This is the fail-safe to catch lazy market makers who didn't assign tags at all but used (W).
-    const titleText = (e.title ?? '').toLowerCase();
-    if (titleText.includes('(w)') || titleText.includes('women')) {
-      isWomensGame = true;
-    }
-
-    // Immediately drop the event if it triggered any women's flags.
-    if (isWomensGame) {
-      continue;
-    }
-
     seen.add(key);
     dedupedEvents.push(e);
   }
 
-  console.log(`[Polymarket] Checkpoint 1: Fetched ${dedupedEvents.length} strictly Men's basketball events.`);
-
+  console.log(`[Polymarket] Checkpoint 1: Fetched ${dedupedEvents.length} MLB events.`);
   const normalized = normalizePolymarketMarkets(dedupedEvents);
-
   const filtered = normalized.filter(isPureMoneyline);
-  console.log(`[Polymarket] Checkpoint 2: Verified upcoming Men's moneyline games = ${filtered.length}`);
+  console.log(`[Polymarket] Checkpoint 2: Verified upcoming MLB moneyline games = ${filtered.length}`);
 
   return filtered;
 }
 
 export async function getPolymarketMarkets(): Promise<PolymarketMarketWithKind[]> {
-  return getPolymarketBasketballMarkets();
+  return getPolymarketBaseballMarkets();
 }

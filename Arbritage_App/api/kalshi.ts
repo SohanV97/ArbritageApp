@@ -17,7 +17,6 @@ const KALSHI_PAGE_LIMIT = 100;
 const KALSHI_PAGE_DELAY_MS = 300;
 /** Stop after this many pages so refresh finishes in ~15–20s max */
 const KALSHI_MAX_PAGES = 25;
-const KALSHI_DEBUG_LOGS = false;
 
 function getKalshiApiKey(): string | null {
   const key = Constants.expoConfig?.extra?.kalshiApiKey;
@@ -68,18 +67,6 @@ interface KalshiMarket {
 interface KalshiMarketsResponse {
   markets?: KalshiMarket[];
   cursor?: string;
-}
-
-interface KalshiSeries {
-  ticker?: string;
-  title?: string;
-  category?: string;
-  tags?: string[];
-  [key: string]: unknown;
-}
-
-interface KalshiSeriesListResponse {
-  series?: KalshiSeries[];
 }
 
 // ==========================================
@@ -135,6 +122,9 @@ async function fetchKalshiMarketsPageWithParams(opts: {
   const url = `${KALSHI_API_BASE}/markets?${params.toString()}`;
   
   const headers: Record<string, string> = {};
+
+  const key = getKalshiApiKey();
+  if (key) headers['KALSHI-ACCESS-KEY'] = key;
 
   let lastError: Error | null = null;
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -206,24 +196,22 @@ export function normalizeKalshiMarketsToUnified(markets: KalshiMarket[]): Unifie
 }
 
 export function normalizeKalshiMarkets(markets: KalshiMarket[]): UnifiedMarket[] {
-  return markets.map((m) => {
-    if (typeof m.ticker === 'string' && (m.ticker.includes('KXMV') || m.market_type === 'scalar')) return null;
-    
-    // Using the restored getPrice to catch nested/camelCase values
+  const result: UnifiedMarket[] = [];
+  for (const m of markets) {
+    if (typeof m.ticker === 'string' && (m.ticker.includes('KXMV') || m.market_type === 'scalar')) continue;
+
     let yesCents = extractCents(getPrice(m, 'yes_ask_dollars', 'yesAskDollars', 'yes_ask', 'yesAsk'));
     let noCents = extractCents(getPrice(m, 'no_ask_dollars', 'noAskDollars', 'no_ask', 'noAsk'));
 
-    // Fallbacks
     if (!yesCents) yesCents = extractCents(getPrice(m, 'yes_bid_dollars', 'yesBidDollars', 'yes_bid', 'yesBid'));
     if (!noCents) noCents = extractCents(getPrice(m, 'no_bid_dollars', 'noBidDollars', 'no_bid', 'noBid'));
 
-    // If completely illiquid on one side
     if (yesCents && !noCents) noCents = 100 - yesCents;
     if (noCents && !yesCents) yesCents = 100 - noCents;
 
-    if (!yesCents || !noCents || yesCents + noCents > 105) return null;
+    if (!yesCents || !noCents || yesCents + noCents > 105) continue;
 
-    return {
+    result.push({
       id: `kalshi-${m.ticker}`,
       venue: 'kalshi',
       question: m.title ?? m.subtitle ?? m.ticker ?? '',
@@ -232,8 +220,9 @@ export function normalizeKalshiMarkets(markets: KalshiMarket[]): UnifiedMarket[]
       noPriceCents: noCents,
       resolutionTime: m.close_time ?? m.expiration_time,
       url: `https://kalshi.com/markets/${m.ticker}`,
-    };
-  }).filter((m): m is UnifiedMarket => m != null);
+    });
+  }
+  return result;
 }
 
 // ==========================================
@@ -245,24 +234,15 @@ export async function getKalshiMarkets(): Promise<UnifiedMarket[]> {
   return normalizeKalshiMarkets(raw);
 }
 
-export async function getKalshiBasketballMarkets(): Promise<UnifiedMarket[]> {
-  // Directly fetch only the daily game series (Lightning fast, ~50 markets total)
-  const basketballSeriesTickers = [
-    'KXNBAGAME',      // NBA Daily Games (Moneyline)
-    'KXNCAAMBGAME'    // Men's College Basketball Games
-  ];
-  
+export async function getKalshiBaseballMarkets(): Promise<UnifiedMarket[]> {
   const raw: KalshiMarket[] = [];
-  
-  for (const ticker of basketballSeriesTickers) {
-    console.log(`[Kalshi] Fetching markets for series: ${ticker}...`);
-    try {
-      const seriesMarkets = await fetchKalshiMarketsBySeries(ticker);
-      raw.push(...seriesMarkets);
-    } catch (error) {
-      console.error(`[Kalshi ERROR] Failed to fetch ${ticker}:`, error);
-    }
-    await delay(KALSHI_PAGE_DELAY_MS);
+
+  console.log(`[Kalshi] Fetching markets for series: KXMLBGAME...`);
+  try {
+    const seriesMarkets = await fetchKalshiMarketsBySeries('KXMLBGAME');
+    raw.push(...seriesMarkets);
+  } catch (error) {
+    console.error(`[Kalshi ERROR] Failed to fetch KXMLBGAME:`, error);
   }
 
   console.log(`[Kalshi] Checkpoint 1: Total raw markets fetched = ${raw.length}`);
@@ -270,10 +250,10 @@ export async function getKalshiBasketballMarkets(): Promise<UnifiedMarket[]> {
 
   const normalized = normalizeKalshiMarkets(raw);
   console.log(`[Kalshi] Checkpoint 2: Markets with valid Yes/No prices = ${normalized.length}`);
-  
-  // BULLETPROOF REGEX: Accounts for Kalshi's letters in their dates (e.g. KXNBAGAME-26FEB24NYKCLE-CLE)
-  const dailyMoneylineRegex = /^KX(NBAGAME|NCAAMBGAME)-[A-Z0-9]+-[A-Z0-9]+$/i;
-  
+
+  // e.g. KXMLBGAME-25JUN26NYYBOS-NYY
+  const dailyMoneylineRegex = /^KXMLBGAME-[A-Z0-9]+-[A-Z0-9]+$/i;
+
   const filtered = normalized.filter(market => {
     const symbol = market.symbol?.toUpperCase() || '';
     return dailyMoneylineRegex.test(symbol);
@@ -283,7 +263,6 @@ export async function getKalshiBasketballMarkets(): Promise<UnifiedMarket[]> {
   return filtered;
 }
 
-// Kept for backward compatibility
 export async function getKalshiSportsMarkets(): Promise<UnifiedMarket[]> {
-  return getKalshiBasketballMarkets();
+  return getKalshiBaseballMarkets();
 }
