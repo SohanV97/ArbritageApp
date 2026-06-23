@@ -1,8 +1,9 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
-import type { ArbitrageOpportunity } from '@/lib/market-types';
+import type { ArbitrageOpportunity, Category } from '@/lib/market-types';
 import type { OpportunitiesResponse } from './api/opportunities/route';
+import { CATEGORY_LABELS, CATEGORY_COLORS } from '@/lib/categories';
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -12,10 +13,6 @@ function fmtUsd(dollars: number) {
 
 function pct(cents: number) {
   return `${(cents / 100).toFixed(0)}%`;
-}
-
-function edge(ep: number) {
-  return ep.toFixed(2);
 }
 
 function timeAgo(iso: string) {
@@ -30,6 +27,19 @@ function fmtDate(iso: string | undefined) {
 }
 
 // ─── sub-components ─────────────────────────────────────────────────────────
+
+function CategoryBadge({ category }: { category?: Category }) {
+  if (!category) return null;
+  const c = CATEGORY_COLORS[category];
+  return (
+    <span
+      style={{ background: c.bg, color: c.color, border: `1px solid ${c.border}` }}
+      className="text-xs font-semibold px-2 py-0.5 rounded-full"
+    >
+      {CATEGORY_LABELS[category]}
+    </span>
+  );
+}
 
 function VenueBadge({ venue }: { venue: 'polymarket' | 'kalshi' }) {
   const ispm = venue === 'polymarket';
@@ -56,7 +66,7 @@ function EdgeBadge({ ep }: { ep: number }) {
       style={{ background: bg, color, border: `1px solid ${border}` }}
       className="text-sm font-bold px-3 py-1 rounded-full font-mono"
     >
-      +{edge(ep)}%
+      +{ep.toFixed(2)}%
     </span>
   );
 }
@@ -65,8 +75,8 @@ function OpportunityCard({ opp, contracts }: { opp: ArbitrageOpportunity; contra
   const [showDebug, setShowDebug] = useState(false);
   const { pair, legA, legB, totalCostCents, edgePercent } = opp;
   const isArb = edgePercent >= 0.5;
+  const category = pair.polymarket.category;
 
-  // Scale from 1-contract (cents) to N-contract (dollars)
   const totalCostDollars = (totalCostCents / 100) * contracts;
   const payoutDollars = contracts;
   const profitDollars = (edgePercent / 100) * contracts;
@@ -84,9 +94,12 @@ function OpportunityCard({ opp, contracts }: { opp: ArbitrageOpportunity; contra
       }}
       className="rounded-xl p-5 flex flex-col gap-4"
     >
-      {/* Header row */}
+      {/* Header */}
       <div className="flex items-start justify-between gap-3">
-        <div className="flex-1 min-w-0">
+        <div className="flex-1 min-w-0 flex flex-col gap-1">
+          <div className="flex items-center gap-2">
+            <CategoryBadge category={category} />
+          </div>
           <p className="text-sm font-medium leading-snug text-[--text-muted] line-clamp-1">
             {pair.polymarket.question}
           </p>
@@ -110,17 +123,11 @@ function OpportunityCard({ opp, contracts }: { opp: ArbitrageOpportunity; contra
           >
             <div className="flex items-center justify-between">
               <VenueBadge venue={leg.venue} />
-              <span className="text-xs text-[--text-muted] font-mono">
-                {leg.side.toUpperCase()}
-              </span>
+              <span className="text-xs text-[--text-muted] font-mono">{leg.side.toUpperCase()}</span>
             </div>
-            <p className="text-xs text-[--text-muted] line-clamp-2 leading-snug">
-              {market.question}
-            </p>
+            <p className="text-xs text-[--text-muted] line-clamp-2 leading-snug">{market.question}</p>
             <div className="flex items-center justify-between mt-1">
-              <span className="text-base font-bold font-mono">
-                {pct(leg.priceCents)}
-              </span>
+              <span className="text-base font-bold font-mono">{pct(leg.priceCents)}</span>
               <span className="text-xs text-[--text-muted] font-mono">
                 fee {fmtUsd((leg.feeCents / 100) * contracts)}
               </span>
@@ -129,7 +136,7 @@ function OpportunityCard({ opp, contracts }: { opp: ArbitrageOpportunity; contra
         ))}
       </div>
 
-      {/* Summary row */}
+      {/* Summary */}
       <div
         style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}
         className="rounded-lg px-4 py-3 flex items-center justify-between gap-4"
@@ -153,23 +160,17 @@ function OpportunityCard({ opp, contracts }: { opp: ArbitrageOpportunity; contra
             </p>
           </div>
         </div>
-
-        {/* Dates */}
         <div className="text-xs text-[--text-muted] text-right flex flex-col gap-0.5">
-          <span style={{ color: datesMatch ? 'var(--text-muted)' : '#f87171' }}>
-            PM: {pmDate ?? '—'}
-          </span>
-          <span style={{ color: datesMatch ? 'var(--text-muted)' : '#f87171' }}>
-            KAL: {kalDate ?? '—'}
-          </span>
+          <span style={{ color: datesMatch ? 'var(--text-muted)' : '#f87171' }}>PM: {pmDate ?? '—'}</span>
+          <span style={{ color: datesMatch ? 'var(--text-muted)' : '#f87171' }}>KAL: {kalDate ?? '—'}</span>
         </div>
       </div>
 
       {/* Debug toggle */}
       <button
         onClick={() => setShowDebug(v => !v)}
-        style={{ color: 'var(--text-muted)', borderColor: 'var(--border)' }}
         className="text-xs underline text-left w-fit"
+        style={{ color: 'var(--text-muted)' }}
       >
         {showDebug ? 'Hide' : 'Show'} matched questions
       </button>
@@ -189,7 +190,7 @@ function OpportunityCard({ opp, contracts }: { opp: ArbitrageOpportunity; contra
           </div>
           {!datesMatch && (
             <p className="text-xs" style={{ color: '#f87171' }}>
-              Date mismatch — may not be the same game.
+              Date mismatch — may not be the same event.
             </p>
           )}
         </div>
@@ -200,11 +201,14 @@ function OpportunityCard({ opp, contracts }: { opp: ArbitrageOpportunity; contra
 
 // ─── main page ───────────────────────────────────────────────────────────────
 
+const ALL_CATEGORIES: Category[] = ['mlb', 'soccer', 'politics'];
+
 export default function Home() {
   const [data, setData] = useState<OpportunitiesResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [lastFetch, setLastFetch] = useState<string | null>(null);
-  const [filter, setFilter] = useState<'all' | 'arb' | 'near'>('all');
+  const [edgeFilter, setEdgeFilter] = useState<'all' | 'arb' | 'near'>('all');
+  const [catFilter, setCatFilter] = useState<Category | 'all'>('all');
   const [contracts, setContracts] = useState(100);
 
   const load = useCallback(async () => {
@@ -221,7 +225,6 @@ export default function Home() {
     }
   }, []);
 
-  // Load on mount, then every 90s
   useEffect(() => {
     load();
     const id = setInterval(load, 90_000);
@@ -229,25 +232,30 @@ export default function Home() {
   }, [load]);
 
   const opportunities = data?.opportunities ?? [];
-  const filtered =
-    filter === 'arb' ? opportunities.filter(o => o.edgePercent >= 2) :
-    filter === 'near' ? opportunities.filter(o => o.edgePercent >= 0.5 && o.edgePercent < 2) :
-    opportunities;
 
-  const arbCount = opportunities.filter(o => o.edgePercent >= 2).length;
+  const catFiltered = catFilter === 'all'
+    ? opportunities
+    : opportunities.filter(o => o.pair.polymarket.category === catFilter);
+
+  const filtered =
+    edgeFilter === 'arb' ? catFiltered.filter(o => o.edgePercent >= 2) :
+    edgeFilter === 'near' ? catFiltered.filter(o => o.edgePercent >= 0.5 && o.edgePercent < 2) :
+    catFiltered;
+
+  const arbCount = catFiltered.filter(o => o.edgePercent >= 2).length;
+  const nearCount = catFiltered.filter(o => o.edgePercent >= 0.5 && o.edgePercent < 2).length;
 
   return (
     <div className="min-h-screen px-4 py-8 max-w-4xl mx-auto">
       {/* Header */}
       <div className="flex items-start justify-between mb-8 gap-4">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight">MLB Arb Finder</h1>
+          <h1 className="text-2xl font-bold tracking-tight">Arb Finder</h1>
           <p className="text-sm text-[--text-muted] mt-1">
-            Kalshi × Polymarket · live moneyline arbitrage
+            Kalshi × Polymarket · MLB · Soccer · Politics
           </p>
         </div>
         <div className="flex items-center gap-3 flex-shrink-0">
-          {/* Contracts input */}
           <div className="flex items-center gap-2">
             <label className="text-xs text-[--text-muted] whitespace-nowrap">Contracts</label>
             <input
@@ -275,21 +283,18 @@ export default function Home() {
       {data && (
         <div
           style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}
-          className="rounded-xl px-5 py-4 mb-6 flex flex-wrap gap-6 items-center"
+          className="rounded-xl px-5 py-4 mb-4 flex flex-wrap gap-6 items-center"
         >
           {[
-            { label: 'Polymarket games', val: data.stats.pmMarkets },
-            { label: 'Kalshi games', val: data.stats.kalshiMarkets },
+            { label: 'PM markets', val: data.stats.pmMarkets },
+            { label: 'Kalshi markets', val: data.stats.kalshiMarkets },
             { label: 'Matched pairs', val: data.stats.matchedPairs },
             { label: 'Opportunities', val: opportunities.length },
-            { label: 'True arb (≥2%)', val: arbCount, highlight: arbCount > 0 },
+            { label: 'True arb (≥2%)', val: opportunities.filter(o => o.edgePercent >= 2).length, highlight: opportunities.filter(o => o.edgePercent >= 2).length > 0 },
           ].map(({ label, val, highlight }) => (
             <div key={label}>
               <p className="text-xs text-[--text-muted]">{label}</p>
-              <p
-                className="text-lg font-bold font-mono"
-                style={{ color: highlight ? '#4ade80' : 'var(--foreground)' }}
-              >
+              <p className="text-lg font-bold font-mono" style={{ color: highlight ? '#4ade80' : 'var(--foreground)' }}>
                 {val}
               </p>
             </div>
@@ -300,22 +305,66 @@ export default function Home() {
         </div>
       )}
 
-      {/* Filter tabs */}
+      {/* Per-category breakdown */}
+      {data?.stats.byCategory && Object.keys(data.stats.byCategory).length > 0 && (
+        <div
+          style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}
+          className="rounded-xl px-5 py-3 mb-6 flex flex-wrap gap-4"
+        >
+          {ALL_CATEGORIES.map(cat => {
+            const s = data.stats.byCategory[cat];
+            if (!s) return null;
+            const c = CATEGORY_COLORS[cat];
+            return (
+              <div key={cat} className="flex items-center gap-2">
+                <span style={{ color: c.color }} className="text-xs font-semibold">{CATEGORY_LABELS[cat]}</span>
+                <span className="text-xs text-[--text-muted] font-mono">
+                  {s.pm}pm / {s.kalshi}kal / {s.pairs} pairs
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Category filter */}
+      <div className="flex gap-2 mb-3 flex-wrap">
+        {(['all', ...ALL_CATEGORIES] as const).map(cat => {
+          const isActive = catFilter === cat;
+          const c = cat !== 'all' ? CATEGORY_COLORS[cat] : null;
+          return (
+            <button
+              key={cat}
+              onClick={() => setCatFilter(cat)}
+              style={{
+                background: isActive ? (c ? c.bg : 'var(--surface)') : 'transparent',
+                border: `1px solid ${isActive ? (c ? c.border : '#8b949e') : 'var(--border)'}`,
+                color: isActive ? (c ? c.color : 'var(--foreground)') : 'var(--text-muted)',
+              }}
+              className="px-3 py-1.5 rounded-full text-sm font-medium transition-colors"
+            >
+              {cat === 'all' ? 'All sports' : CATEGORY_LABELS[cat]}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Edge filter */}
       <div className="flex gap-2 mb-5">
         {(['all', 'arb', 'near'] as const).map(f => (
           <button
             key={f}
-            onClick={() => setFilter(f)}
+            onClick={() => setEdgeFilter(f)}
             style={{
-              background: filter === f ? 'var(--surface)' : 'transparent',
-              border: `1px solid ${filter === f ? '#8b949e' : 'var(--border)'}`,
-              color: filter === f ? 'var(--foreground)' : 'var(--text-muted)',
+              background: edgeFilter === f ? 'var(--surface)' : 'transparent',
+              border: `1px solid ${edgeFilter === f ? '#8b949e' : 'var(--border)'}`,
+              color: edgeFilter === f ? 'var(--foreground)' : 'var(--text-muted)',
             }}
             className="px-4 py-1.5 rounded-full text-sm font-medium transition-colors"
           >
-            {f === 'all' ? `All (${opportunities.length})` :
+            {f === 'all' ? `All (${catFiltered.length})` :
              f === 'arb' ? `True arb ≥2% (${arbCount})` :
-             `Near miss 0.5–2% (${opportunities.filter(o => o.edgePercent >= 0.5 && o.edgePercent < 2).length})`}
+             `Near miss 0.5–2% (${nearCount})`}
           </button>
         ))}
       </div>
@@ -324,8 +373,8 @@ export default function Home() {
       {loading && !data && (
         <div className="flex flex-col items-center justify-center py-24 gap-4">
           <div className="w-8 h-8 border-2 border-[--border] border-t-[--pm-light] rounded-full animate-spin" />
-          <p className="text-sm text-[--text-muted]">Fetching markets from Kalshi and Polymarket…</p>
-          <p className="text-xs text-[--text-muted]">This takes 10–30s on first load (paginating both APIs)</p>
+          <p className="text-sm text-[--text-muted]">Fetching markets across all categories…</p>
+          <p className="text-xs text-[--text-muted]">This takes 15–40s on first load</p>
         </div>
       )}
 
@@ -336,18 +385,15 @@ export default function Home() {
         >
           <p className="text-sm font-semibold text-red-400">Error fetching data</p>
           <p className="text-xs text-[--text-muted] mt-1 font-mono">{data.error}</p>
-          <p className="text-xs text-[--text-muted] mt-2">
-            Note: Kalshi&apos;s API may block browser requests (CORS). This app calls APIs server-side, so it should work — but Kalshi may require an API key.
-          </p>
         </div>
       )}
 
       {data && !loading && filtered.length === 0 && (
         <div className="py-16 text-center">
           <p className="text-[--text-muted]">
-            {filter === 'all'
-              ? 'No matched pairs found right now. Markets may be closed or prices are too far apart.'
-              : `No ${filter === 'arb' ? 'true arb' : 'near-miss'} opportunities right now.`}
+            {edgeFilter === 'all'
+              ? 'No matched pairs found right now.'
+              : `No ${edgeFilter === 'arb' ? 'true arb' : 'near-miss'} opportunities right now.`}
           </p>
         </div>
       )}
@@ -362,7 +408,6 @@ export default function Home() {
         ))}
       </div>
 
-      {/* Footer */}
       <div className="mt-12 pt-6 border-t border-[--border] text-xs text-[--text-muted] flex flex-wrap gap-x-6 gap-y-2">
         <span>Prices refresh every 90s</span>
         <span>Fees included in edge calculation</span>

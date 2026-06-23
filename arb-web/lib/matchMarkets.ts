@@ -4,31 +4,19 @@ import type { PolymarketMarketWithKind } from '@/api/polymarket';
 function normalizeTitle(s: string): string {
   return s
     .toLowerCase()
+    .replace(/\d{4}-\d{2}-\d{2}/g, ' ')   // strip ISO dates before splitting on punctuation
+    .replace(/'s\b/g, 's')                 // "A's" → "As" so it tokenizes as a 2-char token
     .replace(/[^\w\s@]/g, ' ')
-    .replace(/\b(the|baseball|mlb|game|moneyline|winner|will|beat|to|win)\b/g, ' ')
+    .replace(/\b(the|on|end|in|draw|baseball|mlb|nba|nfl|nhl|game|moneyline|winner|will|beat|to|win|hockey|basketball|football)\b/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
-const TOKEN_ALIASES: Record<string, string[]> = {
-  nyy: ['yankees'], bos: ['red sox', 'redsox'], tor: ['blue jays', 'bluejays'],
-  bal: ['orioles'], tb: ['rays'], tbr: ['rays'],
-  cle: ['guardians'], det: ['tigers'], kc: ['royals', 'kansas city'],
-  kcr: ['royals', 'kansas city'], min: ['twins'], cws: ['white sox', 'whitesox'],
-  hou: ['astros'], tex: ['rangers'], sea: ['mariners'], laa: ['angels'], oak: ['athletics'],
-  atl: ['braves'], phi: ['phillies'], nym: ['mets'], mia: ['marlins'],
-  wsh: ['nationals'], was: ['nationals'],
-  chc: ['cubs'], mil: ['brewers'], pit: ['pirates'], stl: ['cardinals'], cin: ['reds'],
-  lad: ['dodgers'], sf: ['giants'], sfg: ['giants'],
-  ari: ['diamondbacks', 'd-backs'], col: ['rockies'], sd: ['padres'], sdp: ['padres'],
-};
-
-function expandToken(t: string): Set<string> {
+function expandToken(t: string, aliases: Record<string, string[]>): Set<string> {
   const out = new Set<string>([t]);
-  const aliases = TOKEN_ALIASES[t];
-  // Array.isArray guards against prototype properties (e.g. TOKEN_ALIASES['constructor'])
-  if (Array.isArray(aliases)) {
-    for (const a of aliases) {
+  const aliasList = aliases[t];
+  if (Array.isArray(aliasList)) {
+    for (const a of aliasList) {
       out.add(a);
       const normalized = normalizeTitle(a).replace(/\b(?:vs|at|@)\b/g, '').replace(/\s+/g, ' ').trim();
       if (normalized.includes(' ')) {
@@ -44,22 +32,22 @@ function tokenize(s: string): Set<string> {
   return new Set(normalized.split(/\s+/).filter(t => t.length > 1));
 }
 
-function tokenMatchesAny(aToken: string, bSet: Set<string>): boolean {
+function tokenMatchesAny(aToken: string, bSet: Set<string>, aliases: Record<string, string[]>): boolean {
   if (bSet.has(aToken)) return true;
-  for (const e of expandToken(aToken)) { if (e !== aToken && bSet.has(e)) return true; }
+  for (const e of expandToken(aToken, aliases)) { if (e !== aToken && bSet.has(e)) return true; }
   return false;
 }
 
-function overlapCount(a: Set<string>, b: Set<string>): number {
+function overlapCount(a: Set<string>, b: Set<string>, aliases: Record<string, string[]>): number {
   let n = 0;
-  for (const x of a) { if (tokenMatchesAny(x, b)) n++; }
+  for (const x of a) { if (tokenMatchesAny(x, b, aliases)) n++; }
   return n;
 }
 
-function jaccardSimilarity(a: Set<string>, b: Set<string>): number {
+function jaccardSimilarity(a: Set<string>, b: Set<string>, aliases: Record<string, string[]>): number {
   if (a.size === 0 && b.size === 0) return 1;
   if (a.size === 0 || b.size === 0) return 0;
-  const intersection = overlapCount(a, b);
+  const intersection = overlapCount(a, b, aliases);
   const union = a.size + b.size - intersection;
   return union === 0 ? 0 : intersection / union;
 }
@@ -82,11 +70,17 @@ function getTeams(q: string): [Set<string>, Set<string>] {
 export function matchMarkets(
   polymarketMarkets: PolymarketMarketWithKind[],
   kalshiMarkets: UnifiedMarket[],
-  options: { minTitleSimilarity?: number; minOverlapTokens?: number; requireSameDay?: boolean } = {}
+  options: {
+    minTitleSimilarity?: number;
+    minOverlapTokens?: number;
+    requireSameDay?: boolean;
+    aliases?: Record<string, string[]>;
+  } = {}
 ): MatchedPair[] {
   const minSim = options.minTitleSimilarity ?? 0.35;
   const minOverlap = options.minOverlapTokens ?? 2;
   const requireSameDay = options.requireSameDay ?? false;
+  const aliases = options.aliases ?? {};
   const rawPairs: MatchedPair[] = [];
 
   for (const pm of polymarketMarkets) {
@@ -103,12 +97,16 @@ export function matchMarkets(
 
       const kTokens = tokenize(k.question);
       const kTeams = getTeams(k.question);
-      const overlap = overlapCount(pmTokens, kTokens);
-      let sim = jaccardSimilarity(pmTokens, kTokens);
+      const overlap = overlapCount(pmTokens, kTokens, aliases);
+      let sim = jaccardSimilarity(pmTokens, kTokens, aliases);
 
       if (pmTeams[0].size > 0 && pmTeams[1].size > 0 && kTeams[0].size > 0 && kTeams[1].size > 0) {
-        const directMatch = overlapCount(pmTeams[0], kTeams[0]) > 0 && overlapCount(pmTeams[1], kTeams[1]) > 0;
-        const flippedMatch = overlapCount(pmTeams[0], kTeams[1]) > 0 && overlapCount(pmTeams[1], kTeams[0]) > 0;
+        const directMatch =
+          overlapCount(pmTeams[0], kTeams[0], aliases) > 0 &&
+          overlapCount(pmTeams[1], kTeams[1], aliases) > 0;
+        const flippedMatch =
+          overlapCount(pmTeams[0], kTeams[1], aliases) > 0 &&
+          overlapCount(pmTeams[1], kTeams[0], aliases) > 0;
         if (!directMatch && !flippedMatch) sim -= 1.0;
       }
 
@@ -116,6 +114,7 @@ export function matchMarkets(
     }
   }
 
+  // Deduplicate: per Polymarket market keep the Kalshi market whose price is closest
   const pairsByPmId = new Map<string, MatchedPair[]>();
   for (const pair of rawPairs) {
     const id = pair.polymarket.id;

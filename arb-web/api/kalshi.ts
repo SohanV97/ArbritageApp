@@ -1,9 +1,10 @@
-import type { UnifiedMarket } from '@/lib/market-types';
+import type { UnifiedMarket, Category } from '@/lib/market-types';
+import { KALSHI_MONEYLINE_PATTERN } from '@/lib/categories';
 
 const KALSHI_API_BASE = 'https://api.elections.kalshi.com/trade-api/v2';
 const KALSHI_PAGE_LIMIT = 100;
 const KALSHI_PAGE_DELAY_MS = 300;
-const KALSHI_MAX_PAGES = 25;
+const KALSHI_MAX_PAGES = 30;
 
 function getKalshiApiKey(): string | null {
   const key = process.env.KALSHI_API_KEY;
@@ -61,7 +62,10 @@ function extractCents(val: any): number | null {
   return null;
 }
 
-async function fetchKalshiMarketsPage(opts: { cursor?: string | null; seriesTicker?: string }): Promise<{ markets: KalshiMarket[]; nextCursor: string | null }> {
+async function fetchKalshiMarketsPage(opts: {
+  cursor?: string | null;
+  seriesTicker?: string;
+}): Promise<{ markets: KalshiMarket[]; nextCursor: string | null }> {
   const params = new URLSearchParams();
   params.set('status', 'open');
   params.set('limit', String(KALSHI_PAGE_LIMIT));
@@ -92,7 +96,22 @@ async function fetchKalshiMarketsPage(opts: { cursor?: string | null; seriesTick
   throw lastError ?? new Error('Kalshi API: failed after retry');
 }
 
-async function fetchKalshiMarketsBySeries(seriesTicker: string): Promise<KalshiMarket[]> {
+const MONTH_ABBR: Record<string, string> = {
+  JAN: '01', FEB: '02', MAR: '03', APR: '04', MAY: '05', JUN: '06',
+  JUL: '07', AUG: '08', SEP: '09', OCT: '10', NOV: '11', DEC: '12',
+};
+
+// Extracts the actual game date from tickers like KXWCGAME-26JUN25TURUSA-USA.
+// Kalshi uses tournament end date as close_time for soccer (e.g. July 11 for WC final),
+// so we must read the date embedded in the ticker instead.
+function parseKalshiGameDate(ticker: string): string | null {
+  const m = ticker.match(/-(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})/i);
+  if (!m) return null;
+  const mm = MONTH_ABBR[m[2].toUpperCase()];
+  return mm ? `20${m[1]}-${mm}-${m[3]}` : null;
+}
+
+async function paginateKalshi(seriesTicker?: string): Promise<KalshiMarket[]> {
   const all: KalshiMarket[] = [];
   let cursor: string | null = null;
   let isFirstPage = true;
@@ -109,7 +128,7 @@ async function fetchKalshiMarketsBySeries(seriesTicker: string): Promise<KalshiM
   return all;
 }
 
-export function normalizeKalshiMarkets(markets: KalshiMarket[]): UnifiedMarket[] {
+export function normalizeKalshiMarkets(markets: KalshiMarket[], category?: Category): UnifiedMarket[] {
   const result: UnifiedMarket[] = [];
   for (const m of markets) {
     if (typeof m.ticker === 'string' && (m.ticker.includes('KXMV') || m.market_type === 'scalar')) continue;
@@ -129,22 +148,112 @@ export function normalizeKalshiMarkets(markets: KalshiMarket[]): UnifiedMarket[]
       symbol: m.ticker,
       yesPriceCents: yesCents,
       noPriceCents: noCents,
-      resolutionTime: m.close_time ?? m.expiration_time,
+      resolutionTime: parseKalshiGameDate(m.ticker)
+        ? `${parseKalshiGameDate(m.ticker)}T23:59:00Z`
+        : (m.close_time ?? m.expiration_time),
       url: `https://kalshi.com/markets/${m.ticker}`,
+      category,
     });
   }
   return result;
 }
 
-export async function getKalshiBaseballMarkets(): Promise<UnifiedMarket[]> {
-  console.log('[Kalshi] Fetching KXMLBGAME series...');
-  const raw = await fetchKalshiMarketsBySeries('KXMLBGAME');
-  console.log(`[Kalshi] Raw markets: ${raw.length}`);
-  if (raw.length === 0) return [];
+// Explicit series tickers to try per category. The API requires series_ticker to return
+// sports markets — an unfiltered request returns only election markets.
+// Multiple series are tried in parallel; empty/missing series return [] gracefully.
+const CATEGORY_SERIES: Record<Category, string[]> = {
+  mlb: ['KXMLBGAME'],
+  soccer: [
+    'KXWCGAME',   // World Cup games (2026)
+    'KXWC',       // World Cup generic
+    'KXWC2026',   // World Cup 2026 explicit
+    'KXFIFAWC',   // FIFA World Cup
+    'KXSOCCER',   // General soccer
+    'KXMLSGAME',  // MLS games
+    'KXMLS',      // MLS generic
+    'KXEPL',      // English Premier League
+    'KXUEFACL',   // UEFA Champions League
+  ],
+  politics: [
+    // Chamber control (confirmed working)
+    'CONTROLS',             // Which party controls the US Senate
+    'KXBALANCEPOWERCOMBO',  // Which party controls House + Senate combo
+    // 2026 Senate midterm races — pattern: SENATE{2-letter-state}
+    'SENATETX', // Texas
+    'SENATEIA', // Iowa
+    'SENATEAK', // Alaska
+    'SENATEGA', // Georgia
+    'SENATEMI', // Michigan
+    'SENATEWI', // Wisconsin
+    'SENATEMT', // Montana
+    'SENATEME', // Maine
+    'SENATENJ', // New Jersey
+    'SENATENH', // New Hampshire
+    'SENATECO', // Colorado
+    'SENATENM', // New Mexico
+    'SENATENC', // North Carolina
+    'SENATEOR', // Oregon
+    'SENATEIL', // Illinois
+    'SENATEMD', // Maryland
+    'SENATEVA', // Virginia
+    'SENATENV', // Nevada
+    'SENATEDE', // Delaware
+    'SENATELA', // Louisiana
+    'SENATEAL', // Alabama
+    'SENATEAR', // Arkansas
+    'SENATEID', // Idaho
+    'SENATEKS', // Kansas
+    'SENATEMN', // Minnesota
+    'SENATESC', // South Carolina
+  ],
+};
 
-  const normalized = normalizeKalshiMarkets(raw);
-  const dailyMoneylineRegex = /^KXMLBGAME-[A-Z0-9]+-[A-Z0-9]+$/i;
-  const filtered = normalized.filter(m => dailyMoneylineRegex.test(m.symbol?.toUpperCase() ?? ''));
-  console.log(`[Kalshi] Filtered MLB moneyline markets: ${filtered.length}`);
-  return filtered;
+export async function getKalshiMarketsForAllCategories(): Promise<Map<Category, UnifiedMarket[]>> {
+  const result = new Map<Category, UnifiedMarket[]>();
+
+  await Promise.all(
+    (Object.entries(CATEGORY_SERIES) as [Category, string[]][]).map(async ([cat, seriesList]) => {
+      // Fetch all series for this category concurrently; swallow per-series errors
+      // Fetch series sequentially to avoid burst rate-limiting (37+ parallel requests → 429s)
+      const raw: KalshiMarket[] = [];
+      for (let i = 0; i < seriesList.length; i++) {
+        const markets = await paginateKalshi(seriesList[i]).catch((err: Error) => {
+          console.error(`[Kalshi] ${cat}/${seriesList[i]} error: ${err.message}`);
+          return [] as KalshiMarket[];
+        });
+        raw.push(...markets);
+        if (i < seriesList.length - 1) await delay(150);
+      }
+
+      // Deduplicate by ticker across series
+      const seen = new Set<string>();
+      const deduped = raw.filter(m => {
+        if (seen.has(m.ticker)) return false;
+        seen.add(m.ticker);
+        return true;
+      });
+
+      console.log(`[Kalshi] ${cat}: ${deduped.length} raw markets`);
+      if (deduped.length === 0) return;
+
+      const normalized = normalizeKalshiMarkets(deduped, cat);
+      const pattern = KALSHI_MONEYLINE_PATTERN[cat];
+
+      let filtered: UnifiedMarket[];
+      if (cat === 'politics') {
+        filtered = normalized.filter(
+          m => !m.resolutionTime || Date.parse(m.resolutionTime) > Date.now()
+        );
+      } else if (pattern) {
+        filtered = normalized.filter(m => pattern.test(m.symbol?.toUpperCase() ?? ''));
+      } else {
+        filtered = normalized;
+      }
+
+      console.log(`[Kalshi] ${cat}: ${filtered.length} markets after filter`);
+      if (filtered.length > 0) result.set(cat, filtered);
+    })
+  );
+
+  return result;
 }

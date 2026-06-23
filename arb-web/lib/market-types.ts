@@ -1,3 +1,5 @@
+export type Category = 'mlb' | 'soccer' | 'politics';
+
 export type Venue = 'polymarket' | 'kalshi';
 
 export type BinarySide = 'yes' | 'no';
@@ -12,6 +14,7 @@ export interface UnifiedMarket {
   resolutionTime?: string;
   url: string;
   rulesDescription?: string;
+  category?: Category;
 }
 
 export interface MatchedPair {
