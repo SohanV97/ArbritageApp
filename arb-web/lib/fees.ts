@@ -30,7 +30,7 @@ export function estimatePolymarketFeeCents(
 export function estimateKalshiFeeCents(priceCents: number, contracts: number): number {
   if (contracts <= 0) return 0;
   // Kalshi charges 3% of profit on winning contracts; use worst-case (assume this leg wins)
-  return Math.ceil(0.03 * (100 - priceCents) * contracts);
+  return Math.max(0, 0.03 * (100 - priceCents) * contracts);
 }
 
 export function estimateFeeCentsForVenue(

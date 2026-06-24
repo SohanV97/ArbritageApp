@@ -8,11 +8,11 @@ import { CATEGORY_LABELS, CATEGORY_COLORS } from '@/lib/categories';
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 function fmtUsd(dollars: number) {
-  return `$${dollars.toFixed(2)}`;
+  return `$${Math.abs(dollars).toFixed(2)}`;
 }
 
 function pct(cents: number) {
-  return `${(cents / 100).toFixed(0)}%`;
+  return `${Math.round(cents)}%`;
 }
 
 function timeAgo(iso: string) {
@@ -23,7 +23,7 @@ function timeAgo(iso: string) {
 
 function fmtDate(iso: string | undefined) {
   if (!iso) return null;
-  return new Date(iso).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+  return new Date(iso).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'UTC' });
 }
 
 // ─── sub-components ─────────────────────────────────────────────────────────
@@ -57,6 +57,22 @@ function VenueBadge({ venue }: { venue: 'polymarket' | 'kalshi' }) {
   );
 }
 
+function SideBadge({ side }: { side: 'yes' | 'no' }) {
+  const isYes = side === 'yes';
+  return (
+    <span
+      style={{
+        background: isYes ? '#16a34a22' : '#9333ea22',
+        color: isYes ? '#4ade80' : '#c084fc',
+        border: `1px solid ${isYes ? '#16a34a55' : '#9333ea55'}`,
+      }}
+      className="text-sm font-bold px-2.5 py-0.5 rounded-full font-mono tracking-wide"
+    >
+      {side.toUpperCase()}
+    </span>
+  );
+}
+
 function EdgeBadge({ ep }: { ep: number }) {
   const color = ep >= 2 ? '#4ade80' : ep >= 0.5 ? '#fbbf24' : '#8b949e';
   const bg = ep >= 2 ? '#16a34a22' : ep >= 0.5 ? '#d9770622' : '#8b949e11';
@@ -66,24 +82,39 @@ function EdgeBadge({ ep }: { ep: number }) {
       style={{ background: bg, color, border: `1px solid ${border}` }}
       className="text-sm font-bold px-3 py-1 rounded-full font-mono"
     >
-      +{ep.toFixed(2)}%
+      {ep >= 0 ? '+' : ''}{ep.toFixed(2)}%
     </span>
   );
 }
 
-function OpportunityCard({ opp, contracts }: { opp: ArbitrageOpportunity; contracts: number }) {
+function OpportunityCard({ opp, amount }: { opp: ArbitrageOpportunity; amount: number }) {
   const [showDebug, setShowDebug] = useState(false);
   const { pair, legA, legB, totalCostCents, edgePercent } = opp;
   const isArb = edgePercent >= 0.5;
   const category = pair.polymarket.category;
 
-  const totalCostDollars = (totalCostCents / 100) * contracts;
-  const payoutDollars = contracts;
-  const profitDollars = (edgePercent / 100) * contracts;
+  const totalCostDollars = (totalCostCents / 100) * amount;
+  const payoutDollars = amount;
+  const profitDollars = payoutDollars - totalCostDollars;
 
   const pmDate = fmtDate(pair.polymarket.resolutionTime);
   const kalDate = fmtDate(pair.kalshi.resolutionTime);
   const datesMatch = pair.polymarket.resolutionTime?.slice(0, 10) === pair.kalshi.resolutionTime?.slice(0, 10);
+
+  const legs = [
+    { leg: legA, market: legA.venue === 'polymarket' ? pair.polymarket : pair.kalshi },
+    { leg: legB, market: legB.venue === 'polymarket' ? pair.polymarket : pair.kalshi },
+  ].map(({ leg, market }) => {
+    const isFlipped = market.question.includes('[FLIPPED]');
+    return {
+      leg,
+      market,
+      displayQuestion: market.question.replace(' [FLIPPED]', ''),
+      displaySide: (isFlipped ? (leg.side === 'yes' ? 'no' : 'yes') : leg.side) as 'yes' | 'no',
+      betDollars: (leg.priceCents / 100) * amount,
+      feeDollars: (leg.feeCents / 100) * amount,
+    };
+  });
 
   return (
     <div
@@ -97,10 +128,8 @@ function OpportunityCard({ opp, contracts }: { opp: ArbitrageOpportunity; contra
       {/* Header */}
       <div className="flex items-start justify-between gap-3">
         <div className="flex-1 min-w-0 flex flex-col gap-1">
-          <div className="flex items-center gap-2">
-            <CategoryBadge category={category} />
-          </div>
-          <p className="text-sm font-medium leading-snug text-[--text-muted] line-clamp-1">
+          <CategoryBadge category={category} />
+          <p className="text-sm font-medium leading-snug text-[--text-muted] line-clamp-1 mt-1">
             {pair.polymarket.question}
           </p>
         </div>
@@ -109,28 +138,36 @@ function OpportunityCard({ opp, contracts }: { opp: ArbitrageOpportunity; contra
 
       {/* Two legs */}
       <div className="grid grid-cols-2 gap-3">
-        {[
-          { leg: legA, market: legA.venue === 'polymarket' ? pair.polymarket : pair.kalshi, label: 'Leg A' },
-          { leg: legB, market: legB.venue === 'polymarket' ? pair.polymarket : pair.kalshi, label: 'Leg B' },
-        ].map(({ leg, market, label }) => (
+        {legs.map(({ leg, market, displayQuestion, displaySide, betDollars, feeDollars }, i) => (
           <a
-            key={label}
+            key={i}
             href={market.url}
             target="_blank"
             rel="noopener noreferrer"
-            style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}
-            className="rounded-lg p-3 flex flex-col gap-2 hover:border-[#8b949e] transition-colors cursor-pointer"
+            style={{ background: 'var(--surface)', border: '1px solid var(--border)', textDecoration: 'none' }}
+            className="rounded-lg p-4 flex flex-col gap-3 hover:border-[#8b949e] transition-colors cursor-pointer"
           >
-            <div className="flex items-center justify-between">
+            {/* Platform + Side */}
+            <div className="flex items-center justify-between gap-2 flex-wrap">
               <VenueBadge venue={leg.venue} />
-              <span className="text-xs text-[--text-muted] font-mono">{leg.side.toUpperCase()}</span>
+              <SideBadge side={displaySide} />
             </div>
-            <p className="text-xs text-[--text-muted] line-clamp-2 leading-snug">{market.question}</p>
-            <div className="flex items-center justify-between mt-1">
-              <span className="text-base font-bold font-mono">{pct(leg.priceCents)}</span>
-              <span className="text-xs text-[--text-muted] font-mono">
-                fee {fmtUsd((leg.feeCents / 100) * contracts)}
-              </span>
+
+            {/* Question */}
+            <p className="text-xs text-[--text-muted] line-clamp-2 leading-snug">{displayQuestion}</p>
+
+            {/* Big dollar bet amount */}
+            <div>
+              <p className="text-xs text-[--text-muted] font-medium mb-0.5">Bet</p>
+              <p className="text-3xl font-bold font-mono" style={{ color: 'var(--foreground)' }}>
+                {fmtUsd(betDollars)}
+              </p>
+            </div>
+
+            {/* Price + fee */}
+            <div className="flex items-center justify-between text-xs text-[--text-muted] font-mono">
+              <span>@ {pct(leg.priceCents)}</span>
+              <span>fee {fmtUsd(feeDollars)}</span>
             </div>
           </a>
         ))}
@@ -141,9 +178,9 @@ function OpportunityCard({ opp, contracts }: { opp: ArbitrageOpportunity; contra
         style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}
         className="rounded-lg px-4 py-3 flex items-center justify-between gap-4"
       >
-        <div className="flex gap-6">
+        <div className="flex gap-6 flex-wrap">
           <div>
-            <p className="text-xs text-[--text-muted]">Total cost</p>
+            <p className="text-xs text-[--text-muted]">Total invested</p>
             <p className="text-sm font-bold font-mono">{fmtUsd(totalCostDollars)}</p>
           </div>
           <div>
@@ -154,9 +191,9 @@ function OpportunityCard({ opp, contracts }: { opp: ArbitrageOpportunity; contra
             <p className="text-xs text-[--text-muted]">Profit</p>
             <p
               className="text-sm font-bold font-mono"
-              style={{ color: edgePercent >= 0.5 ? '#4ade80' : '#8b949e' }}
+              style={{ color: edgePercent >= 0 ? '#4ade80' : '#f87171' }}
             >
-              {fmtUsd(profitDollars)}
+              {profitDollars >= 0 ? '+' : '-'}{fmtUsd(profitDollars)}
             </p>
           </div>
         </div>
@@ -209,7 +246,7 @@ export default function Home() {
   const [lastFetch, setLastFetch] = useState<string | null>(null);
   const [edgeFilter, setEdgeFilter] = useState<'all' | 'arb' | 'near'>('all');
   const [catFilter, setCatFilter] = useState<Category | 'all'>('all');
-  const [contracts, setContracts] = useState(100);
+  const [amount, setAmount] = useState(100);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -257,15 +294,15 @@ export default function Home() {
         </div>
         <div className="flex items-center gap-3 flex-shrink-0">
           <div className="flex items-center gap-2">
-            <label className="text-xs text-[--text-muted] whitespace-nowrap">Contracts</label>
+            <label className="text-xs text-[--text-muted] whitespace-nowrap">Amount ($)</label>
             <input
               type="number"
               min={1}
-              max={10000}
-              value={contracts}
-              onChange={e => setContracts(Math.max(1, parseInt(e.target.value) || 1))}
+              max={100000}
+              value={amount}
+              onChange={e => setAmount(Math.max(1, parseInt(e.target.value) || 1))}
               style={{ background: 'var(--surface)', border: '1px solid var(--border)', color: 'var(--foreground)' }}
-              className="w-20 px-2 py-1.5 rounded-lg text-sm font-mono text-right"
+              className="w-24 px-2 py-1.5 rounded-lg text-sm font-mono text-right"
             />
           </div>
           <button
@@ -288,7 +325,6 @@ export default function Home() {
           {[
             { label: 'PM markets', val: data.stats.pmMarkets },
             { label: 'Kalshi markets', val: data.stats.kalshiMarkets },
-            { label: 'Matched pairs', val: data.stats.matchedPairs },
             { label: 'Opportunities', val: opportunities.length },
             { label: 'True arb (≥2%)', val: opportunities.filter(o => o.edgePercent >= 2).length, highlight: opportunities.filter(o => o.edgePercent >= 2).length > 0 },
           ].map(({ label, val, highlight }) => (
@@ -319,7 +355,7 @@ export default function Home() {
               <div key={cat} className="flex items-center gap-2">
                 <span style={{ color: c.color }} className="text-xs font-semibold">{CATEGORY_LABELS[cat]}</span>
                 <span className="text-xs text-[--text-muted] font-mono">
-                  {s.pm}pm / {s.kalshi}kal / {s.pairs} pairs
+                  {s.pm}pm / {s.kalshi}kal / {s.pairs} events matched
                 </span>
               </div>
             );
@@ -403,7 +439,7 @@ export default function Home() {
           <OpportunityCard
             key={`${opp.pair.polymarket.id}-${i}`}
             opp={opp}
-            contracts={contracts}
+            amount={amount}
           />
         ))}
       </div>
@@ -411,7 +447,7 @@ export default function Home() {
       <div className="mt-12 pt-6 border-t border-[--border] text-xs text-[--text-muted] flex flex-wrap gap-x-6 gap-y-2">
         <span>Prices refresh every 90s</span>
         <span>Fees included in edge calculation</span>
-        <span>Contracts = max payout in dollars per pair</span>
+        <span>Amount = payout when winning leg resolves</span>
         <span>Always verify prices before placing trades</span>
       </div>
     </div>

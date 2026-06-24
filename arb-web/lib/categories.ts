@@ -81,7 +81,7 @@ export const SPORT_ALIASES: Record<Category, Record<string, string[]>> = {
     lafc: ['los angeles fc'], lag: ['la galaxy', 'galaxy'],
     nycfc: ['new york city fc', 'nyc fc'], nyrb: ['new york red bulls', 'red bulls'],
     atl: ['atlanta united'], mia: ['inter miami', 'miami'],
-    sea: ['sounders', 'seattle sounders'], por: ['timbers', 'portland timbers'],
+    sea: ['sounders', 'seattle sounders'], ptim: ['timbers', 'portland timbers'],
     // Common European clubs
     rma: ['real madrid'], bar: ['barcelona'], mci: ['manchester city', 'man city'],
     mun: ['manchester united', 'man utd'], lfc: ['liverpool'], che: ['chelsea'],

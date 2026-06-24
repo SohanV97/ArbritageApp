@@ -69,7 +69,7 @@ export async function GET() {
         };
       });
 
-      const opps = findArbitrageOpportunities(typedPairs, -10);
+      const opps = findArbitrageOpportunities(typedPairs, 0);
       allOpportunities.push(...opps);
       byCategory[cat] = { pm: pmMarkets.length, kalshi: kalshiMarkets.length, pairs: pairs.length };
     }

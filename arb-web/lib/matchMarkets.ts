@@ -90,9 +90,9 @@ export function matchMarkets(
 
     for (const k of kalshiMarkets) {
       const kDay = parseResolutionDay(k.resolutionTime);
-      // Only enforce date check when both dates are present; allow ±1 calendar day for UTC/ET offset
+      // Require exact same calendar date — different dates = different events
       if (requireSameDay && pmDay !== null && kDay !== null) {
-        if (Math.abs(Date.parse(pmDay) - Date.parse(kDay)) > 86_400_000) continue;
+        if (pmDay !== kDay) continue;
       }
 
       const kTokens = tokenize(k.question);
