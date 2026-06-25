@@ -76,6 +76,7 @@ function parseOutcomePrices(outcomePrices: string | undefined): { yes: number; n
 export interface PolymarketMarketWithKind extends UnifiedMarket {
   polymarketFeeKind: PolymarketMarketKind;
   yesTokenId?: string;
+  noTokenId?: string;
 }
 
 function normalizeEvents(
@@ -105,7 +106,14 @@ function normalizeEvents(
       const conditionId = m.condition_id ?? m.conditionId ?? m.id ?? '';
 
       let yesTokenId: string | undefined;
-      try { if (typeof m.clobTokenIds === 'string') yesTokenId = (JSON.parse(m.clobTokenIds) as string[])[0]; } catch { /* ok */ }
+      let noTokenId: string | undefined;
+      try {
+        if (typeof m.clobTokenIds === 'string') {
+          const ids = JSON.parse(m.clobTokenIds) as string[];
+          yesTokenId = ids[0];
+          noTokenId = ids[1];
+        }
+      } catch { /* ok */ }
 
       out.push({
         id: `pm-${conditionId || slug}`,
@@ -117,6 +125,7 @@ function normalizeEvents(
         url: `https://polymarket.com/event/${eventSlug}`,
         polymarketFeeKind: feeKind,
         yesTokenId,
+        noTokenId,
         category,
       });
     }

@@ -19,7 +19,7 @@ export interface OpportunitiesResponse {
   error?: string;
 }
 
-export const revalidate = 60;
+export const revalidate = 60; // cache for 60s — re-fetches upstream APIs once per minute
 
 const SPORT_CATEGORIES: Category[] = ['mlb', 'soccer'];
 

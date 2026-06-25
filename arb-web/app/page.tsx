@@ -1,9 +1,11 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ArbitrageOpportunity, Category } from '@/lib/market-types';
 import type { OpportunitiesResponse } from './api/opportunities/route';
+import type { ExecuteResponse } from './api/execute/route';
 import { CATEGORY_LABELS, CATEGORY_COLORS } from '@/lib/categories';
+import { kellyBet } from '@/lib/kelly';
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -87,7 +89,12 @@ function EdgeBadge({ ep }: { ep: number }) {
   );
 }
 
-function OpportunityCard({ opp, amount }: { opp: ArbitrageOpportunity; amount: number }) {
+function OpportunityCard({ opp, amount, bankroll, onUseKelly }: {
+  opp: ArbitrageOpportunity;
+  amount: number;
+  bankroll: number;
+  onUseKelly: (n: number) => void;
+}) {
   const [showDebug, setShowDebug] = useState(false);
   const { pair, legA, legB, totalCostCents, edgePercent } = opp;
   const isArb = edgePercent >= 0.5;
@@ -96,6 +103,7 @@ function OpportunityCard({ opp, amount }: { opp: ArbitrageOpportunity; amount: n
   const totalCostDollars = (totalCostCents / 100) * amount;
   const payoutDollars = amount;
   const profitDollars = payoutDollars - totalCostDollars;
+  const kellySuggestion = kellyBet(bankroll, edgePercent);
 
   const pmDate = fmtDate(pair.polymarket.resolutionTime);
   const kalDate = fmtDate(pair.kalshi.resolutionTime);
@@ -133,7 +141,16 @@ function OpportunityCard({ opp, amount }: { opp: ArbitrageOpportunity; amount: n
             {pair.polymarket.question}
           </p>
         </div>
-        <EdgeBadge ep={edgePercent} />
+        <div className="flex flex-col items-end gap-1 flex-shrink-0">
+          <EdgeBadge ep={edgePercent} />
+          <button
+            onClick={() => onUseKelly(kellySuggestion)}
+            className="text-xs font-mono hover:underline"
+            style={{ color: '#fbbf24' }}
+          >
+            Kelly: {fmtUsd(kellySuggestion)}
+          </button>
+        </div>
       </div>
 
       {/* Two legs */}
@@ -236,6 +253,16 @@ function OpportunityCard({ opp, amount }: { opp: ArbitrageOpportunity; amount: n
   );
 }
 
+// ─── exec log ────────────────────────────────────────────────────────────────
+
+interface ExecLogEntry {
+  ts: string;
+  question: string;
+  edgePercent: number;
+  amount: number;
+  result: ExecuteResponse;
+}
+
 // ─── main page ───────────────────────────────────────────────────────────────
 
 const ALL_CATEGORIES: Category[] = ['mlb', 'soccer', 'politics'];
@@ -248,7 +275,17 @@ export default function Home() {
   const [catFilter, setCatFilter] = useState<Category | 'all'>('all');
   const [amount, setAmount] = useState(100);
 
-  const load = useCallback(async () => {
+  // Auto-exec state
+  const [autoExec, setAutoExec] = useState(false);
+  const [execThreshold, setExecThreshold] = useState(1.5);
+  const [bankroll, setBankroll] = useState(10000);
+  const [execLog, setExecLog] = useState<ExecLogEntry[]>([]);
+  const executedPairs = useRef(new Set<string>());
+  const isFetching = useRef(false);
+
+  const load = useCallback(async (force = false) => {
+    if (isFetching.current && !force) return; // skip if a fetch is already in flight
+    isFetching.current = true;
     setLoading(true);
     try {
       const res = await fetch('/api/opportunities');
@@ -259,14 +296,48 @@ export default function Home() {
       console.error(e);
     } finally {
       setLoading(false);
+      isFetching.current = false;
     }
   }, []);
 
+  // Poll every 60s — server caches for 60s so polls after the first return instantly
   useEffect(() => {
     load();
-    const id = setInterval(load, 90_000);
+    const id = setInterval(() => load(), 60_000);
     return () => clearInterval(id);
   }, [load]);
+
+  // Auto-execute when opportunities appear and auto-exec is enabled
+  useEffect(() => {
+    if (!autoExec || !data) return;
+    for (const opp of data.opportunities) {
+      if (opp.edgePercent < execThreshold) break; // list is sorted descending
+      const pairKey = `${opp.pair.polymarket.id}|${opp.pair.kalshi.id}`;
+      if (executedPairs.current.has(pairKey)) continue;
+      executedPairs.current.add(pairKey);
+
+      const betAmount = kellyBet(bankroll, opp.edgePercent);
+      fetch('/api/execute', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ opportunity: opp, amount: betAmount }),
+      })
+        .then(r => r.json())
+        .then((result: ExecuteResponse) => {
+          setExecLog(prev => [{
+            ts: new Date().toISOString(),
+            question: opp.pair.polymarket.question,
+            edgePercent: opp.edgePercent,
+            amount: betAmount,
+            result,
+          }, ...prev].slice(0, 50));
+        })
+        .catch(err => console.error('[auto-exec]', err));
+
+      // 5-minute cooldown per pair to prevent re-executing the same opportunity
+      setTimeout(() => executedPairs.current.delete(pairKey), 5 * 60_000);
+    }
+  }, [data, autoExec, execThreshold, bankroll]);
 
   const opportunities = data?.opportunities ?? [];
 
@@ -285,28 +356,16 @@ export default function Home() {
   return (
     <div className="min-h-screen px-4 py-8 max-w-4xl mx-auto">
       {/* Header */}
-      <div className="flex items-start justify-between mb-8 gap-4">
+      <div className="flex items-start justify-between mb-6 gap-4 flex-wrap">
         <div>
           <h1 className="text-2xl font-bold tracking-tight">Arb Finder</h1>
           <p className="text-sm text-[--text-muted] mt-1">
             Kalshi × Polymarket · MLB · Soccer · Politics
           </p>
         </div>
-        <div className="flex items-center gap-3 flex-shrink-0">
-          <div className="flex items-center gap-2">
-            <label className="text-xs text-[--text-muted] whitespace-nowrap">Amount ($)</label>
-            <input
-              type="number"
-              min={1}
-              max={100000}
-              value={amount}
-              onChange={e => setAmount(Math.max(1, parseInt(e.target.value) || 1))}
-              style={{ background: 'var(--surface)', border: '1px solid var(--border)', color: 'var(--foreground)' }}
-              className="w-24 px-2 py-1.5 rounded-lg text-sm font-mono text-right"
-            />
-          </div>
+        <div className="flex items-center gap-3 flex-shrink-0 flex-wrap">
           <button
-            onClick={load}
+            onClick={() => load(true)}
             disabled={loading}
             style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}
             className="px-4 py-2 rounded-lg text-sm font-medium hover:border-[#8b949e] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
@@ -314,6 +373,100 @@ export default function Home() {
             {loading ? 'Refreshing…' : 'Refresh'}
           </button>
         </div>
+      </div>
+
+      {/* Controls bar */}
+      <div
+        style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}
+        className="rounded-xl px-5 py-4 mb-4 flex flex-wrap gap-5 items-end"
+      >
+        {/* Manual amount */}
+        <div className="flex flex-col gap-1">
+          <label className="text-xs text-[--text-muted]">Amount ($)</label>
+          <input
+            type="number"
+            min={1}
+            max={100000}
+            value={amount}
+            onChange={e => setAmount(Math.max(1, parseInt(e.target.value) || 1))}
+            style={{ background: 'var(--card)', border: '1px solid var(--border)', color: 'var(--foreground)' }}
+            className="w-24 px-2 py-1.5 rounded-lg text-sm font-mono text-right"
+          />
+        </div>
+
+        <div style={{ width: 1, height: 36, background: 'var(--border)' }} />
+
+        {/* Bankroll */}
+        <div className="flex flex-col gap-1">
+          <label className="text-xs text-[--text-muted]">Bankroll ($)</label>
+          <input
+            type="number"
+            min={1}
+            value={bankroll}
+            onChange={e => setBankroll(Math.max(1, parseInt(e.target.value) || 1))}
+            style={{ background: 'var(--card)', border: '1px solid var(--border)', color: 'var(--foreground)' }}
+            className="w-28 px-2 py-1.5 rounded-lg text-sm font-mono text-right"
+          />
+        </div>
+
+        {/* Auto-exec toggle */}
+        <div className="flex flex-col gap-1">
+          <label className="text-xs text-[--text-muted]">Auto-execute</label>
+          <div className="flex items-center gap-2 h-[34px]">
+            <button
+              onClick={() => setAutoExec(v => !v)}
+              style={{
+                background: autoExec ? '#16a34a' : '#374151',
+                transition: 'background 0.2s',
+              }}
+              className="relative w-10 h-5 rounded-full flex-shrink-0"
+              aria-label="Toggle auto-execute"
+            >
+              <div
+                style={{
+                  transform: autoExec ? 'translateX(20px)' : 'translateX(2px)',
+                  transition: 'transform 0.2s',
+                }}
+                className="absolute top-0.5 w-4 h-4 bg-white rounded-full"
+              />
+            </button>
+            <span className="text-xs font-medium" style={{ color: autoExec ? '#4ade80' : 'var(--text-muted)' }}>
+              {autoExec ? 'ON' : 'OFF'}
+            </span>
+          </div>
+        </div>
+
+        {/* Threshold — only shown when auto-exec is on */}
+        {autoExec && (
+          <div className="flex flex-col gap-1">
+            <label className="text-xs text-[--text-muted]">Min edge</label>
+            <div className="flex items-center gap-1">
+              <input
+                type="number"
+                min={0.1}
+                max={20}
+                step={0.1}
+                value={execThreshold}
+                onChange={e => setExecThreshold(parseFloat(e.target.value) || 1.5)}
+                style={{ background: 'var(--card)', border: `1px solid #16a34a66`, color: '#4ade80' }}
+                className="w-16 px-2 py-1.5 rounded-lg text-sm font-mono text-right"
+              />
+              <span className="text-xs text-[--text-muted]">%</span>
+            </div>
+          </div>
+        )}
+
+        {autoExec && (
+          <div
+            style={{ background: '#16a34a11', border: '1px solid #16a34a33' }}
+            className="rounded-lg px-3 py-1.5 flex items-center gap-2 self-end"
+          >
+            <div className="w-2 h-2 rounded-full bg-[#4ade80] animate-pulse" />
+            <span className="text-xs text-[#4ade80] font-medium">
+              Auto-trading active · Kelly sizing · {execLog.length} executed
+            </span>
+          </div>
+        )}
       </div>
 
       {/* Stats bar */}
@@ -440,15 +593,52 @@ export default function Home() {
             key={`${opp.pair.polymarket.id}-${i}`}
             opp={opp}
             amount={amount}
+            bankroll={bankroll}
+            onUseKelly={setAmount}
           />
         ))}
       </div>
 
+      {/* Execution log */}
+      {execLog.length > 0 && (
+        <div className="mt-10">
+          <h2 className="text-sm font-semibold mb-3">Execution Log</h2>
+          <div className="flex flex-col gap-2">
+            {execLog.map((entry, i) => (
+              <div
+                key={i}
+                style={{
+                  background: 'var(--surface)',
+                  border: `1px solid ${entry.result.bothOk ? '#16a34a44' : '#f8717144'}`,
+                }}
+                className="rounded-lg px-4 py-3 flex items-center justify-between gap-4 flex-wrap"
+              >
+                <div className="flex flex-col gap-0.5 min-w-0">
+                  <p className="text-xs font-medium truncate">{entry.question}</p>
+                  <p className="text-xs text-[--text-muted] font-mono">
+                    {new Date(entry.ts).toLocaleTimeString()} · +{entry.edgePercent.toFixed(2)}% · {fmtUsd(entry.amount)}
+                  </p>
+                </div>
+                <div className="flex gap-3 text-xs font-mono flex-shrink-0">
+                  <span style={{ color: entry.result.kalshi.ok ? '#4ade80' : '#f87171' }}>
+                    KAL {entry.result.kalshi.ok ? `✓ ${entry.result.kalshi.orderId?.slice(0, 8)}` : `✗ ${entry.result.kalshi.error?.slice(0, 30)}`}
+                  </span>
+                  <span style={{ color: entry.result.polymarket.ok ? '#4ade80' : '#f87171' }}>
+                    PM {entry.result.polymarket.ok ? `✓ ${entry.result.polymarket.orderId?.slice(0, 8)}` : `✗ ${entry.result.polymarket.error?.slice(0, 30)}`}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="mt-12 pt-6 border-t border-[--border] text-xs text-[--text-muted] flex flex-wrap gap-x-6 gap-y-2">
-        <span>Prices refresh every 90s</span>
+        <span>Prices refresh every 15s</span>
         <span>Fees included in edge calculation</span>
         <span>Amount = payout when winning leg resolves</span>
-        <span>Always verify prices before placing trades</span>
+        <span>Kelly = fractional Kelly sizing based on bankroll</span>
+        <span>Always verify prices before enabling auto-execute</span>
       </div>
     </div>
   );
