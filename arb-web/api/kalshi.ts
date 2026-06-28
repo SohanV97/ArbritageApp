@@ -3,8 +3,10 @@ import { KALSHI_MONEYLINE_PATTERN } from '@/lib/categories';
 
 const KALSHI_API_BASE = 'https://api.elections.kalshi.com/trade-api/v2';
 const KALSHI_PAGE_LIMIT = 100;
-const KALSHI_PAGE_DELAY_MS = 300;
-const KALSHI_MAX_PAGES = 30;
+const KALSHI_PAGE_DELAY_MS = 75;  // between pages of the same series
+const KALSHI_MAX_PAGES = 3;       // 300 markets per series is plenty
+const KALSHI_SERIES_BATCH = 4;    // fetch 4 series concurrently
+const KALSHI_BATCH_DELAY_MS = 75; // between batches
 
 function getKalshiApiKey(): string | null {
   const key = process.env.KALSHI_API_KEY;
@@ -213,16 +215,19 @@ export async function getKalshiMarketsForAllCategories(): Promise<Map<Category, 
 
   await Promise.all(
     (Object.entries(CATEGORY_SERIES) as [Category, string[]][]).map(async ([cat, seriesList]) => {
-      // Fetch all series for this category concurrently; swallow per-series errors
-      // Fetch series sequentially to avoid burst rate-limiting (37+ parallel requests → 429s)
+      // Fetch in batches of KALSHI_SERIES_BATCH concurrently rather than one-by-one.
+      // Politics has 26 series; batching 4 at a time drops it from ~12 s to ~2 s.
       const raw: KalshiMarket[] = [];
-      for (let i = 0; i < seriesList.length; i++) {
-        const markets = await paginateKalshi(seriesList[i]).catch((err: Error) => {
-          console.error(`[Kalshi] ${cat}/${seriesList[i]} error: ${err.message}`);
-          return [] as KalshiMarket[];
-        });
-        raw.push(...markets);
-        if (i < seriesList.length - 1) await delay(150);
+      for (let i = 0; i < seriesList.length; i += KALSHI_SERIES_BATCH) {
+        const batch = seriesList.slice(i, i + KALSHI_SERIES_BATCH);
+        const batchResults = await Promise.all(
+          batch.map(s => paginateKalshi(s).catch((err: Error) => {
+            console.error(`[Kalshi] ${cat}/${s}: ${err.message}`);
+            return [] as KalshiMarket[];
+          }))
+        );
+        raw.push(...batchResults.flat());
+        if (i + KALSHI_SERIES_BATCH < seriesList.length) await delay(KALSHI_BATCH_DELAY_MS);
       }
 
       // Deduplicate by ticker across series

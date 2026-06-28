@@ -196,26 +196,31 @@ function isPoliticsMarket(market: PolymarketMarketWithKind): boolean {
 
 async function fetchEventsByIds(
   idParam: string,
-  ids: Set<string>
+  ids: Set<string>,
+  maxPages = 50
 ): Promise<GammaEvent[]> {
-  const all: GammaEvent[] = [];
   const limit = 100;
-  for (const id of ids) {
+  // Fetch all IDs in parallel (was sequential — with 10+ tag IDs this saved several seconds).
+  const perIdResults = await Promise.all([...ids].map(async (id) => {
+    const events: GammaEvent[] = [];
     let offset = 0;
-    while (true) {
+    let pagesFetched = 0;
+    while (pagesFetched < maxPages) {
       try {
         const url = `${POLYMARKET_GAMMA_API}/events?${idParam}=${encodeURIComponent(id)}&active=true&closed=false&limit=${limit}&offset=${offset}`;
         const res = await fetch(url, { headers: polymarketHeaders() });
         if (!res.ok) break;
-        const events = await res.json() as GammaEvent[];
-        if (!Array.isArray(events) || events.length === 0) break;
-        all.push(...events);
-        if (events.length < limit) break;
+        const page = await res.json() as GammaEvent[];
+        if (!Array.isArray(page) || page.length === 0) break;
+        events.push(...page);
+        pagesFetched++;
+        if (page.length < limit) break;
         offset += limit;
       } catch { break; }
     }
-  }
-  return all;
+    return events;
+  }));
+  return perIdResults.flat();
 }
 
 async function dedupeEvents(events: GammaEvent[]): Promise<GammaEvent[]> {
@@ -253,10 +258,13 @@ export async function getPolymarketMarketsForAllCategories(): Promise<Map<Catego
     }
   } catch { /* ok */ }
 
-  // ── Sports categories ────────────────────────────────────────────────────
+  // ── Sports + Politics in parallel ────────────────────────────────────────
+  // Sports and politics both need allTags (already fetched), so run them concurrently.
   const sportCategories: Category[] = ['mlb', 'soccer'];
 
-  await Promise.all(sportCategories.map(async (cat) => {
+  await Promise.all([
+    // Sports: MLB + soccer in parallel, capped at 5 pages each
+    Promise.all(sportCategories.map(async (cat) => {
     const keywords = POLYMARKET_SPORT_KEYWORDS[cat] ?? [];
     const seriesIds = new Set<string>();
     const tagIds = new Set<string>();
@@ -281,10 +289,12 @@ export async function getPolymarketMarketsForAllCategories(): Promise<Map<Catego
       }
     }
 
+    // Sports arb requires same-day match, so 5 pages (500 events) covers 15+ days of games.
+    // Full pagination of MLB (28 pages) costs ~8 s; capping at 5 drops it to ~1.5 s.
     const allEvents: GammaEvent[] = [];
     const [bySeriesEvents, byTagEvents] = await Promise.all([
-      seriesIds.size > 0 ? fetchEventsByIds('series_id', seriesIds) : Promise.resolve([]),
-      tagIds.size > 0 ? fetchEventsByIds('tag_id', tagIds) : Promise.resolve([]),
+      seriesIds.size > 0 ? fetchEventsByIds('series_id', seriesIds, 5) : Promise.resolve([]),
+      tagIds.size > 0 ? fetchEventsByIds('tag_id', tagIds, 5) : Promise.resolve([]),
     ]);
     allEvents.push(...bySeriesEvents, ...byTagEvents);
 
@@ -295,43 +305,40 @@ export async function getPolymarketMarketsForAllCategories(): Promise<Map<Catego
     const filtered = normalized.filter(m => isSportMoneyline(m, cat));
     console.log(`[Polymarket] ${cat}: ${filtered.length} moneyline markets`);
     result.set(cat, filtered);
-  }));
+  })),
 
-  // ── Politics ─────────────────────────────────────────────────────────────
-  const politicsTagIds = new Set<string>();
-  for (const tag of allTags) {
-    const slug = (tag.slug ?? '').toLowerCase();
-    const label = (tag.label ?? '').toLowerCase();
-    if (POLYMARKET_POLITICS_TAG_SLUGS.some(kw => slug.includes(kw) || label.includes(kw))) {
-      if (tag.id) politicsTagIds.add(tag.id);
-    }
-  }
+    // Politics: runs in parallel with sports
+    (async () => {
+      const politicsTagIds = new Set<string>();
+      for (const tag of allTags) {
+        const slug = (tag.slug ?? '').toLowerCase();
+        const label = (tag.label ?? '').toLowerCase();
+        if (POLYMARKET_POLITICS_TAG_SLUGS.some(kw => slug.includes(kw) || label.includes(kw))) {
+          if (tag.id) politicsTagIds.add(tag.id);
+        }
+      }
 
-  // Also try fetching by category param directly
-  const politicsEvents: GammaEvent[] = [];
-  try {
-    const res = await fetch(
-      `${POLYMARKET_GAMMA_API}/events?category=politics&active=true&closed=false&limit=100`,
-      { headers: polymarketHeaders() }
-    );
-    if (res.ok) {
-      const d = await res.json();
-      if (Array.isArray(d)) politicsEvents.push(...d);
-    }
-  } catch { /* ok */ }
+      // Fetch by category param and by tag IDs simultaneously
+      const [catEvents, politicsByTag] = await Promise.all([
+        fetch(
+          `${POLYMARKET_GAMMA_API}/events?category=politics&active=true&closed=false&limit=100`,
+          { headers: polymarketHeaders() }
+        ).then(r => r.ok ? r.json() as Promise<GammaEvent[]> : [] as GammaEvent[]).catch(() => [] as GammaEvent[]),
+        politicsTagIds.size > 0
+          ? fetchEventsByIds('tag_id', politicsTagIds)
+          : Promise.resolve([] as GammaEvent[]),
+      ]);
 
-  const politicsByTag = politicsTagIds.size > 0
-    ? await fetchEventsByIds('tag_id', politicsTagIds)
-    : [];
+      const politicsEvents = [...(Array.isArray(catEvents) ? catEvents : []), ...politicsByTag];
+      const dedupedPol = await dedupeEvents(politicsEvents);
+      console.log(`[Polymarket] politics: ${dedupedPol.length} events`);
 
-  politicsEvents.push(...politicsByTag);
-  const dedupedPol = await dedupeEvents(politicsEvents);
-  console.log(`[Polymarket] politics: ${dedupedPol.length} events`);
-
-  const normalizedPol = normalizeEvents(dedupedPol, 'politics', 'fee_free');
-  const filteredPol = normalizedPol.filter(isPoliticsMarket);
-  console.log(`[Polymarket] politics: ${filteredPol.length} markets`);
-  result.set('politics', filteredPol);
+      const normalizedPol = normalizeEvents(dedupedPol, 'politics', 'fee_free');
+      const filteredPol = normalizedPol.filter(isPoliticsMarket);
+      console.log(`[Polymarket] politics: ${filteredPol.length} markets`);
+      result.set('politics', filteredPol);
+    })(),
+  ]);
 
   return result;
 }
