@@ -8,7 +8,9 @@ import {
 const POLYMARKET_GAMMA_API = 'https://gamma-api.polymarket.com';
 
 function getPolymarketApiKey(): string | null {
-  const key = process.env.POLYMARKET_API_KEY;
+  // EXPO_PUBLIC_ fallback: the key may still live in the OS env under the old
+  // Expo app's naming convention.
+  const key = process.env.POLYMARKET_API_KEY ?? process.env.EXPO_PUBLIC_POLYMARKET_API_KEY;
   return typeof key === 'string' && key.length > 0 ? key : null;
 }
 
@@ -27,6 +29,11 @@ interface GammaMarket {
   slug?: string;
   outcomes?: string;
   outcomePrices?: string;
+  bestBid?: number | string;
+  bestAsk?: number | string;
+  spread?: number | string;
+  liquidity?: number | string;
+  liquidityClob?: number | string;
   end_date_iso?: string;
   endDateIso?: string;
   clobTokenIds?: string;
@@ -58,18 +65,72 @@ interface GammaSportMetadata {
   [key: string]: unknown;
 }
 
-function parseOutcomePrices(outcomePrices: string | undefined): { yes: number; no: number } {
-  if (!outcomePrices) return { yes: 50, no: 50 };
+// /sports and /tags are stable metadata — cache for 5 minutes to avoid re-fetching on every 55s rebuild.
+const PM_META_TTL_MS = 5 * 60_000;
+let _cachedSportsData: { data: GammaSportMetadata[]; ts: number } | null = null;
+let _cachedTags: { data: GammaTag[]; ts: number } | null = null;
+
+async function fetchSportsMetadata(): Promise<GammaSportMetadata[]> {
+  if (_cachedSportsData && Date.now() - _cachedSportsData.ts < PM_META_TTL_MS) return _cachedSportsData.data;
+  try {
+    const res = await fetch(`${POLYMARKET_GAMMA_API}/sports`, { headers: polymarketHeaders() });
+    if (res.ok) {
+      const data = await res.json() as GammaSportMetadata[];
+      _cachedSportsData = { data: Array.isArray(data) ? data : [], ts: Date.now() };
+      return _cachedSportsData.data;
+    }
+  } catch { /* ok */ }
+  return _cachedSportsData?.data ?? [];
+}
+
+async function fetchAllTags(): Promise<GammaTag[]> {
+  if (_cachedTags && Date.now() - _cachedTags.ts < PM_META_TTL_MS) return _cachedTags.data;
+  try {
+    const res = await fetch(`${POLYMARKET_GAMMA_API}/tags`, { headers: polymarketHeaders() });
+    if (res.ok) {
+      const data = await res.json() as GammaTag[];
+      _cachedTags = { data: Array.isArray(data) ? data : [], ts: Date.now() };
+      return _cachedTags.data;
+    }
+  } catch { /* ok */ }
+  return _cachedTags?.data ?? [];
+}
+
+function toNum(v: unknown): number | null {
+  const n = typeof v === 'number' ? v : typeof v === 'string' ? parseFloat(v) : NaN;
+  return Number.isFinite(n) ? n : null;
+}
+
+// Executable prices from the CLOB book: buying YES (outcome[0]) fills at bestAsk;
+// buying NO (outcome[1]) fills at 1 − bestBid. outcomePrices is last-trade/mid —
+// quoting it makes arbs appear that can't actually be filled at those prices.
+function parseBookPrices(m: GammaMarket): { yes: number; no: number } | null {
+  const bid = toNum(m.bestBid);
+  const ask = toNum(m.bestAsk);
+  if (bid === null || ask === null) return null;
+  if (bid <= 0 || ask <= 0 || bid >= 1 || ask >= 1 || ask < bid) return null;
+  return {
+    yes: Math.max(1, Math.min(99, Math.round(ask * 100))),
+    no: Math.max(1, Math.min(99, Math.round((1 - bid) * 100))),
+  };
+}
+
+// Returns null when the market has no real prices (e.g. Polymarket's placeholder
+// "Person A" / "Party B" slots). Defaulting to 50/50 here would fabricate
+// opportunities out of markets that were never actually quoted.
+function parseOutcomePrices(outcomePrices: string | undefined): { yes: number; no: number } | null {
+  if (!outcomePrices) return null;
   try {
     const arr = JSON.parse(outcomePrices) as string[];
-    let yes = Math.round(parseFloat(arr[0] ?? '0.5') * 100);
-    let no = Math.round(parseFloat(arr[1] ?? '0.5') * 100);
-    yes = Math.max(1, Math.min(99, yes));
-    no = Math.max(1, Math.min(99, no));
+    const rawYes = parseFloat(arr[0] ?? '');
+    const rawNo = parseFloat(arr[1] ?? '');
+    if (!Number.isFinite(rawYes) || !Number.isFinite(rawNo)) return null;
+    const yes = Math.max(1, Math.min(99, Math.round(rawYes * 100)));
+    let no = Math.max(1, Math.min(99, Math.round(rawNo * 100)));
     if (yes + no < 99 || yes + no > 101) no = 100 - yes;
     return { yes, no };
   } catch {
-    return { yes: 50, no: 50 };
+    return null;
   }
 }
 
@@ -79,15 +140,43 @@ export interface PolymarketMarketWithKind extends UnifiedMarket {
   noTokenId?: string;
 }
 
+// For sports markets, PM's end_date_iso is the event/series settlement date (often
+// 7 days later), not the actual game date. Extract the real game date from the
+// market slug, which encodes the date in the URL.
+// Handles: "...jul-2-2026", "...july-02", "...2026-07-02", "...0702" (mmdd), etc.
+const SLUG_MONTH: Record<string, string> = {
+  jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
+  jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12',
+};
+
+function extractDateFromSlug(slug: string): string | null {
+  if (!slug) return null;
+  // ISO date anywhere in slug: 2026-07-02
+  const iso = slug.match(/(\d{4}-\d{2}-\d{2})/);
+  if (iso) return iso[1];
+  // "jul-2-2026" or "jul-02-2026" or "july-2" (no year → current year inferred later)
+  const m = slug.match(/-(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*-(\d{1,2})(?:-(\d{4}))?/i);
+  if (m) {
+    const month = SLUG_MONTH[m[1].toLowerCase().slice(0, 3)];
+    if (month) {
+      const day = m[2].padStart(2, '0');
+      const year = m[3] ?? '2026';
+      return `${year}-${month}-${day}`;
+    }
+  }
+  return null;
+}
+
 function normalizeEvents(
   events: GammaEvent[],
   category: Category,
   feeKind: PolymarketMarketKind
 ): PolymarketMarketWithKind[] {
+  const isSport = category === 'mlb' || category === 'soccer';
   const out: PolymarketMarketWithKind[] = [];
   for (const event of events) {
     const markets = event.markets ?? [];
-    const eventTitle = event.title ?? '';
+    const eventTitle = (event.title ?? '').trim(); // PM titles can carry trailing spaces
     const eventSlug = event.slug ?? event.id ?? '';
     const endDate = event.end_date_iso;
 
@@ -96,7 +185,10 @@ function normalizeEvents(
       try { outcomesArr = JSON.parse(m.outcomes ?? '["Yes","No"]'); } catch { outcomesArr = ['Yes', 'No']; }
       if (outcomesArr.length !== 2) continue;
 
-      const { yes, no } = parseOutcomePrices(m.outcomePrices);
+      // Prefer executable book prices; fall back to last-trade/mid when no book data
+      const prices = parseBookPrices(m) ?? parseOutcomePrices(m.outcomePrices);
+      if (!prices) continue; // no real quotes — skip rather than invent 50/50
+      const { yes, no } = prices;
       const rawQuestion = m.question ?? m.groupItemTitle ?? '';
       let question = rawQuestion.toLowerCase().includes(eventTitle.toLowerCase()) ? rawQuestion : `${eventTitle}: ${rawQuestion}`;
       const isYesNo = outcomesArr[0].toLowerCase() === 'yes' || outcomesArr[1].toLowerCase() === 'no';
@@ -104,6 +196,13 @@ function normalizeEvents(
 
       const slug = m.slug ?? m.market_slug ?? m.condition_id ?? m.conditionId ?? m.id ?? '';
       const conditionId = m.condition_id ?? m.conditionId ?? m.id ?? '';
+
+      // For sports: extract game date from slug (more reliable than end_date_iso,
+      // which PM sets to the series/event settlement date, not the game date).
+      const slugDate = isSport ? extractDateFromSlug(m.slug ?? m.market_slug ?? '') : null;
+      const resolutionTime = slugDate
+        ? `${slugDate}T23:59:00Z`
+        : (m.end_date_iso ?? m.endDateIso ?? endDate);
 
       let yesTokenId: string | undefined;
       let noTokenId: string | undefined;
@@ -115,18 +214,33 @@ function normalizeEvents(
         }
       } catch { /* ok */ }
 
+      // Build the /event/ deep-link. Polymarket's URL always takes an EVENT slug.
+      // - Sports: each game is its own event whose slug equals the moneyline market
+      //   slug (e.g. mlb-mil-stl-2026-05-05), so the market slug deep-links the game.
+      // - Politics: the candidate/party markets live inside one multi-outcome event
+      //   ("Arkansas Senate Election Winner") and have no standalone page, so only the
+      //   event slug resolves — the market slug (will-the-republicans-win-…) 404s.
+      const marketSlug = m.slug ?? m.market_slug ?? '';
+      const urlSlug = isSport ? (marketSlug || eventSlug) : (eventSlug || marketSlug);
       out.push({
         id: `pm-${conditionId || slug}`,
         venue: 'polymarket',
         question,
         yesPriceCents: yes,
         noPriceCents: no,
-        resolutionTime: m.end_date_iso ?? m.endDateIso ?? endDate,
-        url: `https://polymarket.com/event/${eventSlug}`,
+        resolutionTime,
+        url: urlSlug
+          ? `https://polymarket.com/event/${urlSlug}`
+          : `https://polymarket.com/event/${eventSlug}`,
         polymarketFeeKind: feeKind,
         yesTokenId,
         noTokenId,
         category,
+        // Team-outcome moneylines: YES pays on outcomes[0], NO on outcomes[1]
+        yesTeam: isSport && !isYesNo ? outcomesArr[0] : undefined,
+        noTeam: isSport && !isYesNo ? outcomesArr[1] : undefined,
+        spreadCents: (() => { const s = toNum(m.spread); return s !== null ? Math.round(s * 100) : undefined; })(),
+        liquidityUsd: toNum(m.liquidityClob ?? m.liquidity) ?? undefined,
       });
     }
   }
@@ -144,6 +258,13 @@ const COMMON_SPORT_JUNK = [
   'championship', 'award', 'mvp', 'rookie', 'draft', 'most valuable',
   'division winner', 'pennant', 'wild card', 'make the playoffs', 'series winner',
   'margin', 'stats', 'will be traded', 'trade destination',
+  // Esports / gaming — these appear in PM's "sports" feed but Kalshi doesn't cover them
+  'valorant', 'vct', 'vcl', 'esports', 'e-sports', 'gaming',
+  'map 1', 'map 2', 'map 3', 'map 4', 'map 5', 'bo1', 'bo3', 'bo5',
+  'league of legends', 'counter-strike', 'cs:go', 'dota', 'overwatch',
+  'mobile legends', 'bang bang', 'mlbb', 'mid season cup',
+  // Prop-bet markets about commentary / broadcasting — not the same as match winner
+  'announcer', 'commentator', 'broadcast',
 ];
 
 // Sport-specific additional junk on top of COMMON_SPORT_JUNK
@@ -157,6 +278,12 @@ const SPORT_EXTRA_JUNK: Record<string, string[]> = {
     'clean sheet', 'penalty kick', 'penalty shootout', 'corner', 'free kick', 'foul', 'offside',
     'both teams', 'first half', 'second half', 'halftime', 'half time',
     'golden boot', 'top scorer', 'red card', 'yellow card', 'offsides',
+    // Time/outcome prop markets — NOT the same as a match winner market
+    'extra time', 'overtime', 'over time',
+    'draw', 'tie',
+    // Polymarket "More Markets" sub-events contain props like extra time, draw, etc.
+    // The event title is prefixed with "- More Markets:" so blocking this catches them all.
+    'more markets',
   ],
 };
 
@@ -175,21 +302,52 @@ function isSportMoneyline(market: PolymarketMarketWithKind, cat: Category): bool
   return true;
 }
 
-// Keywords that Kalshi's political markets tend to focus on.
-// This trims Polymarket's huge politics catalogue to the slice that overlaps with Kalshi.
-const POLITICS_MATCH_KEYWORDS = [
-  'president', 'presidential', 'senate', 'senator', 'house', 'congress', 'congressional',
-  'governor', 'election', 'primary', 'republican', 'democrat', 'gop',
-  'trump', 'harris', 'biden', 'administration', 'white house',
-  'supreme court', 'cabinet', 'nomination', 'electoral', 'midterm',
-  'legislation', 'bill', 'veto', 'executive order', 'impeach',
-  'approval rating', 'polling', 'swing state', 'battleground',
+// States with 2026 Senate races that Kalshi lists (mirrors CATEGORY_SERIES in kalshi.ts).
+const KALSHI_SENATE_STATES = [
+  'texas', 'iowa', 'alaska', 'georgia', 'michigan', 'wisconsin',
+  'montana', 'maine', 'new jersey', 'new hampshire', 'colorado',
+  'new mexico', 'north carolina', 'oregon', 'illinois', 'maryland',
+  'virginia', 'nevada', 'delaware', 'louisiana', 'alabama',
+  'arkansas', 'idaho', 'kansas', 'minnesota', 'south carolina',
+  'massachusetts', 'rhode island', 'west virginia', 'oklahoma',
+  'tennessee', 'mississippi', 'nebraska',
 ];
 
+// Kalshi politics coverage is narrow: individual 2026 Senate races + Senate/House control.
+// Filtering PM down to the same slice prevents false matches with approval ratings,
+// Supreme Court picks, policy bills, foreign elections, and other things Kalshi ignores.
 function isPoliticsMarket(market: PolymarketMarketWithKind): boolean {
   if (market.resolutionTime && Date.parse(market.resolutionTime) < Date.now()) return false;
   const q = market.question.toLowerCase();
-  return POLITICS_MATCH_KEYWORDS.some(kw => q.includes(kw));
+
+  // Kalshi has no primaries, runoffs, caucuses, or governor races
+  if (/\bprimary\b|\bprimaries\b|\brunoff\b|\bcaucus\b|\bgovernor\b|\bgov\b/.test(q)) return false;
+
+  // Drop Polymarket's placeholder candidate/party slots ("Person A", "Party B",
+  // "a candidate not listed above", "another party") — they have no real prices.
+  if (/\b(person|party|candidate)\s+[a-l]\b/.test(q)) return false;
+  if (/not listed|another party|other party/.test(q)) return false;
+
+  // Compound / derivative markets that LOOK like control markets but resolve on a
+  // different event: trifecta, supermajority, "all core four races", seat counts,
+  // "lose a seat", "before the midterms" timing markets, House+Senate combos.
+  if (/\btrifecta\b|\bsupermajority\b|\bcore four\b|\bhow many\b|\bincumbent|\bsweep\b|\bswept\b|\blose\b|\bflip\b|\bbefore the midterm/.test(q)) return false;
+  if (/\bhouse\b/.test(q) && /\bsenate\b/.test(q)) return false;
+
+  // Must name a real party so the structured matcher can align it.
+  const hasParty = /\b(republican|republicans|democrat|democrats|democratic)\b/.test(q);
+  if (!hasParty) return false;
+
+  const hasSenate = /\bsenate\b|\bsenator\b/.test(q);
+  const hasControl = /\bcontrol\b|\bmajority\b/.test(q);
+
+  // Senate race in a state Kalshi covers
+  if (hasSenate && KALSHI_SENATE_STATES.some(s => q.includes(s))) return true;
+
+  // "Which party controls / wins the Senate / House / Congress?"
+  if ((hasControl || hasSenate) && /\b(senate|house|congress)\b/.test(q)) return true;
+
+  return false;
 }
 
 // ─── event fetching helpers ──────────────────────────────────────────────────
@@ -197,9 +355,9 @@ function isPoliticsMarket(market: PolymarketMarketWithKind): boolean {
 async function fetchEventsByIds(
   idParam: string,
   ids: Set<string>,
-  maxPages = 50
+  maxPages = 3
 ): Promise<GammaEvent[]> {
-  const limit = 100;
+  const limit = 200;
   // Fetch all IDs in parallel (was sequential — with 10+ tag IDs this saved several seconds).
   const perIdResults = await Promise.all([...ids].map(async (id) => {
     const events: GammaEvent[] = [];
@@ -223,7 +381,30 @@ async function fetchEventsByIds(
   return perIdResults.flat();
 }
 
-async function dedupeEvents(events: GammaEvent[]): Promise<GammaEvent[]> {
+// Fetch events by tag slug with pagination. Politics senate/control events live
+// deep in the politics tag (well past the first 100), so the old
+// `category=politics&limit=100` call never reached them — it only saw the noisy
+// top of the feed (Kraken IPO, celebrity markets, foreign elections).
+async function fetchEventsByTagSlug(slug: string, maxPages = 12): Promise<GammaEvent[]> {
+  const limit = 200;
+  const events: GammaEvent[] = [];
+  let offset = 0;
+  for (let page = 0; page < maxPages; page++) {
+    try {
+      const url = `${POLYMARKET_GAMMA_API}/events?tag_slug=${encodeURIComponent(slug)}&active=true&closed=false&limit=${limit}&offset=${offset}`;
+      const res = await fetch(url, { headers: polymarketHeaders() });
+      if (!res.ok) break;
+      const pageEvents = await res.json() as GammaEvent[];
+      if (!Array.isArray(pageEvents) || pageEvents.length === 0) break;
+      events.push(...pageEvents);
+      if (pageEvents.length < limit) break;
+      offset += limit;
+    } catch { break; }
+  }
+  return events;
+}
+
+function dedupeEvents(events: GammaEvent[]): GammaEvent[] {
   const seen = new Set<string>();
   return events.filter(e => {
     const key = e.id ?? e.slug;
@@ -238,25 +419,8 @@ async function dedupeEvents(events: GammaEvent[]): Promise<GammaEvent[]> {
 export async function getPolymarketMarketsForAllCategories(): Promise<Map<Category, PolymarketMarketWithKind[]>> {
   const result = new Map<Category, PolymarketMarketWithKind[]>();
 
-  // Fetch the /sports metadata once
-  let sportsData: GammaSportMetadata[] = [];
-  try {
-    const res = await fetch(`${POLYMARKET_GAMMA_API}/sports`, { headers: polymarketHeaders() });
-    if (res.ok) {
-      const d = await res.json();
-      sportsData = Array.isArray(d) ? d : [];
-    }
-  } catch { /* ok */ }
-
-  // Fetch all tags once
-  let allTags: GammaTag[] = [];
-  try {
-    const res = await fetch(`${POLYMARKET_GAMMA_API}/tags`, { headers: polymarketHeaders() });
-    if (res.ok) {
-      const d = await res.json();
-      allTags = Array.isArray(d) ? d : [];
-    }
-  } catch { /* ok */ }
+  // Use cached metadata (5-min TTL) — avoids re-fetching on every 55s rebuild.
+  const [sportsData, allTags] = await Promise.all([fetchSportsMetadata(), fetchAllTags()]);
 
   // ── Sports + Politics in parallel ────────────────────────────────────────
   // Sports and politics both need allTags (already fetched), so run them concurrently.
@@ -289,16 +453,15 @@ export async function getPolymarketMarketsForAllCategories(): Promise<Map<Catego
       }
     }
 
-    // Sports arb requires same-day match, so 5 pages (500 events) covers 15+ days of games.
-    // Full pagination of MLB (28 pages) costs ~8 s; capping at 5 drops it to ~1.5 s.
+    // 3 pages × 200/page = 600 events; covers 15+ days of upcoming games.
     const allEvents: GammaEvent[] = [];
     const [bySeriesEvents, byTagEvents] = await Promise.all([
-      seriesIds.size > 0 ? fetchEventsByIds('series_id', seriesIds, 5) : Promise.resolve([]),
-      tagIds.size > 0 ? fetchEventsByIds('tag_id', tagIds, 5) : Promise.resolve([]),
+      seriesIds.size > 0 ? fetchEventsByIds('series_id', seriesIds, 3) : Promise.resolve([]),
+      tagIds.size > 0 ? fetchEventsByIds('tag_id', tagIds, 3) : Promise.resolve([]),
     ]);
     allEvents.push(...bySeriesEvents, ...byTagEvents);
 
-    const deduped = await dedupeEvents(allEvents);
+    const deduped = dedupeEvents(allEvents);
     console.log(`[Polymarket] ${cat}: ${deduped.length} events`);
 
     const normalized = normalizeEvents(deduped, cat, 'sports');
@@ -309,28 +472,13 @@ export async function getPolymarketMarketsForAllCategories(): Promise<Map<Catego
 
     // Politics: runs in parallel with sports
     (async () => {
-      const politicsTagIds = new Set<string>();
-      for (const tag of allTags) {
-        const slug = (tag.slug ?? '').toLowerCase();
-        const label = (tag.label ?? '').toLowerCase();
-        if (POLYMARKET_POLITICS_TAG_SLUGS.some(kw => slug.includes(kw) || label.includes(kw))) {
-          if (tag.id) politicsTagIds.add(tag.id);
-        }
-      }
-
-      // Fetch by category param and by tag IDs simultaneously
-      const [catEvents, politicsByTag] = await Promise.all([
-        fetch(
-          `${POLYMARKET_GAMMA_API}/events?category=politics&active=true&closed=false&limit=100`,
-          { headers: polymarketHeaders() }
-        ).then(r => r.ok ? r.json() as Promise<GammaEvent[]> : [] as GammaEvent[]).catch(() => [] as GammaEvent[]),
-        politicsTagIds.size > 0
-          ? fetchEventsByIds('tag_id', politicsTagIds)
-          : Promise.resolve([] as GammaEvent[]),
-      ]);
-
-      const politicsEvents = [...(Array.isArray(catEvents) ? catEvents : []), ...politicsByTag];
-      const dedupedPol = await dedupeEvents(politicsEvents);
+      // Paginate the politics/elections tag slugs — this is the only method that
+      // reaches the individual Senate-race events (e.g. "Georgia Senate Election
+      // Winner"), which sit far past the first page of the politics feed.
+      const slugResults = await Promise.all(
+        POLYMARKET_POLITICS_TAG_SLUGS.map(slug => fetchEventsByTagSlug(slug))
+      );
+      const dedupedPol = dedupeEvents(slugResults.flat());
       console.log(`[Polymarket] politics: ${dedupedPol.length} events`);
 
       const normalizedPol = normalizeEvents(dedupedPol, 'politics', 'fee_free');

@@ -47,9 +47,10 @@ export function findArbitrageOpportunities(
     if (bestEdge < minEdgePercent) continue;
 
     if (edge1 >= edge2) {
-      opportunities.push({ pair: { polymarket: pm, kalshi: k }, legA: { venue: 'polymarket', side: 'yes', ...legPmYes }, legB: { venue: 'kalshi', side: 'no', ...legKNo }, totalCostCents: cost1, maxPayoutCents: 100, edgePercent: edge1 });
+      // Kalshi leg buys NO → fillable size is the NO-side depth
+      opportunities.push({ pair: { polymarket: pm, kalshi: k }, legA: { venue: 'polymarket', side: 'yes', ...legPmYes }, legB: { venue: 'kalshi', side: 'no', ...legKNo }, totalCostCents: cost1, maxPayoutCents: 100, edgePercent: edge1, maxContracts: k.noDepth });
     } else {
-      opportunities.push({ pair: { polymarket: pm, kalshi: k }, legA: { venue: 'polymarket', side: 'no', ...legPmNo }, legB: { venue: 'kalshi', side: 'yes', ...legKYes }, totalCostCents: cost2, maxPayoutCents: 100, edgePercent: edge2 });
+      opportunities.push({ pair: { polymarket: pm, kalshi: k }, legA: { venue: 'polymarket', side: 'no', ...legPmNo }, legB: { venue: 'kalshi', side: 'yes', ...legKYes }, totalCostCents: cost2, maxPayoutCents: 100, edgePercent: edge2, maxContracts: k.yesDepth });
     }
   }
 

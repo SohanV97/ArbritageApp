@@ -2,11 +2,11 @@ import type { UnifiedMarket, Category } from '@/lib/market-types';
 import { KALSHI_MONEYLINE_PATTERN } from '@/lib/categories';
 
 const KALSHI_API_BASE = 'https://api.elections.kalshi.com/trade-api/v2';
-const KALSHI_PAGE_LIMIT = 100;
-const KALSHI_PAGE_DELAY_MS = 75;  // between pages of the same series
-const KALSHI_MAX_PAGES = 3;       // 300 markets per series is plenty
-const KALSHI_SERIES_BATCH = 4;    // fetch 4 series concurrently
-const KALSHI_BATCH_DELAY_MS = 75; // between batches
+const KALSHI_PAGE_LIMIT = 200;    // request 200/page (API may cap at 100)
+const KALSHI_PAGE_DELAY_MS = 50;  // between pages of the same series
+const KALSHI_MAX_PAGES = 3;       // up to 600 markets; MLB alone can have 200+ open games
+const KALSHI_SERIES_BATCH = 4;    // 4 concurrent — keeps politics (34 series) under the rate limit
+const KALSHI_BATCH_DELAY_MS = 80; // between batches
 
 function getKalshiApiKey(): string | null {
   const key = process.env.KALSHI_API_KEY;
@@ -20,11 +20,14 @@ interface KalshiMarket {
   market_type?: string;
   title?: string;
   subtitle?: string;
+  yes_sub_title?: string;
   status?: string;
   yes_bid?: number;
   yes_bid_dollars?: number | string;
+  yes_bid_size_fp?: number | string;
   yes_ask?: number;
   yes_ask_dollars?: number | string;
+  yes_ask_size_fp?: number | string;
   no_bid?: number;
   no_bid_dollars?: number | string;
   no_ask?: number;
@@ -79,11 +82,14 @@ async function fetchKalshiMarketsPage(opts: {
   if (key) headers['KALSHI-ACCESS-KEY'] = key;
 
   let lastError: Error | null = null;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  // Up to 4 attempts with exponential backoff — politics fans out to ~34 series and
+  // Kalshi rate-limits bursts. Dropping a series here means an entire state's races
+  // silently vanish from matching, so retry generously.
+  for (let attempt = 0; attempt < 4; attempt++) {
     const res = await fetch(`${KALSHI_API_BASE}/markets?${params.toString()}`, { headers });
     if (res.status === 429) {
       lastError = new Error('Kalshi API: 429 too many requests');
-      await delay(2500);
+      await delay(600 * 2 ** attempt); // 600 → 1200 → 2400 → 4800 ms
       continue;
     }
     if (!res.ok) throw new Error(`Kalshi API: ${res.status} ${await res.text()}`);
@@ -130,6 +136,49 @@ async function paginateKalshi(seriesTicker?: string): Promise<KalshiMarket[]> {
   return all;
 }
 
+// Kalshi politics titles are already rich, e.g. "Will Republicans win the Senate
+// race in Texas?" — they carry party + chamber + state. We only append the election
+// year (encoded in the ticker, e.g. SENATETX-26 → 2026 or CONTROLS-2026) so the
+// structured matcher can keep the 2026 race distinct from the 2028 one.
+function politicsYearFromTicker(ticker: string): string | null {
+  const m = ticker.match(/-(\d{4}|\d{2})(?:\D|$)/);
+  if (!m) return null;
+  return m[1].length === 4 ? m[1] : `20${m[1]}`;
+}
+
+function buildKalshiPoliticsQuestion(m: KalshiMarket): string {
+  const base = (m.title && m.title.trim().length > 1)
+    ? m.title.trim()
+    : (typeof m.subtitle === 'string' && m.subtitle.trim() ? m.subtitle.trim() : m.ticker);
+  const year = politicsYearFromTicker(m.event_ticker ?? m.ticker);
+  return year ? `${base} ${year}` : base;
+}
+
+// Kalshi URL format: /markets/{series}/{subtitle}/{event_ticker}
+// The Kalshi markets API does not return the subtitle field, so we hardcode it per series.
+const SERIES_SUBTITLE: Record<string, string> = {
+  KXMLBGAME:  'professional-baseball-game',
+  KXWCGAME:   'fifa-world-cup-game',
+  KXMLSGAME:  'mls-soccer-game',
+  KXEPLGAME:  'premier-league-game',
+};
+
+function kalshiMarketUrl(m: KalshiMarket): string {
+  const eventTicker = (m.event_ticker ?? m.ticker);
+  const seriesKey = eventTicker.split('-')[0].toUpperCase();
+  const series = seriesKey.toLowerCase();
+  const event = eventTicker.toLowerCase();
+  // Politics subtitles arrive as "Democratic party:: Democratic party" — keep the
+  // part before '::' so the URL slug isn't doubled.
+  const rawSubtitle = typeof m.subtitle === 'string' ? m.subtitle.split('::')[0].trim() : '';
+  const subtitle = rawSubtitle
+    ? rawSubtitle.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+    : SERIES_SUBTITLE[seriesKey] ?? null;
+  return subtitle
+    ? `https://kalshi.com/markets/${series}/${subtitle}/${event}`
+    : `https://kalshi.com/markets/${series}/${event}`;
+}
+
 export function normalizeKalshiMarkets(markets: KalshiMarket[], category?: Category): UnifiedMarket[] {
   const result: UnifiedMarket[] = [];
   for (const m of markets) {
@@ -143,18 +192,47 @@ export function normalizeKalshiMarkets(markets: KalshiMarket[], category?: Categ
     if (noCents && !yesCents) yesCents = 100 - noCents;
     if (!yesCents || !noCents || yesCents + noCents > 105) continue;
 
+    // Use event_ticker for date extraction — it encodes the actual game date in the URL
+    // (e.g. KXMLBGAME-26JUL061410PHIKC). The market ticker (m.ticker) may carry a
+    // -Y/-N suffix or a stale date from when the contract was originally created.
+    const dateTicker = m.event_ticker ?? m.ticker;
+    const gameDate = parseKalshiGameDate(dateTicker);
+
+    // Sports game markets share one title per game ("Toronto vs San Diego Winner?");
+    // which team YES pays on lives only in the ticker suffix (-TOR) and yes_sub_title
+    // ("Toronto"). Capture both so alignment can be done by identity, not price.
+    let yesTeam: string | undefined;
+    if (category === 'mlb' || category === 'soccer') {
+      const et = m.event_ticker ?? '';
+      const code = et && m.ticker.toUpperCase().startsWith(`${et.toUpperCase()}-`)
+        ? m.ticker.slice(et.length + 1)
+        : '';
+      const sub = typeof m.yes_sub_title === 'string' ? m.yes_sub_title : '';
+      yesTeam = `${code} ${sub}`.trim() || undefined;
+    }
+
+    // Contracts fillable at the quoted prices. Kalshi's book is unified: a NO buy
+    // fills against the YES bid, so NO-side depth is the YES bid size.
+    const parseFp = (v: number | string | undefined): number | undefined => {
+      const n = typeof v === 'number' ? v : typeof v === 'string' ? parseFloat(v) : NaN;
+      return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+    };
+
     result.push({
       id: `kalshi-${m.ticker}`,
       venue: 'kalshi',
-      question: m.title ?? m.subtitle ?? m.ticker ?? '',
+      question: category === 'politics'
+        ? buildKalshiPoliticsQuestion(m)
+        : (m.title ?? m.subtitle ?? m.ticker ?? ''),
       symbol: m.ticker,
       yesPriceCents: yesCents,
       noPriceCents: noCents,
-      resolutionTime: parseKalshiGameDate(m.ticker)
-        ? `${parseKalshiGameDate(m.ticker)}T23:59:00Z`
-        : (m.close_time ?? m.expiration_time),
-      url: `https://kalshi.com/markets/${m.ticker}`,
+      resolutionTime: gameDate ? `${gameDate}T23:59:00Z` : (m.close_time ?? m.expiration_time),
+      url: kalshiMarketUrl(m),
       category,
+      yesTeam,
+      yesDepth: parseFp(m.yes_ask_size_fp),
+      noDepth: parseFp(m.yes_bid_size_fp),
     });
   }
   return result;
@@ -177,36 +255,16 @@ const CATEGORY_SERIES: Record<Category, string[]> = {
     'KXUEFACL',   // UEFA Champions League
   ],
   politics: [
-    // Chamber control (confirmed working)
-    'CONTROLS',             // Which party controls the US Senate
-    'KXBALANCEPOWERCOMBO',  // Which party controls House + Senate combo
-    // 2026 Senate midterm races — pattern: SENATE{2-letter-state}
-    'SENATETX', // Texas
-    'SENATEIA', // Iowa
-    'SENATEAK', // Alaska
-    'SENATEGA', // Georgia
-    'SENATEMI', // Michigan
-    'SENATEWI', // Wisconsin
-    'SENATEMT', // Montana
-    'SENATEME', // Maine
-    'SENATENJ', // New Jersey
-    'SENATENH', // New Hampshire
-    'SENATECO', // Colorado
-    'SENATENM', // New Mexico
-    'SENATENC', // North Carolina
-    'SENATEOR', // Oregon
-    'SENATEIL', // Illinois
-    'SENATEMD', // Maryland
-    'SENATEVA', // Virginia
-    'SENATENV', // Nevada
-    'SENATEDE', // Delaware
-    'SENATELA', // Louisiana
-    'SENATEAL', // Alabama
-    'SENATEAR', // Arkansas
-    'SENATEID', // Idaho
-    'SENATEKS', // Kansas
-    'SENATEMN', // Minnesota
-    'SENATESC', // South Carolina
+    // Senate control. (KXBALANCEPOWERCOMBO omitted — it's a House-AND-Senate combo
+    // market with no clean 1:1 counterpart on Polymarket.)
+    'CONTROLS',             // Which party wins the US Senate
+    // 2026 Senate races — pattern: SENATE{2-letter-state}. All verified to return markets.
+    'SENATETX', 'SENATEIA', 'SENATEAK', 'SENATEGA', 'SENATEMI', 'SENATEWI',
+    'SENATEMT', 'SENATEME', 'SENATENJ', 'SENATENH', 'SENATECO', 'SENATENM',
+    'SENATENC', 'SENATEOR', 'SENATEIL', 'SENATEMD', 'SENATEVA', 'SENATENV',
+    'SENATEDE', 'SENATELA', 'SENATEAL', 'SENATEAR', 'SENATEID', 'SENATEKS',
+    'SENATEMN', 'SENATESC', 'SENATEMA', 'SENATERI', 'SENATEWV', 'SENATEOK',
+    'SENATETN', 'SENATEMS', 'SENATENE',
   ],
 };
 
@@ -251,6 +309,13 @@ export async function getKalshiMarketsForAllCategories(): Promise<Map<Category, 
         );
       } else if (pattern) {
         filtered = normalized.filter(m => pattern.test(m.symbol?.toUpperCase() ?? ''));
+        if (cat === 'soccer') {
+          // Drop tie/draw contracts (ticker suffix -TIE) — the PM side only keeps
+          // team moneylines, and a tie market must never pair against one.
+          filtered = filtered.filter(m =>
+            !/-TIE$/i.test(m.symbol ?? '') && !/\b(tie|draw)\b/i.test(m.question)
+          );
+        }
       } else {
         filtered = normalized;
       }

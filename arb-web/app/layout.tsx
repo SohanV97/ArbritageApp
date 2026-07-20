@@ -6,8 +6,8 @@ const geistSans = Geist({ variable: '--font-geist-sans', subsets: ['latin'] });
 const geistMono = Geist_Mono({ variable: '--font-geist-mono', subsets: ['latin'] });
 
 export const metadata: Metadata = {
-  title: 'Arb Finder — MLB',
-  description: 'Real-time MLB arbitrage opportunities across Kalshi and Polymarket',
+  title: 'Arb Finder',
+  description: 'Real-time MLB, soccer, and politics arbitrage opportunities across Kalshi and Polymarket',
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
