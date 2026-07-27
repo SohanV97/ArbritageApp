@@ -31,9 +31,10 @@ export interface PolymarketOrderRequest {
 }
 
 export interface PolymarketOrderResult {
-  ok: boolean;
+  ok: boolean;          // order accepted by the CLOB without error
   orderId?: string;
-  status?: string;
+  status?: string;      // e.g. "matched", "live", "unmatched"
+  filledCount?: number; // shares actually filled (takingAmount on a BUY)
   error?: string;
 }
 
@@ -145,9 +146,18 @@ export async function placePolymarketOrder(req: PolymarketOrderRequest): Promise
     const resp = await init.client.postOrder(order, OrderType.FAK);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const r = resp as any;
-    if (r.errorCode || r.error) return { ok: false, error: mapClobError(String(r.errorCode ?? r.error)) };
-
-    return { ok: true, orderId: r.orderID ?? r.order_id ?? r.id, status: r.status };
+    // OrderResponse: { success, errorMsg, orderID, status, takingAmount, makingAmount }.
+    // takingAmount = outcome shares received on a BUY = the amount actually filled.
+    if (r.success === false || r.errorMsg || r.errorCode || r.error) {
+      return { ok: false, error: mapClobError(String(r.errorMsg ?? r.errorCode ?? r.error ?? 'order rejected')) };
+    }
+    const filled = Math.round(parseFloat(r.takingAmount ?? '0'));
+    return {
+      ok: true,
+      orderId: r.orderID ?? r.order_id ?? r.id,
+      status: r.status,
+      filledCount: Number.isFinite(filled) ? filled : undefined,
+    };
   } catch (err) {
     return { ok: false, error: mapClobError(String(err)) };
   }

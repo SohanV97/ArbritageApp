@@ -184,13 +184,14 @@ export function normalizeKalshiMarkets(markets: KalshiMarket[], category?: Categ
   for (const m of markets) {
     if (typeof m.ticker === 'string' && (m.ticker.includes('KXMV') || m.market_type === 'scalar')) continue;
 
-    let yesCents = extractCents(getPrice(m, 'yes_ask_dollars', 'yes_ask'));
-    let noCents = extractCents(getPrice(m, 'no_ask_dollars', 'no_ask'));
-    if (!yesCents) yesCents = extractCents(getPrice(m, 'yes_bid_dollars', 'yes_bid'));
-    if (!noCents) noCents = extractCents(getPrice(m, 'no_bid_dollars', 'no_bid'));
-    if (yesCents && !noCents) noCents = 100 - yesCents;
-    if (noCents && !yesCents) yesCents = 100 - noCents;
-    if (!yesCents || !noCents || yesCents + noCents > 105) continue;
+    // Executable BUY price is the ASK on each side. Never fall back to the bid or
+    // synthesize the complement (100 − other side): buying at the bid is not fillable
+    // and fabricates phantom arbs. A market missing either ask isn't tradeable → skip.
+    const yesCents = extractCents(getPrice(m, 'yes_ask_dollars', 'yes_ask'));
+    const noCents = extractCents(getPrice(m, 'no_ask_dollars', 'no_ask'));
+    // A real two-sided book's asks sum to ≥100 (the overround). A sum well below 100
+    // means a stale/crossed quote — reject it rather than surface an impossible price.
+    if (!yesCents || !noCents || yesCents + noCents > 105 || yesCents + noCents < 95) continue;
 
     // Use event_ticker for date extraction — it encodes the actual game date in the URL
     // (e.g. KXMLBGAME-26JUL061410PHIKC). The market ticker (m.ticker) may carry a

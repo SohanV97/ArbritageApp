@@ -104,34 +104,18 @@ function toNum(v: unknown): number | null {
 // Executable prices from the CLOB book: buying YES (outcome[0]) fills at bestAsk;
 // buying NO (outcome[1]) fills at 1 − bestBid. outcomePrices is last-trade/mid —
 // quoting it makes arbs appear that can't actually be filled at those prices.
+// Round UP: a BUY limit rounded down could sit below the true ask and never fill,
+// and a lower price would understate cost and OVERSTATE edge. Ceil is conservative
+// on both counts.
 function parseBookPrices(m: GammaMarket): { yes: number; no: number } | null {
   const bid = toNum(m.bestBid);
   const ask = toNum(m.bestAsk);
   if (bid === null || ask === null) return null;
   if (bid <= 0 || ask <= 0 || bid >= 1 || ask >= 1 || ask < bid) return null;
   return {
-    yes: Math.max(1, Math.min(99, Math.round(ask * 100))),
-    no: Math.max(1, Math.min(99, Math.round((1 - bid) * 100))),
+    yes: Math.max(1, Math.min(99, Math.ceil(ask * 100))),
+    no: Math.max(1, Math.min(99, Math.ceil((1 - bid) * 100))),
   };
-}
-
-// Returns null when the market has no real prices (e.g. Polymarket's placeholder
-// "Person A" / "Party B" slots). Defaulting to 50/50 here would fabricate
-// opportunities out of markets that were never actually quoted.
-function parseOutcomePrices(outcomePrices: string | undefined): { yes: number; no: number } | null {
-  if (!outcomePrices) return null;
-  try {
-    const arr = JSON.parse(outcomePrices) as string[];
-    const rawYes = parseFloat(arr[0] ?? '');
-    const rawNo = parseFloat(arr[1] ?? '');
-    if (!Number.isFinite(rawYes) || !Number.isFinite(rawNo)) return null;
-    const yes = Math.max(1, Math.min(99, Math.round(rawYes * 100)));
-    let no = Math.max(1, Math.min(99, Math.round(rawNo * 100)));
-    if (yes + no < 99 || yes + no > 101) no = 100 - yes;
-    return { yes, no };
-  } catch {
-    return null;
-  }
 }
 
 export interface PolymarketMarketWithKind extends UnifiedMarket {
@@ -185,9 +169,11 @@ function normalizeEvents(
       try { outcomesArr = JSON.parse(m.outcomes ?? '["Yes","No"]'); } catch { outcomesArr = ['Yes', 'No']; }
       if (outcomesArr.length !== 2) continue;
 
-      // Prefer executable book prices; fall back to last-trade/mid when no book data
-      const prices = parseBookPrices(m) ?? parseOutcomePrices(m.outcomePrices);
-      if (!prices) continue; // no real quotes — skip rather than invent 50/50
+      // Executable book prices only. A market with no live two-sided book cannot be
+      // bought at a known price, so skip it rather than fall back to a non-executable
+      // mid/last-trade price that would surface phantom arbs.
+      const prices = parseBookPrices(m);
+      if (!prices) continue;
       const { yes, no } = prices;
       const rawQuestion = m.question ?? m.groupItemTitle ?? '';
       let question = rawQuestion.toLowerCase().includes(eventTitle.toLowerCase()) ? rawQuestion : `${eventTitle}: ${rawQuestion}`;

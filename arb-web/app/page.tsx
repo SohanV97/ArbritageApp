@@ -191,13 +191,14 @@ interface CardExecState {
   result?: ExecuteResponse;
 }
 
-function OpportunityCard({ opp, amount, bankroll, persistence, onUseKelly, onExecuted }: {
+function OpportunityCard({ opp, amount, bankroll, persistence, onUseKelly, onExecuted, onExecuteStart }: {
   opp: ArbitrageOpportunity;
   amount: number;
   bankroll: number;
   persistence: number;
   onUseKelly: (n: number) => void;
   onExecuted: (opp: ArbitrageOpportunity, amount: number, result: ExecuteResponse) => void;
+  onExecuteStart: (opp: ArbitrageOpportunity) => void;
 }) {
   const [showDebug, setShowDebug] = useState(false);
   const [cardExec, setCardExec] = useState<CardExecState>({ state: 'idle' });
@@ -221,6 +222,16 @@ function OpportunityCard({ opp, amount, bankroll, persistence, onUseKelly, onExe
   const datesMatch = category === 'politics'
     || pair.polymarket.resolutionTime?.slice(0, 10) === pair.kalshi.resolutionTime?.slice(0, 10);
 
+  // How long capital is tied up until settlement, and the edge expressed as an annual
+  // rate — so a 3% arb that settles in 120 days doesn't look like an overnight 3%.
+  const settleMs = pair.polymarket.resolutionTime ? Date.parse(pair.polymarket.resolutionTime) : NaN;
+  const lockupDays = Number.isFinite(settleMs)
+    ? Math.max(0, Math.ceil((settleMs - Date.now()) / 86_400_000))
+    : null;
+  const annualizedPct = (lockupDays != null && lockupDays >= 1 && edgePercent > 0)
+    ? Math.round(edgePercent * (365 / lockupDays))
+    : null;
+
   const legs = [
     { leg: legA, market: legA.venue === 'polymarket' ? pair.polymarket : pair.kalshi },
     { leg: legB, market: legB.venue === 'polymarket' ? pair.polymarket : pair.kalshi },
@@ -237,6 +248,8 @@ function OpportunityCard({ opp, amount, bankroll, persistence, onUseKelly, onExe
   });
 
   async function handleCardExecute() {
+    // Register the pair immediately so auto-exec can't fire the same one in parallel.
+    onExecuteStart(opp);
     setCardExec({ state: 'pending' });
     try {
       const res = await fetch('/api/execute', {
@@ -245,7 +258,8 @@ function OpportunityCard({ opp, amount, bankroll, persistence, onUseKelly, onExe
         body: JSON.stringify({ opportunity: opp, amount }),
       });
       const result = await res.json() as ExecuteResponse;
-      setCardExec({ state: result.bothOk ? 'ok' : 'err', result });
+      // A clean hedge is the only true success; a naked/partial leg shows as an error.
+      setCardExec({ state: result.hedged ? 'ok' : 'err', result });
       onExecuted(opp, amount, result);
     } catch (err) {
       const result: ExecuteResponse = {
@@ -253,8 +267,11 @@ function OpportunityCard({ opp, amount, bankroll, persistence, onUseKelly, onExe
         polymarket: { ok: false, error: String(err) },
         executedAt: new Date().toISOString(),
         bothOk: false,
+        hedged: false,
+        hedgeNote: `Request failed: ${String(err)}`,
       };
       setCardExec({ state: 'err', result });
+      onExecuted(opp, amount, result);
     }
   }
 
@@ -278,6 +295,15 @@ function OpportunityCard({ opp, amount, bankroll, persistence, onUseKelly, onExe
                 className="text-xs px-2 py-0.5 rounded-full font-mono"
               >
                 Seen {persistence}× · {persistence * 7}s
+              </span>
+            )}
+            {lockupDays != null && lockupDays > 2 && (
+              <span
+                style={{ background: '#d9770622', color: '#fbbf24', border: '1px solid #d9770644' }}
+                className="text-xs px-2 py-0.5 rounded-full font-mono"
+                title="Capital stays locked until this market settles"
+              >
+                locks ~{lockupDays}d{annualizedPct != null ? ` · ${annualizedPct}%/yr` : ''}
               </span>
             )}
           </div>
@@ -413,27 +439,34 @@ function OpportunityCard({ opp, amount, bankroll, persistence, onUseKelly, onExe
             background: cardExec.state === 'ok' ? '#16a34a11' : '#dc262611',
             border: `1px solid ${cardExec.state === 'ok' ? '#16a34a33' : '#dc262633'}`,
           }}
-          className="w-full py-2.5 rounded-lg px-4 flex items-center justify-between gap-3"
+          className="w-full py-2.5 rounded-lg px-4 flex flex-col gap-1.5"
         >
-          <div className="flex gap-4 text-xs font-mono">
-            <span style={{ color: cardExec.result.kalshi.ok ? '#4ade80' : '#f87171' }}>
-              KAL {cardExec.result.kalshi.ok
-                ? `✓ ${cardExec.result.kalshi.orderId?.slice(0, 10) ?? 'placed'}`
-                : `✗ ${cardExec.result.kalshi.error?.slice(0, 24) ?? 'error'}`}
-            </span>
-            <span style={{ color: cardExec.result.polymarket.ok ? '#4ade80' : '#f87171' }}>
-              PM {cardExec.result.polymarket.ok
-                ? `✓ ${cardExec.result.polymarket.orderId?.slice(0, 10) ?? 'placed'}`
-                : `✗ ${cardExec.result.polymarket.error?.slice(0, 24) ?? 'error'}`}
-            </span>
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex gap-4 text-xs font-mono">
+              <span style={{ color: (cardExec.result.kalshi.filledCount ?? (cardExec.result.kalshi.ok ? 1 : 0)) > 0 ? '#4ade80' : '#f87171' }}>
+                KAL {cardExec.result.kalshi.ok
+                  ? (cardExec.result.kalshi.filledCount != null ? `✓ filled ${cardExec.result.kalshi.filledCount}` : '✓ placed')
+                  : `✗ ${cardExec.result.kalshi.error?.slice(0, 24) ?? 'error'}`}
+              </span>
+              <span style={{ color: (cardExec.result.polymarket.filledCount ?? (cardExec.result.polymarket.ok ? 1 : 0)) > 0 ? '#4ade80' : '#f87171' }}>
+                PM {cardExec.result.polymarket.ok
+                  ? (cardExec.result.polymarket.filledCount != null ? `✓ filled ${cardExec.result.polymarket.filledCount}` : '✓ placed')
+                  : `✗ ${cardExec.result.polymarket.error?.slice(0, 24) ?? 'error'}`}
+              </span>
+            </div>
+            <button
+              onClick={() => setCardExec({ state: 'idle' })}
+              className="text-xs hover:text-[--foreground] transition-colors flex-shrink-0"
+              style={{ color: 'var(--text-muted)' }}
+            >
+              ✕
+            </button>
           </div>
-          <button
-            onClick={() => setCardExec({ state: 'idle' })}
-            className="text-xs hover:text-[--foreground] transition-colors"
-            style={{ color: 'var(--text-muted)' }}
-          >
-            ✕
-          </button>
+          {cardExec.result.hedgeNote && (
+            <p className="text-xs font-semibold" style={{ color: cardExec.result.hedged ? '#fbbf24' : '#f87171' }}>
+              {cardExec.result.hedgeNote}
+            </p>
+          )}
         </div>
       )}
 
@@ -647,8 +680,11 @@ function ExecutionResultScreen({
   onDismiss: () => void;
 }) {
   const { pair, totalCostCents, edgePercent } = opp;
-  const bothOk = result.bothOk;
+  const hedged = result.hedged;
+  // hedgeNote present without hedged = a naked/partial position needing attention.
+  const naked = !hedged && !!result.hedgeNote;
   const profitDollars = amount - (totalCostCents / 100) * amount;
+  const accent = hedged ? '#16a34a' : '#dc2626';
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center px-4 py-12">
@@ -656,8 +692,8 @@ function ExecutionResultScreen({
         <div
           style={{
             background: 'var(--card)',
-            border: `1px solid ${bothOk ? '#16a34a55' : '#dc262655'}`,
-            boxShadow: `0 0 60px ${bothOk ? '#16a34a12' : '#dc262612'}`,
+            border: `1px solid ${accent}55`,
+            boxShadow: `0 0 60px ${accent}12`,
           }}
           className="rounded-2xl p-8"
         >
@@ -665,21 +701,33 @@ function ExecutionResultScreen({
           <div className="flex items-center gap-4 mb-7">
             <div
               style={{
-                background: bothOk ? '#16a34a22' : '#dc262622',
-                border: `1px solid ${bothOk ? '#16a34a55' : '#dc262655'}`,
-                color: bothOk ? '#4ade80' : '#f87171',
+                background: `${accent}22`,
+                border: `1px solid ${accent}55`,
+                color: hedged ? '#4ade80' : '#f87171',
               }}
               className="w-12 h-12 rounded-full flex items-center justify-center text-xl font-bold flex-shrink-0"
             >
-              {bothOk ? '✓' : '✗'}
+              {hedged ? '✓' : '⚠'}
             </div>
             <div>
-              <h2 className="text-xl font-bold">{bothOk ? 'Execution Complete' : 'Execution Failed'}</h2>
+              <h2 className="text-xl font-bold">{hedged ? 'Hedge Complete' : naked ? 'Position Needs Attention' : 'Execution Failed'}</h2>
               <p className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
                 {new Date(result.executedAt).toLocaleString()}
               </p>
             </div>
           </div>
+
+          {/* Hedge warning — the single most important thing to see when not clean */}
+          {result.hedgeNote && (
+            <div
+              style={{ background: naked ? '#dc262618' : '#d9770618', border: `1px solid ${naked ? '#dc262655' : '#d9770655'}` }}
+              className="rounded-xl px-4 py-3 mb-5"
+            >
+              <p className="text-sm font-semibold" style={{ color: naked ? '#f87171' : '#fbbf24' }}>
+                {result.hedgeNote}
+              </p>
+            </div>
+          )}
 
           {/* Category + edge */}
           <div className="flex items-center gap-3 mb-3">
@@ -692,42 +740,48 @@ function ExecutionResultScreen({
             {pair.polymarket.question.replace(' [FLIPPED]', '')}
           </p>
 
-          {/* Leg results */}
+          {/* Leg results — show ACTUAL filled counts, not just acceptance */}
           <div className="flex flex-col gap-3 mb-6">
             {([
               { label: 'Kalshi', res: result.kalshi },
               { label: 'Polymarket', res: result.polymarket },
-            ] as const).map(({ label, res }) => (
-              <div
-                key={label}
-                style={{
-                  background: 'var(--surface)',
-                  border: `1px solid ${res.ok ? '#16a34a33' : '#dc262633'}`,
-                }}
-                className="rounded-xl px-4 py-3 flex items-center justify-between gap-4"
-              >
-                <span className="text-sm font-semibold">{label}</span>
-                <div className="text-right">
-                  {res.ok ? (
-                    <div>
-                      <p className="text-sm font-mono" style={{ color: '#4ade80' }}>✓ Order placed</p>
-                      {res.orderId && (
-                        <p className="text-xs font-mono mt-0.5" style={{ color: 'var(--text-muted)' }}>
-                          {res.orderId}
+            ] as const).map(({ label, res }) => {
+              const filled = res.filledCount;
+              const legOk = res.ok && (filled == null || filled > 0);
+              return (
+                <div
+                  key={label}
+                  style={{
+                    background: 'var(--surface)',
+                    border: `1px solid ${legOk ? '#16a34a33' : '#dc262633'}`,
+                  }}
+                  className="rounded-xl px-4 py-3 flex items-center justify-between gap-4"
+                >
+                  <span className="text-sm font-semibold">{label}</span>
+                  <div className="text-right">
+                    {res.ok ? (
+                      <div>
+                        <p className="text-sm font-mono" style={{ color: filled === 0 ? '#f87171' : '#4ade80' }}>
+                          {filled != null ? (filled > 0 ? `✓ filled ${filled}` : '✗ filled 0') : '✓ accepted'}
                         </p>
-                      )}
-                    </div>
-                  ) : (
-                    <p className="text-sm font-mono" style={{ color: '#f87171' }}>
-                      ✗ {res.error?.slice(0, 50) ?? 'Failed'}
-                    </p>
-                  )}
+                        {res.orderId && (
+                          <p className="text-xs font-mono mt-0.5" style={{ color: 'var(--text-muted)' }}>
+                            {res.orderId.slice(0, 18)}
+                          </p>
+                        )}
+                      </div>
+                    ) : (
+                      <p className="text-sm font-mono" style={{ color: '#f87171' }}>
+                        ✗ {res.error?.slice(0, 60) ?? 'Failed'}
+                      </p>
+                    )}
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
 
-          {bothOk && (
+          {hedged && (
             <div
               style={{ background: '#16a34a0d', border: '1px solid #16a34a33' }}
               className="rounded-xl px-4 py-3 mb-6 flex items-center justify-between"
@@ -742,9 +796,9 @@ function ExecutionResultScreen({
           <button
             onClick={onDismiss}
             style={{
-              background: bothOk ? '#16a34a' : 'var(--surface)',
-              color: bothOk ? 'white' : 'var(--foreground)',
-              border: bothOk ? 'none' : '1px solid var(--border)',
+              background: hedged ? '#16a34a' : 'var(--surface)',
+              color: hedged ? 'white' : 'var(--foreground)',
+              border: hedged ? 'none' : '1px solid var(--border)',
             }}
             className="w-full py-3 rounded-xl text-sm font-bold hover:opacity-90 transition-opacity"
           >
@@ -815,33 +869,57 @@ export default function Home() {
   const executedPairs = useRef(new Set<string>());
   const isFetching = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
+  const execLogLoaded = useRef(false);
+
+  // Persist the execution log across refreshes/crashes — order history is a record
+  // you may need to reconcile against the venues. Loaded on mount (client-only to
+  // avoid a hydration mismatch), saved on every change after the initial load.
+  const EXEC_LOG_KEY = 'arb-exec-log';
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(EXEC_LOG_KEY);
+      if (saved) setExecLog(JSON.parse(saved) as ExecLogEntry[]);
+    } catch { /* ignore corrupt/absent storage */ }
+  }, []);
+  useEffect(() => {
+    // Skip the first run so the initial empty log doesn't clobber saved history
+    // before the load effect's state update has applied.
+    if (!execLogLoaded.current) { execLogLoaded.current = true; return; }
+    try { localStorage.setItem(EXEC_LOG_KEY, JSON.stringify(execLog)); } catch { /* quota/absent */ }
+  }, [execLog]);
 
   const executeOpportunity = useCallback(async (opp: ArbitrageOpportunity, betAmount: number, key: string) => {
+    let result: ExecuteResponse;
     try {
       const res = await fetch('/api/execute', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ opportunity: opp, amount: betAmount }),
       });
-      const result = await res.json() as ExecuteResponse;
-      setExecPhase({ phase: 'result', opp, amount: betAmount, result });
-      setExecLog(prev => [{
-        ts: new Date().toISOString(),
-        question: opp.pair.polymarket.question,
-        edgePercent: opp.edgePercent,
-        amount: betAmount,
-        result,
-      }, ...prev].slice(0, 50));
-      // 5-minute cooldown per pair
-      setTimeout(() => executedPairs.current.delete(key), 5 * 60_000);
+      result = await res.json() as ExecuteResponse;
     } catch (err) {
-      const result: ExecuteResponse = {
+      result = {
         kalshi: { ok: false, error: String(err) },
         polymarket: { ok: false, error: String(err) },
         executedAt: new Date().toISOString(),
         bothOk: false,
+        hedged: false,
+        hedgeNote: `Request failed: ${String(err)}`,
       };
-      setExecPhase({ phase: 'result', opp, amount: betAmount, result });
+    }
+    setExecPhase({ phase: 'result', opp, amount: betAmount, result });
+    // Always log — successes AND failures — so a naked/failed leg is never silently dropped.
+    setExecLog(prev => [{
+      ts: new Date().toISOString(),
+      question: opp.pair.polymarket.question,
+      edgePercent: opp.edgePercent,
+      amount: betAmount,
+      result,
+    }, ...prev].slice(0, 50));
+    // Re-arm auto-exec for this pair ONLY when the position is cleanly hedged. A naked,
+    // partial, or failed leg stays blocked so we never auto-fire a second order onto it.
+    if (result.hedged) {
+      setTimeout(() => executedPairs.current.delete(key), 5 * 60_000);
     }
   }, []);
 
@@ -889,8 +967,13 @@ export default function Home() {
       if (autoExecScope === 'sports' && opp.pair.polymarket.category === 'politics') continue;
       const key = `${opp.pair.polymarket.id}|${opp.pair.kalshi.id}`;
       if (executedPairs.current.has(key)) continue;
+      // Never auto-size beyond the Kalshi book depth — an oversized IOC leg partially
+      // fills and cancels, leaving the fully-filled Polymarket leg naked. Skip pairs
+      // with no reported depth rather than guess.
+      if (opp.maxContracts != null && opp.maxContracts < 1) continue;
+      const kelly = kellyBet(bankroll, opp.edgePercent);
+      const betAmount = opp.maxContracts != null ? Math.max(1, Math.min(kelly, opp.maxContracts)) : kelly;
       executedPairs.current.add(key);
-      const betAmount = kellyBet(bankroll, opp.edgePercent);
       setExecPhase({ phase: 'pending', opp, amount: betAmount, countdown: COUNTDOWN_START, key });
       break; // one at a time
     }
@@ -931,6 +1014,11 @@ export default function Home() {
     setExecPhase(null);
   }
 
+  function handleExecuteStart(opp: ArbitrageOpportunity) {
+    // Block auto-exec from firing this pair while a manual execute is in flight.
+    executedPairs.current.add(`${opp.pair.polymarket.id}|${opp.pair.kalshi.id}`);
+  }
+
   function handleCardExecuted(opp: ArbitrageOpportunity, betAmount: number, result: ExecuteResponse) {
     setExecLog(prev => [{
       ts: new Date().toISOString(),
@@ -939,7 +1027,31 @@ export default function Home() {
       amount: betAmount,
       result,
     }, ...prev].slice(0, 50));
+    // Re-arm only when cleanly hedged; a naked/partial/failed leg stays blocked.
+    const key = `${opp.pair.polymarket.id}|${opp.pair.kalshi.id}`;
+    if (result.hedged) setTimeout(() => executedPairs.current.delete(key), 5 * 60_000);
   }
+
+  // Derived values — MUST be computed before any early return below, or the hook
+  // count changes between renders (Rules of Hooks) and React crashes the moment
+  // an execution screen shows.
+  const opportunities = useMemo(() => data?.opportunities ?? [], [data]);
+
+  const catFiltered = useMemo(
+    () => catFilter === 'all' ? opportunities : opportunities.filter(o => o.pair.polymarket.category === catFilter),
+    [opportunities, catFilter]
+  );
+
+  const filtered = useMemo(
+    () =>
+      edgeFilter === 'arb' ? catFiltered.filter(o => o.edgePercent >= 2) :
+      edgeFilter === 'near' ? catFiltered.filter(o => o.edgePercent >= 0.5 && o.edgePercent < 2) :
+      catFiltered,
+    [catFiltered, edgeFilter]
+  );
+
+  const arbCount = useMemo(() => catFiltered.filter(o => o.edgePercent >= 2).length, [catFiltered]);
+  const nearCount = useMemo(() => catFiltered.filter(o => o.edgePercent >= 0.5 && o.edgePercent < 2).length, [catFiltered]);
 
   // ── two-screen auto-exec views ─────────────────────────────────────────────
   if (execPhase?.phase === 'pending' || execPhase?.phase === 'executing') {
@@ -964,24 +1076,6 @@ export default function Home() {
   }
 
   // ── normal market view ─────────────────────────────────────────────────────
-
-  const opportunities = useMemo(() => data?.opportunities ?? [], [data]);
-
-  const catFiltered = useMemo(
-    () => catFilter === 'all' ? opportunities : opportunities.filter(o => o.pair.polymarket.category === catFilter),
-    [opportunities, catFilter]
-  );
-
-  const filtered = useMemo(
-    () =>
-      edgeFilter === 'arb' ? catFiltered.filter(o => o.edgePercent >= 2) :
-      edgeFilter === 'near' ? catFiltered.filter(o => o.edgePercent >= 0.5 && o.edgePercent < 2) :
-      catFiltered,
-    [catFiltered, edgeFilter]
-  );
-
-  const arbCount = useMemo(() => catFiltered.filter(o => o.edgePercent >= 2).length, [catFiltered]);
-  const nearCount = useMemo(() => catFiltered.filter(o => o.edgePercent >= 0.5 && o.edgePercent < 2).length, [catFiltered]);
 
   return (
     <div className="min-h-screen px-4 py-8 max-w-4xl mx-auto">
@@ -1030,8 +1124,9 @@ export default function Home() {
       >
         {/* Manual amount */}
         <div className="flex flex-col gap-1">
-          <label className="text-xs text-[--text-muted]">Amount ($)</label>
+          <label htmlFor="arb-amount" className="text-xs text-[--text-muted]">Amount ($)</label>
           <input
+            id="arb-amount"
             type="number"
             min={1}
             max={100000}
@@ -1046,8 +1141,9 @@ export default function Home() {
 
         {/* Bankroll */}
         <div className="flex flex-col gap-1">
-          <label className="text-xs text-[--text-muted]">Bankroll ($)</label>
+          <label htmlFor="arb-bankroll" className="text-xs text-[--text-muted]">Bankroll ($)</label>
           <input
+            id="arb-bankroll"
             type="number"
             min={1}
             value={bankroll}
@@ -1315,6 +1411,7 @@ export default function Home() {
                   persistence={persistMap.get(k) ?? 1}
                   onUseKelly={setAmount}
                   onExecuted={handleCardExecuted}
+                  onExecuteStart={handleExecuteStart}
                 />
               );
             })}
@@ -1364,10 +1461,10 @@ export default function Home() {
           <div className="flex flex-col gap-2">
             {execLog.map((entry, i) => (
               <div
-                key={i}
+                key={`${entry.ts}-${i}`}
                 style={{
                   background: 'var(--surface)',
-                  border: `1px solid ${entry.result.bothOk ? '#16a34a44' : '#f8717144'}`,
+                  border: `1px solid ${entry.result.hedged ? '#16a34a44' : '#f8717144'}`,
                 }}
                 className="rounded-lg px-4 py-3 flex items-center justify-between gap-4 flex-wrap"
               >

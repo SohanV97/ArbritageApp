@@ -33,11 +33,12 @@ export function estimatePolymarketFeeCents(
 
 export function estimateKalshiFeeCents(priceCents: number, contracts: number): number {
   if (contracts <= 0) return 0;
-  // Kalshi's general trading fee: 0.07 × contracts × price × (1 − price),
-  // charged on execution (win or lose). Kept fractional here for edge accuracy;
-  // Kalshi rounds the total up to the next cent per order.
+  // Kalshi's general trading fee: 0.07 × contracts × price × (1 − price), charged on
+  // execution (win or lose) and rounded UP to the next whole cent per order. We apply
+  // that ceil so the edge is never overstated — e.g. a single 50¢ contract is billed
+  // 2¢ (ceil of 1.75¢), not 1.75¢.
   const p = Math.max(0, Math.min(1, priceCents / 100));
-  return Math.max(0, 0.07 * p * (1 - p) * 100 * contracts);
+  return Math.ceil(0.07 * p * (1 - p) * 100 * contracts);
 }
 
 export function estimateFeeCentsForVenue(

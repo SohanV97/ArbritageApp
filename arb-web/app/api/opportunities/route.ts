@@ -104,13 +104,14 @@ async function buildOpportunities(): Promise<OpportunitiesResponse> {
     }
 
     const pairs = matchMarkets(pmMarkets, kalshiMarkets, {
-      // Soccer: date restriction needed — World Cup has unique fixtures
-      // MLB: price sanity (>25¢) catches cross-series mismatches; same-day bonus in scorer
+      // Sports (MLB + soccer): team-split matching requires BOTH teams to align, so
+      //   ambiguous city aliases (york→yankees/mets) can't cross-match different games;
+      //   also enforces same game date (the same two teams play a multi-day series).
       // Politics: structured (state, chamber, year) matching — token similarity
       //   can't separate states because every senate market shares "senate race 2026".
       minTitleSimilarity: 0.35,
       minOverlapTokens: 1,
-      requireSameDay: cat === 'soccer',
+      requireSameDay: cat === 'soccer' || cat === 'mlb',
       politics: cat === 'politics',
       aliases: SPORT_ALIASES[cat],
     });
