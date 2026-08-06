@@ -12,6 +12,11 @@
  *   10%+ edge → $2000 (20% hard cap)
  */
 export function kellyBet(bankroll: number, edgePercent: number): number {
+  // Guard non-finite inputs: Math.min(NaN, 0.2) is NaN and propagates all the way to
+  // an order size, so a single bad number would size a real trade as NaN.
+  if (!Number.isFinite(bankroll) || bankroll <= 0) return 1;
+  if (!Number.isFinite(edgePercent) || edgePercent <= 0) return 1;
   const fraction = Math.min((edgePercent / 100) * 2, 0.20);
-  return Math.max(1, Math.round(bankroll * fraction));
+  const bet = Math.round(bankroll * fraction);
+  return Number.isFinite(bet) ? Math.max(1, bet) : 1;
 }

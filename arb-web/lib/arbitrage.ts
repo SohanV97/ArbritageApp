@@ -6,6 +6,12 @@ const CONTRACTS_PER_LEG = 1;
 
 export type PairWithKind = { polymarket: PolymarketMarketWithKind; kalshi: MatchedPair['kalshi'] };
 
+// A tradeable contract price: a real number in 1–99 cents. Rejects NaN/Infinity/
+// undefined/null and non-numeric values, all of which pass a naive `< 1` check.
+function isValidPriceCents(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v) && v >= 1 && v <= 99;
+}
+
 function computeLeg(
   venue: Venue,
   side: BinarySide,
@@ -28,7 +34,11 @@ export function findArbitrageOpportunities(
   for (const pair of pairs) {
     const pm = pair.polymarket;
     const k = pair.kalshi;
-    if (pm.yesPriceCents < 1 || pm.noPriceCents < 1 || k.yesPriceCents < 1 || k.noPriceCents < 1) continue;
+    // Validate explicitly rather than with `< 1`: that comparison is FALSE for NaN and
+    // undefined, so a corrupt price used to sail through and produce an opportunity with
+    // edge = NaN, which then rendered as "NaN%" and could be handed to the order path.
+    if (!isValidPriceCents(pm.yesPriceCents) || !isValidPriceCents(pm.noPriceCents)
+      || !isValidPriceCents(k.yesPriceCents) || !isValidPriceCents(k.noPriceCents)) continue;
     const kind = pm.polymarketFeeKind ?? 'fee_free';
 
     const legPmYes = computeLeg('polymarket', 'yes', pm.yesPriceCents, kind);

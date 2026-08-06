@@ -61,6 +61,12 @@ export const SPORT_ALIASES: Record<Category, Record<string, string[]>> = {
     kcr: ['royals', 'kansas city'], min: ['twins'], cws: ['white sox', 'whitesox'],
     hou: ['astros'], tex: ['rangers'], sea: ['mariners'], laa: ['angels'],
     oak: ['athletics', 'as'], as: ['athletics', 'oakland athletics', 'sacramento athletics'],
+    // Athletics is the one club whose Polymarket name ("Athletics") shares NO token with
+    // Kalshi's ("ATH A's") — apostrophes are stripped and 1-char tokens dropped, so
+    // identity alignment scored 0/0 and silently fell back to price proximity. These two
+    // keys restore a real token overlap in both directions.
+    ath: ['athletics', 'as', 'oakland athletics', 'sacramento athletics'],
+    athletics: ['ath', 'as', 'oak'],
     atl: ['braves'], phi: ['phillies'], nym: ['mets'], mia: ['marlins'],
     wsh: ['nationals'], was: ['nationals'],
     chc: ['cubs'], mil: ['brewers'], pit: ['pirates'], stl: ['cardinals'], cin: ['reds'],

@@ -33,6 +33,10 @@ export interface OpportunitiesResponse {
     matchedPairs: number;
     byCategory: Partial<Record<Category, { pm: number; kalshi: number; pairs: number }>>;
     fetchedAt: string;
+    /** When these quotes were actually built (not when the response was sent). */
+    builtAt?: string;
+    /** Age of the quotes in ms at send time — what the UI should show as freshness. */
+    ageMs?: number;
   };
   error?: string;
 }
@@ -42,6 +46,10 @@ export interface OpportunitiesResponse {
 // is governed by the in-process stale-while-revalidate cache below.
 const SPORT_CATEGORIES: Category[] = ['mlb', 'soccer'];
 
+// Opportunities down to this edge are returned so near-misses stay visible.
+// Anything ≤ 0 is unprofitable and the UI refuses to execute it.
+const NEAR_MISS_FLOOR_PERCENT = -5;
+
 // ─── stale-while-revalidate in-process cache ─────────────────────────────────
 // After the first cold-start fetch (~3 s with batch optimizations), every poll
 // returns from this cache in <5 ms. When the TTL expires the cache is served
@@ -49,7 +57,24 @@ const SPORT_CATEGORIES: Category[] = ['mlb', 'soccer'];
 interface CacheEntry { body: OpportunitiesResponse; builtAt: number; }
 let _cache: CacheEntry | null = null;
 let _rebuilding = false;
-const CACHE_TTL_MS = 55_000; // refresh in background at 55 s (under the 60 s revalidate)
+// A full rebuild measured ~1.2 s, so holding quotes for 55 s was ~50× more stale than
+// necessary: an opportunity could be gone from the venues long before the app stopped
+// showing it. Keep it just under the client's 7 s poll so nearly every poll gets a
+// freshly built set, while still collapsing bursts onto one build.
+const CACHE_TTL_MS = 6_000;
+
+// Single-flight: every caller that needs a rebuild awaits the SAME build, so a burst of
+// polls or force-refreshes can never stampede the upstream APIs into rate limits.
+let _inFlight: Promise<OpportunitiesResponse> | null = null;
+
+function rebuild(): Promise<OpportunitiesResponse> {
+  if (_inFlight) return _inFlight;
+  _rebuilding = true;
+  _inFlight = buildOpportunities()
+    .then(body => { _cache = { body, builtAt: Date.now() }; return body; })
+    .finally(() => { _inFlight = null; _rebuilding = false; });
+  return _inFlight;
+}
 
 // ─── YES-side alignment helpers ──────────────────────────────────────────────
 // A matched pair's two YES contracts may pay on opposite outcomes (PM YES = Braves,
@@ -194,7 +219,13 @@ async function buildOpportunities(): Promise<OpportunitiesResponse> {
       }];
     });
 
-    const opps = findArbitrageOpportunities(typedPairs, 0);
+    // Surface near-misses, not just profitable arbs. Cross-venue prediction markets
+    // are efficient most of the day: a threshold of 0 hides every matched game and
+    // leaves the user staring at an empty screen with no idea whether the app is
+    // broken or the market is simply tight. Showing down to -5% makes "how close are
+    // we" visible; the UI marks anything ≤0 as unprofitable and blocks executing it,
+    // and auto-exec has its own (positive) threshold, so nothing loss-making trades.
+    const opps = findArbitrageOpportunities(typedPairs, NEAR_MISS_FLOOR_PERCENT);
     allOpportunities.push(...opps);
     byCategory[cat] = { pm: pmMarkets.length, kalshi: kalshiMarkets.length, pairs: pairs.length };
   }
@@ -224,40 +255,58 @@ async function buildOpportunities(): Promise<OpportunitiesResponse> {
 // request arrives while the warm is still running, it awaits the same Promise
 // instead of starting a second parallel build.
 let _warmupPromise: Promise<void> | null = (() => {
-  _rebuilding = true;
-  return buildOpportunities()
-    .then(body => { _cache = { body, builtAt: Date.now() }; })
+  return rebuild()
+    .then(() => { /* cache populated by rebuild() */ })
     .catch(err => console.error('[opportunities] startup warm failed:', err))
-    .finally(() => { _rebuilding = false; _warmupPromise = null; });
+    .finally(() => { _warmupPromise = null; });
 })();
 
-const cacheHeaders = { 'Cache-Control': 'public, max-age=7, stale-while-revalidate=55' };
+// Never let a browser or proxy serve a cached copy: quotes go stale in seconds, and an
+// HTTP-cached response made pressing Refresh look like nothing had changed because the
+// request never reached the server.
+const cacheHeaders = { 'Cache-Control': 'no-store, max-age=0' };
 
-export async function GET() {
+// Stamp how old the quotes actually are, so the UI can report real data age instead of
+// "just now" (which only ever meant "the response arrived just now").
+function withAge(body: OpportunitiesResponse, builtAt: number): OpportunitiesResponse {
+  return { ...body, stats: { ...body.stats, builtAt: new Date(builtAt).toISOString(), ageMs: Math.max(0, Date.now() - builtAt) } };
+}
+
+export async function GET(request: Request) {
+  // ?fresh=1 — used by the Refresh button. Waits for a genuinely new build so the prices
+  // shown match the venues right now, and an opportunity that has evaporated disappears.
+  let forceFresh = false;
+  try { forceFresh = new URL(request.url).searchParams.get('fresh') === '1'; } catch { /* ignore */ }
+
   // If the startup warm is still in flight, wait for it rather than firing a second build.
   if (_warmupPromise) await _warmupPromise;
 
-  const now = Date.now();
-  const age = _cache ? now - _cache.builtAt : Infinity;
+  if (forceFresh) {
+    try {
+      const body = await rebuild();
+      return NextResponse.json(withAge(body, _cache?.builtAt ?? Date.now()), { headers: cacheHeaders });
+    } catch (err) {
+      console.error('[opportunities] forced refresh failed:', err);
+      // Serve the last good data rather than an empty screen; the age makes it obvious.
+      if (_cache) return NextResponse.json(withAge(_cache.body, _cache.builtAt), { headers: cacheHeaders });
+    }
+  }
 
-  // Stale: return old data immediately and kick off a background refresh
-  if (_cache && age > CACHE_TTL_MS && !_rebuilding) {
-    _rebuilding = true;
-    buildOpportunities()
-      .then(body => { _cache = { body, builtAt: Date.now() }; })
-      .catch(err => console.error('[opportunities] background rebuild failed:', err))
-      .finally(() => { _rebuilding = false; });
-    return NextResponse.json(_cache.body, { headers: cacheHeaders });
+  const age = _cache ? Date.now() - _cache.builtAt : Infinity;
+
+  // Stale: return current data immediately and refresh in the background
+  if (_cache && age > CACHE_TTL_MS) {
+    rebuild().catch(err => console.error('[opportunities] background rebuild failed:', err));
+    return NextResponse.json(withAge(_cache.body, _cache.builtAt), { headers: cacheHeaders });
   }
 
   // Fresh cache: instant return
-  if (_cache) return NextResponse.json(_cache.body, { headers: cacheHeaders });
+  if (_cache) return NextResponse.json(withAge(_cache.body, _cache.builtAt), { headers: cacheHeaders });
 
-  // Warm failed — try once more
+  // No cache at all (warm failed) — build now. Just-built, so age is effectively zero.
   try {
-    const body = await buildOpportunities();
-    _cache = { body, builtAt: Date.now() };
-    return NextResponse.json(body, { headers: cacheHeaders });
+    const body = await rebuild();
+    return NextResponse.json(withAge(body, Date.now()), { headers: cacheHeaders });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error('[/api/opportunities]', message);

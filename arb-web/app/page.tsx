@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ArbitrageOpportunity, Category } from '@/lib/market-types';
+import { MIN_ORDER_CONTRACTS } from '@/lib/market-types';
 import type { OpportunitiesResponse, PairInfo } from './api/opportunities/route';
 import type { ExecuteResponse, ConnectionTestResponse } from './api/execute/route';
 import { CATEGORY_LABELS, CATEGORY_COLORS } from '@/lib/categories';
@@ -204,6 +205,8 @@ function OpportunityCard({ opp, amount, bankroll, persistence, onUseKelly, onExe
   const [cardExec, setCardExec] = useState<CardExecState>({ state: 'idle' });
   const { pair, legA, legB, totalCostCents, edgePercent } = opp;
   const isArb = edgePercent >= 0.5;
+  // Strictly positive edge after fees = the only case worth (and safe) to execute.
+  const isProfitable = edgePercent > 0;
   const category = pair.polymarket.category;
 
   const totalCostDollars = (totalCostCents / 100) * amount;
@@ -212,8 +215,14 @@ function OpportunityCard({ opp, amount, bankroll, persistence, onUseKelly, onExe
   // Cap the Kelly suggestion at what the Kalshi book can actually fill —
   // a $690 suggestion against a 19-contract book is fiction.
   const kellyRaw = kellyBet(bankroll, edgePercent);
-  const kellySuggestion = opp.maxContracts != null ? Math.min(kellyRaw, opp.maxContracts) : kellyRaw;
+  // Never suggest a size that can't actually be placed: cap by book depth, but never
+  // below the venue minimum (a $0 or $2 suggestion is not a tradeable order).
+  const kellyCapped = opp.maxContracts != null ? Math.min(kellyRaw, opp.maxContracts) : kellyRaw;
+  const kellySuggestion = Math.max(MIN_ORDER_CONTRACTS, kellyCapped);
   const exceedsDepth = opp.maxContracts != null && amount > opp.maxContracts;
+  // Polymarket rejects orders under 5 shares; Kalshi accepts 1. Placing a smaller pair
+  // would fill only the Kalshi leg, so the trade must be blocked entirely.
+  const belowMinimum = Math.round(amount) < MIN_ORDER_CONTRACTS;
 
   const pmDate = fmtDate(pair.polymarket.resolutionTime);
   const kalDate = fmtDate(pair.kalshi.resolutionTime);
@@ -392,9 +401,9 @@ function OpportunityCard({ opp, amount, bankroll, persistence, onUseKelly, onExe
         </div>
         <span className="text-[--text-muted]">→</span>
         <div>
-          <p className="text-xs text-[--text-muted]">Profit</p>
-          <p className="text-sm font-bold font-mono" style={{ color: edgePercent >= 0 ? '#4ade80' : '#f87171' }}>
-            {profitDollars >= 0 ? '+' : '-'}{fmtUsd(profitDollars)}
+          <p className="text-xs text-[--text-muted]">{isProfitable ? 'Profit' : 'Loss'}</p>
+          <p className="text-sm font-bold font-mono" style={{ color: isProfitable ? '#4ade80' : '#f87171' }}>
+            {profitDollars >= 0 ? '+' : '−'}{fmtUsd(profitDollars)}
           </p>
         </div>
         {opp.maxContracts != null && (
@@ -412,15 +421,43 @@ function OpportunityCard({ opp, amount, bankroll, persistence, onUseKelly, onExe
         </p>
       )}
 
-      {/* Per-card execute button / inline result */}
+      {/* Per-card execute button / inline result.
+          A non-positive edge is a guaranteed loss at these prices — never offer to
+          place it, and never label a loss as "profit". */}
       {cardExec.state === 'idle' && (
-        <button
-          onClick={handleCardExecute}
-          style={{ background: '#16a34a', color: 'white' }}
-          className="w-full py-2.5 rounded-lg text-sm font-semibold hover:opacity-90 transition-opacity"
-        >
-          Execute — invest {fmtUsd(totalCostDollars)}, profit +{fmtUsd(profitDollars)}
-        </button>
+        isProfitable && belowMinimum ? (
+          <div
+            style={{ background: 'var(--surface)', border: '1px solid #d9770655' }}
+            className="w-full py-2.5 rounded-lg text-center"
+          >
+            <p className="text-sm font-semibold" style={{ color: '#fbbf24' }}>
+              Amount below Polymarket&apos;s {MIN_ORDER_CONTRACTS}-share minimum
+            </p>
+            <p className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
+              Raise Amount to at least ${MIN_ORDER_CONTRACTS} — a smaller order fills only the Kalshi leg and leaves it unhedged
+            </p>
+          </div>
+        ) : isProfitable ? (
+          <button
+            onClick={handleCardExecute}
+            style={{ background: '#16a34a', color: 'white' }}
+            className="w-full py-2.5 rounded-lg text-sm font-semibold hover:opacity-90 transition-opacity"
+          >
+            Execute — invest {fmtUsd(totalCostDollars)}, profit +{fmtUsd(profitDollars)}
+          </button>
+        ) : (
+          <div
+            style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}
+            className="w-full py-2.5 rounded-lg text-center"
+          >
+            <p className="text-sm font-semibold" style={{ color: 'var(--text-muted)' }}>
+              No profit at these prices — costs {fmtUsd(totalCostDollars)} to win {fmtUsd(payoutDollars)}
+            </p>
+            <p className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
+              Needs {fmtUsd(Math.abs(profitDollars))} more edge ({edgePercent.toFixed(2)}%) · watching for the spread to widen
+            </p>
+          </div>
+        )
       )}
 
       {cardExec.state === 'pending' && (
@@ -837,7 +874,7 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [lastFetch, setLastFetch] = useState<string | null>(null);
   const [view, setView] = useState<'opportunities' | 'pairs'>('opportunities');
-  const [edgeFilter, setEdgeFilter] = useState<'all' | 'arb' | 'near'>('all');
+  const [edgeFilter, setEdgeFilter] = useState<'all' | 'arb' | 'profit' | 'near'>('all');
   const [catFilter, setCatFilter] = useState<Category | 'all'>('all');
   const [pairsCatFilter, setPairsCatFilter] = useState<Category | 'all'>('all');
   const [amount, setAmount] = useState(100);
@@ -931,7 +968,14 @@ export default function Home() {
     isFetching.current = true;
     setLoading(true);
     try {
-      const res = await fetch('/api/opportunities', { signal: abortRef.current.signal });
+      // force -> ?fresh=1 makes the server rebuild from the venues and wait for it, so
+      // Refresh shows the prices that are live right now and drops opportunities that
+      // have already evaporated. cache:'no-store' stops the browser answering from its
+      // own cache, which previously made Refresh look like it did nothing.
+      const res = await fetch(`/api/opportunities${force ? '?fresh=1' : ''}`, {
+        signal: abortRef.current.signal,
+        cache: 'no-store',
+      });
       const json = await res.json() as OpportunitiesResponse;
       setData(json);
       setLastFetch(new Date().toISOString());
@@ -963,16 +1007,20 @@ export default function Home() {
     if (!autoExec || !data || execPhase !== null) return;
     for (const opp of data.opportunities) {
       if (opp.edgePercent < execThreshold) break;
+      // Hard floor: never auto-trade a non-profitable edge, whatever the threshold says.
+      // The list now includes near-misses (negative edge) for visibility.
+      if (opp.edgePercent <= 0) break;
       // Default scope trades sports only — politics settle months out and lock capital
       if (autoExecScope === 'sports' && opp.pair.polymarket.category === 'politics') continue;
       const key = `${opp.pair.polymarket.id}|${opp.pair.kalshi.id}`;
       if (executedPairs.current.has(key)) continue;
       // Never auto-size beyond the Kalshi book depth — an oversized IOC leg partially
-      // fills and cancels, leaving the fully-filled Polymarket leg naked. Skip pairs
-      // with no reported depth rather than guess.
-      if (opp.maxContracts != null && opp.maxContracts < 1) continue;
+      // fills and cancels, leaving the fully-filled Polymarket leg naked.
       const kelly = kellyBet(bankroll, opp.edgePercent);
-      const betAmount = opp.maxContracts != null ? Math.max(1, Math.min(kelly, opp.maxContracts)) : kelly;
+      const betAmount = opp.maxContracts != null ? Math.min(kelly, opp.maxContracts) : kelly;
+      // Skip anything that can't be placed on BOTH venues: under Polymarket's 5-share
+      // minimum the PM leg is rejected while Kalshi fills, leaving a naked position.
+      if (betAmount < MIN_ORDER_CONTRACTS) continue;
       executedPairs.current.add(key);
       setExecPhase({ phase: 'pending', opp, amount: betAmount, countdown: COUNTDOWN_START, key });
       break; // one at a time
@@ -1045,13 +1093,20 @@ export default function Home() {
   const filtered = useMemo(
     () =>
       edgeFilter === 'arb' ? catFiltered.filter(o => o.edgePercent >= 2) :
-      edgeFilter === 'near' ? catFiltered.filter(o => o.edgePercent >= 0.5 && o.edgePercent < 2) :
+      edgeFilter === 'profit' ? catFiltered.filter(o => o.edgePercent > 0) :
+      edgeFilter === 'near' ? catFiltered.filter(o => o.edgePercent > -1 && o.edgePercent <= 0) :
       catFiltered,
     [catFiltered, edgeFilter]
   );
 
   const arbCount = useMemo(() => catFiltered.filter(o => o.edgePercent >= 2).length, [catFiltered]);
-  const nearCount = useMemo(() => catFiltered.filter(o => o.edgePercent >= 0.5 && o.edgePercent < 2).length, [catFiltered]);
+  const profitCount = useMemo(() => catFiltered.filter(o => o.edgePercent > 0).length, [catFiltered]);
+  // "So close" band: unprofitable but within a point of flipping positive.
+  const nearCount = useMemo(() => catFiltered.filter(o => o.edgePercent > -1 && o.edgePercent <= 0).length, [catFiltered]);
+  const profitableCount = useMemo(() => opportunities.filter(o => o.edgePercent > 0).length, [opportunities]);
+  // Quotes older than ~20s are worth flagging: at prediction-market speed an edge can be
+  // gone by then, which is exactly the "site says arb, venue disagrees" complaint.
+  const quotesStale = (data?.stats.ageMs ?? 0) > 20_000;
 
   // ── two-screen auto-exec views ─────────────────────────────────────────────
   if (execPhase?.phase === 'pending' || execPhase?.phase === 'executing') {
@@ -1091,10 +1146,11 @@ export default function Home() {
           <button
             onClick={() => load(true)}
             disabled={loading}
+            title="Re-fetch live prices from both venues now"
             style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}
             className="px-4 py-2 rounded-lg text-sm font-medium hover:border-[#8b949e] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {loading ? 'Refreshing…' : 'Refresh'}
+            {loading ? 'Fetching live prices…' : 'Refresh prices'}
           </button>
         </div>
       </div>
@@ -1128,7 +1184,7 @@ export default function Home() {
           <input
             id="arb-amount"
             type="number"
-            min={1}
+            min={MIN_ORDER_CONTRACTS}
             max={100000}
             value={amount}
             onChange={e => setAmount(Math.max(1, parseInt(e.target.value) || 1))}
@@ -1218,7 +1274,12 @@ export default function Home() {
                 max={20}
                 step={0.1}
                 value={execThreshold}
-                onChange={e => setExecThreshold(parseFloat(e.target.value) || 1.5)}
+                // Clamp above zero — a negative/zero threshold would arm auto-exec on
+                // the near-miss (loss-making) opportunities now shown in the list.
+                onChange={e => {
+                  const v = parseFloat(e.target.value);
+                  setExecThreshold(Number.isFinite(v) && v > 0 ? v : 0.1);
+                }}
                 style={{ background: 'var(--card)', border: `1px solid #16a34a66`, color: '#4ade80' }}
                 className="w-16 px-2 py-1.5 rounded-lg text-sm font-mono text-right"
               />
@@ -1289,7 +1350,8 @@ export default function Home() {
           {[
             { label: 'PM markets', val: data.stats.pmMarkets },
             { label: 'Kalshi markets', val: data.stats.kalshiMarkets },
-            { label: 'Opportunities', val: opportunities.length },
+            { label: 'Tracked (incl. near-miss)', val: opportunities.length },
+            { label: 'Profitable (>0%)', val: profitableCount, highlight: profitableCount > 0 },
             { label: 'True arb (≥2%)', val: opportunities.filter(o => o.edgePercent >= 2).length, highlight: opportunities.filter(o => o.edgePercent >= 2).length > 0 },
           ].map(({ label, val, highlight }) => (
             <div key={label}>
@@ -1299,8 +1361,12 @@ export default function Home() {
               </p>
             </div>
           ))}
-          <div className="ml-auto text-xs text-[--text-muted]">
-            {lastFetch ? `Updated ${timeAgo(lastFetch)}` : ''}
+          {/* Show how old the QUOTES are (server build time), not when the response
+              arrived — the latter always read "just now" even on 55s-old prices. */}
+          <div className="ml-auto text-xs" style={{ color: quotesStale ? '#fbbf24' : 'var(--text-muted)' }}>
+            {data.stats.builtAt
+              ? `Prices ${timeAgo(data.stats.builtAt)}${quotesStale ? ' — hit Refresh' : ''}`
+              : lastFetch ? `Updated ${timeAgo(lastFetch)}` : ''}
           </div>
         </div>
       )}
@@ -1350,8 +1416,8 @@ export default function Home() {
       </div>}
 
       {/* Edge filter — opportunities view only */}
-      {view === 'opportunities' && <div className="flex gap-2 mb-5">
-        {(['all', 'arb', 'near'] as const).map(f => (
+      {view === 'opportunities' && <div className="flex gap-2 mb-5 flex-wrap">
+        {(['all', 'profit', 'arb', 'near'] as const).map(f => (
           <button
             key={f}
             onClick={() => setEdgeFilter(f)}
@@ -1363,8 +1429,9 @@ export default function Home() {
             className="px-4 py-1.5 rounded-full text-sm font-medium transition-colors"
           >
             {f === 'all' ? `All (${catFiltered.length})` :
+             f === 'profit' ? `Profitable (${profitCount})` :
              f === 'arb' ? `True arb ≥2% (${arbCount})` :
-             `Near miss 0.5–2% (${nearCount})`}
+             `So close −1–0% (${nearCount})`}
           </button>
         ))}
       </div>}
@@ -1394,8 +1461,12 @@ export default function Home() {
             <div className="py-16 text-center">
               <p className="text-[--text-muted]">
                 {edgeFilter === 'all'
-                  ? 'No matched pairs found right now.'
-                  : `No ${edgeFilter === 'arb' ? 'true arb' : 'near-miss'} opportunities right now.`}
+                  ? 'No matched markets right now.'
+                  : edgeFilter === 'profit'
+                  ? `No profitable edge right now — ${catFiltered.length} market${catFiltered.length === 1 ? '' : 's'} tracked. Switch to "All" to see how close they are.`
+                  : edgeFilter === 'arb'
+                  ? `No ≥2% arb right now — ${catFiltered.length} tracked.`
+                  : `Nothing in the −1–0% band right now — ${catFiltered.length} tracked.`}
               </p>
             </div>
           )}

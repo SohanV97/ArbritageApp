@@ -1,5 +1,12 @@
 export type Category = 'mlb' | 'soccer' | 'politics';
 
+// Polymarket's CLOB rejects orders under 5 shares (INVALID_ORDER_MIN_SIZE); verified
+// against live /markets data — every market reports minimum_order_size = 5. Kalshi's
+// minimum is 1, so a 1–4 contract arb would fill the Kalshi leg and have the Polymarket
+// leg rejected, leaving a naked directional position. Both legs are sized equally, so
+// no arb below this size may be placed.
+export const MIN_ORDER_CONTRACTS = 5;
+
 export type Venue = 'polymarket' | 'kalshi';
 
 export type BinarySide = 'yes' | 'no';

@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import type { ArbitrageOpportunity } from '@/lib/market-types';
+import { MIN_ORDER_CONTRACTS } from '@/lib/market-types';
 import { placeKalshiOrder, testKalshiAuth } from '@/api/kalshi-trading';
 import { placePolymarketOrder, testPolymarketAuth } from '@/api/polymarket-trading';
 import type { KalshiAuthTest } from '@/api/kalshi-trading';
@@ -105,6 +106,11 @@ export async function POST(request: Request): Promise<Response> {
   } catch {
     return executeError('Invalid JSON body');
   }
+  // `JSON.parse` accepts "null", "[]" and bare scalars — destructuring those threw a
+  // TypeError that escaped as an unshaped 500 the client could not render.
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    return executeError('Request body must be a JSON object');
+  }
 
   const { opportunity, amount } = body;
   if (!opportunity?.pair?.polymarket || !opportunity?.pair?.kalshi || !opportunity.legA || !opportunity.legB) {
@@ -158,6 +164,11 @@ export async function POST(request: Request): Promise<Response> {
   const contracts = Math.max(1, Math.round(amount));
   if (contracts > MAX_ORDER_CONTRACTS) {
     return executeError(`Order size ${contracts} exceeds the server cap (${MAX_ORDER_CONTRACTS}). Set ARB_MAX_ORDER_CONTRACTS to raise it.`);
+  }
+  // Reject BEFORE placing either leg: Polymarket rejects under 5 shares while Kalshi
+  // accepts 1, so a smaller order fills only the Kalshi side and leaves it unhedged.
+  if (contracts < MIN_ORDER_CONTRACTS) {
+    return executeError(`Order size ${contracts} is below Polymarket's ${MIN_ORDER_CONTRACTS}-share minimum. A smaller order would fill only the Kalshi leg and leave it unhedged.`);
   }
 
   // Place both legs simultaneously — this minimizes price-movement risk between legs

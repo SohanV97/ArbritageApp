@@ -34,11 +34,16 @@ export function estimatePolymarketFeeCents(
 export function estimateKalshiFeeCents(priceCents: number, contracts: number): number {
   if (contracts <= 0) return 0;
   // Kalshi's general trading fee: 0.07 × contracts × price × (1 − price), charged on
-  // execution (win or lose) and rounded UP to the next whole cent per order. We apply
-  // that ceil so the edge is never overstated — e.g. a single 50¢ contract is billed
-  // 2¢ (ceil of 1.75¢), not 1.75¢.
+  // execution (win or lose). Kalshi rounds the ORDER TOTAL up to the next whole cent.
+  //
+  // Do NOT ceil here. This is called with contracts = 1 as a per-contract marginal
+  // rate that the caller scales by the real order size, so ceiling at one contract
+  // would bill every contract the rounding of a 1-lot: at 30¢ the true rate is
+  // 1.47¢/contract but ceil makes it 2¢, overstating cost ~0.5¢ on every contract.
+  // On an arb whose whole edge is 1–3¢ that error alone erases real opportunities.
+  // The genuine per-order rounding is at most 1¢ spread across the whole order.
   const p = Math.max(0, Math.min(1, priceCents / 100));
-  return Math.ceil(0.07 * p * (1 - p) * 100 * contracts);
+  return Math.max(0, 0.07 * p * (1 - p) * 100 * contracts);
 }
 
 export function estimateFeeCentsForVenue(

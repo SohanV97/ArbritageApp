@@ -56,15 +56,23 @@ function getPrice(m: KalshiMarket, ...keys: string[]): number | string | undefin
   return undefined;
 }
 
+// Reads a price in CENTS from the two shapes Kalshi returns.
+// `unit` removes a genuine ambiguity: the raw value 1 means $1.00 (=100¢) coming from a
+// *_dollars field but 1¢ coming from an integer-cent field. Guessing from magnitude
+// alone silently turns a 1¢ quote into a 100¢ one.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function extractCents(val: any): number | null {
+function extractCents(val: any, unit: 'dollars' | 'cents'): number | null {
   if (val === undefined || val === null || val === '') return null;
   const n = typeof val === 'string' ? parseFloat(val) : Number(val);
-  if (Number.isNaN(n)) return null;
-  if (n > 0 && n < 1) return Math.round(n * 100);
-  if (n === 1) return 100;
-  if (n >= 1 && n <= 100) return Math.round(n);
-  return null;
+  if (!Number.isFinite(n)) return null;
+  const cents = unit === 'dollars' ? Math.round(n * 100) : Math.round(n);
+  return cents >= 1 && cents <= 100 ? cents : null;
+}
+
+// Prefer the authoritative *_dollars field; fall back to the integer-cent field.
+function readPriceCents(m: KalshiMarket, dollarsKey: string, centsKey: string): number | null {
+  return extractCents(getPrice(m, dollarsKey), 'dollars')
+      ?? extractCents(getPrice(m, centsKey), 'cents');
 }
 
 async function fetchKalshiMarketsPage(opts: {
@@ -164,7 +172,11 @@ const SERIES_SUBTITLE: Record<string, string> = {
 };
 
 function kalshiMarketUrl(m: KalshiMarket): string {
-  const eventTicker = (m.event_ticker ?? m.ticker);
+  // Both fields are untrusted API data — fall back rather than assume a string.
+  const eventTicker = (typeof m.event_ticker === 'string' && m.event_ticker)
+    || (typeof m.ticker === 'string' && m.ticker)
+    || '';
+  if (!eventTicker) return 'https://kalshi.com/markets';
   const seriesKey = eventTicker.split('-')[0].toUpperCase();
   const series = seriesKey.toLowerCase();
   const event = eventTicker.toLowerCase();
@@ -182,13 +194,16 @@ function kalshiMarketUrl(m: KalshiMarket): string {
 export function normalizeKalshiMarkets(markets: KalshiMarket[], category?: Category): UnifiedMarket[] {
   const result: UnifiedMarket[] = [];
   for (const m of markets) {
-    if (typeof m.ticker === 'string' && (m.ticker.includes('KXMV') || m.market_type === 'scalar')) continue;
+    // A market with no ticker is unusable (it's the order key and the URL/date source)
+    // and previously crashed the whole build below, 500-ing the opportunities endpoint.
+    if (typeof m.ticker !== 'string' || m.ticker.length === 0) continue;
+    if (m.ticker.includes('KXMV') || m.market_type === 'scalar') continue;
 
     // Executable BUY price is the ASK on each side. Never fall back to the bid or
     // synthesize the complement (100 − other side): buying at the bid is not fillable
     // and fabricates phantom arbs. A market missing either ask isn't tradeable → skip.
-    const yesCents = extractCents(getPrice(m, 'yes_ask_dollars', 'yes_ask'));
-    const noCents = extractCents(getPrice(m, 'no_ask_dollars', 'no_ask'));
+    const yesCents = readPriceCents(m, 'yes_ask_dollars', 'yes_ask');
+    const noCents = readPriceCents(m, 'no_ask_dollars', 'no_ask');
     // A real two-sided book's asks sum to ≥100 (the overround). A sum well below 100
     // means a stale/crossed quote — reject it rather than surface an impossible price.
     if (!yesCents || !noCents || yesCents + noCents > 105 || yesCents + noCents < 95) continue;
@@ -196,17 +211,17 @@ export function normalizeKalshiMarkets(markets: KalshiMarket[], category?: Categ
     // Use event_ticker for date extraction — it encodes the actual game date in the URL
     // (e.g. KXMLBGAME-26JUL061410PHIKC). The market ticker (m.ticker) may carry a
     // -Y/-N suffix or a stale date from when the contract was originally created.
-    const dateTicker = m.event_ticker ?? m.ticker;
-    const gameDate = parseKalshiGameDate(dateTicker);
+    // Treat event_ticker as untrusted: the API could return a non-string.
+    const eventTicker = typeof m.event_ticker === 'string' ? m.event_ticker : '';
+    const gameDate = parseKalshiGameDate(eventTicker || m.ticker);
 
     // Sports game markets share one title per game ("Toronto vs San Diego Winner?");
     // which team YES pays on lives only in the ticker suffix (-TOR) and yes_sub_title
     // ("Toronto"). Capture both so alignment can be done by identity, not price.
     let yesTeam: string | undefined;
     if (category === 'mlb' || category === 'soccer') {
-      const et = m.event_ticker ?? '';
-      const code = et && m.ticker.toUpperCase().startsWith(`${et.toUpperCase()}-`)
-        ? m.ticker.slice(et.length + 1)
+      const code = eventTicker && m.ticker.toUpperCase().startsWith(`${eventTicker.toUpperCase()}-`)
+        ? m.ticker.slice(eventTicker.length + 1)
         : '';
       const sub = typeof m.yes_sub_title === 'string' ? m.yes_sub_title : '';
       yesTeam = `${code} ${sub}`.trim() || undefined;
@@ -214,9 +229,14 @@ export function normalizeKalshiMarkets(markets: KalshiMarket[], category?: Categ
 
     // Contracts fillable at the quoted prices. Kalshi's book is unified: a NO buy
     // fills against the YES bid, so NO-side depth is the YES bid size.
+    // Fractional sizes below one contract floor to 0, which is not a tradeable depth —
+    // it surfaced as "Max fill ~$0.00" and a $0 Kelly suggestion. Report undefined
+    // (unknown/none) rather than a zero that reads like a real number.
     const parseFp = (v: number | string | undefined): number | undefined => {
       const n = typeof v === 'number' ? v : typeof v === 'string' ? parseFloat(v) : NaN;
-      return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+      if (!Number.isFinite(n) || n < 1) return undefined;
+      const floored = Math.floor(n);
+      return floored >= 1 ? floored : undefined;
     };
 
     result.push({

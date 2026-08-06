@@ -133,22 +133,57 @@ const SLUG_MONTH: Record<string, string> = {
   jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12',
 };
 
+// When a slug carries a month/day but no year, infer it from today rather than
+// hardcoding one: a fixed year silently mis-dates every such market once the calendar
+// rolls over, and since sports matching requires the same game date, those games would
+// quietly stop matching. Pick the current year, rolling forward when that would place
+// the date far in the past (a "jan-03" slug seen in December means next January).
+function inferYearFor(month: string, day: string): string {
+  const now = new Date();
+  const y = now.getUTCFullYear();
+  const candidate = Date.parse(`${y}-${month}-${day}T00:00:00Z`);
+  if (Number.isNaN(candidate)) return String(y);
+  const daysAgo = (now.getTime() - candidate) / 86_400_000;
+  if (daysAgo > 180) return String(y + 1);   // e.g. "jan-03" seen in December
+  if (daysAgo < -180) return String(y - 1);  // e.g. "dec-28" seen in January
+  return String(y);
+}
+
 function extractDateFromSlug(slug: string): string | null {
   if (!slug) return null;
   // ISO date anywhere in slug: 2026-07-02
   const iso = slug.match(/(\d{4}-\d{2}-\d{2})/);
   if (iso) return iso[1];
-  // "jul-2-2026" or "jul-02-2026" or "july-2" (no year → current year inferred later)
+  // "jul-2-2026" or "jul-02-2026" or "july-2" (no year → inferred from today)
   const m = slug.match(/-(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*-(\d{1,2})(?:-(\d{4}))?/i);
   if (m) {
     const month = SLUG_MONTH[m[1].toLowerCase().slice(0, 3)];
     if (month) {
       const day = m[2].padStart(2, '0');
-      const year = m[3] ?? '2026';
+      const year = m[3] ?? inferYearFor(month, day);
       return `${year}-${month}-${day}`;
     }
   }
   return null;
+}
+
+// Soccer (and some MLB) markets are phrased "Will <Team> win on <date>?" with plain
+// Yes/No outcomes, so the winning team never appears in `outcomes` — leaving yesTeam
+// unset and forcing YES/NO alignment to fall back to price proximity, which inverts
+// precisely when the venues disagree (i.e. when there's an arb). Recover the team
+// from the question text and the "A vs. B" event title so alignment stays identity-based.
+function extractYesNoTeams(eventTitle: string, question: string): { yes?: string; no?: string } {
+  const m = question.match(/\bwill\s+(.+?)\s+win\b/i);
+  if (!m) return {};
+  const team = m[1].trim();
+  const parts = eventTitle.split(/\s+vs\.?\s+/i).map(s => s.trim()).filter(Boolean);
+  if (parts.length === 2) {
+    const [a, b] = parts;
+    const la = a.toLowerCase(), lb = b.toLowerCase(), lt = team.toLowerCase();
+    if (la.includes(lt) || lt.includes(la)) return { yes: a, no: b };
+    if (lb.includes(lt) || lt.includes(lb)) return { yes: b, no: a };
+  }
+  return { yes: team };
 }
 
 function normalizeEvents(
@@ -179,6 +214,9 @@ function normalizeEvents(
       let question = rawQuestion.toLowerCase().includes(eventTitle.toLowerCase()) ? rawQuestion : `${eventTitle}: ${rawQuestion}`;
       const isYesNo = outcomesArr[0].toLowerCase() === 'yes' || outcomesArr[1].toLowerCase() === 'no';
       if (!isYesNo) question = `${question} [${outcomesArr[0]} vs ${outcomesArr[1]}]`;
+      // "Will <Team> win?" markets carry the team only in the text — recover it so
+      // YES/NO alignment is identity-based rather than price-based.
+      const ynTeams = (isSport && isYesNo) ? extractYesNoTeams(eventTitle, rawQuestion) : {};
 
       const slug = m.slug ?? m.market_slug ?? m.condition_id ?? m.conditionId ?? m.id ?? '';
       const conditionId = m.condition_id ?? m.conditionId ?? m.id ?? '';
@@ -222,9 +260,10 @@ function normalizeEvents(
         yesTokenId,
         noTokenId,
         category,
-        // Team-outcome moneylines: YES pays on outcomes[0], NO on outcomes[1]
-        yesTeam: isSport && !isYesNo ? outcomesArr[0] : undefined,
-        noTeam: isSport && !isYesNo ? outcomesArr[1] : undefined,
+        // Team-outcome moneylines: YES pays on outcomes[0], NO on outcomes[1].
+        // Yes/No-phrased markets ("Will <Team> win?"): recover the team from the text.
+        yesTeam: !isSport ? undefined : (!isYesNo ? outcomesArr[0] : ynTeams.yes),
+        noTeam: !isSport ? undefined : (!isYesNo ? outcomesArr[1] : ynTeams.no),
         spreadCents: (() => { const s = toNum(m.spread); return s !== null ? Math.round(s * 100) : undefined; })(),
         liquidityUsd: toNum(m.liquidityClob ?? m.liquidity) ?? undefined,
       });
