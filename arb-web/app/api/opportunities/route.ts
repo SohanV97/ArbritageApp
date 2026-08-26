@@ -1,10 +1,11 @@
 import { NextResponse } from 'next/server';
-import { getPolymarketMarketsForAllCategories } from '@/api/polymarket';
-import { getKalshiMarketsForAllCategories } from '@/api/kalshi';
+import { gzipSync } from 'node:zlib';
+import { getPolymarketMarketsForAllCategories, refreshPolymarketPrices } from '@/api/polymarket';
+import { getKalshiMarketsForAllCategories, refreshKalshiPrices } from '@/api/kalshi';
 import { matchMarkets } from '@/lib/matchMarkets';
 import { findArbitrageOpportunities, type PairWithKind } from '@/lib/arbitrage';
 import type { PolymarketMarketWithKind } from '@/api/polymarket';
-import type { ArbitrageOpportunity, Category } from '@/lib/market-types';
+import type { ArbitrageOpportunity, Category, MatchedPair, UnifiedMarket } from '@/lib/market-types';
 import { SPORT_ALIASES } from '@/lib/categories';
 
 export interface PairInfo {
@@ -54,9 +55,32 @@ const NEAR_MISS_FLOOR_PERCENT = -5;
 // After the first cold-start fetch (~3 s with batch optimizations), every poll
 // returns from this cache in <5 ms. When the TTL expires the cache is served
 // stale immediately and refreshed in the background, so the user never waits.
-interface CacheEntry { body: OpportunitiesResponse; builtAt: number; }
+// The body only changes when prices refresh, so serialize AND compress it once per
+// build instead of on every request. Measured: the raw payload is ~200 KB and was being
+// sent uncompressed; gzip takes it to ~37 KB (5.4x less over the wire) and a request
+// becomes a buffer write with no JSON work at all.
+interface CacheEntry {
+  body: OpportunitiesResponse;
+  builtAt: number;
+  json: string;
+  gzip: Buffer;
+}
 let _cache: CacheEntry | null = null;
+
+function makeEntry(body: OpportunitiesResponse, builtAt: number): CacheEntry {
+  // builtAt travels IN the payload so the response is byte-identical for the whole
+  // build window; the client derives quote age from it. (A per-request "ageMs" field
+  // would force re-serialization on every hit and defeat the caching.)
+  const stamped: OpportunitiesResponse = {
+    ...body,
+    stats: { ...body.stats, builtAt: new Date(builtAt).toISOString() },
+  };
+  const json = JSON.stringify(stamped);
+  return { body: stamped, builtAt, json, gzip: gzipSync(json, { level: 6 }) };
+}
 let _rebuilding = false;
+// Last discovery result, reused by the cheap reprice path.
+let _discovery: Discovery | null = null;
 // A full rebuild measured ~1.2 s, so holding quotes for 55 s was ~50× more stale than
 // necessary: an opportunity could be gone from the venues long before the app stopped
 // showing it. Keep it just under the client's 7 s poll so nearly every poll gets a
@@ -71,9 +95,54 @@ function rebuild(): Promise<OpportunitiesResponse> {
   if (_inFlight) return _inFlight;
   _rebuilding = true;
   _inFlight = buildOpportunities()
-    .then(body => { _cache = { body, builtAt: Date.now() }; return body; })
+    .then(body => { _cache = makeEntry(body, Date.now()); return body; })
     .finally(() => { _inFlight = null; _rebuilding = false; });
   return _inFlight;
+}
+
+// Fast path: re-quote the matched markets only. Single-flighted like rebuild().
+let _repriceInFlight: Promise<OpportunitiesResponse> | null = null;
+
+function reprice(): Promise<OpportunitiesResponse> {
+  if (_repriceInFlight) return _repriceInFlight;
+  const disc = _discovery;
+  if (!disc) return rebuild();               // nothing discovered yet
+  _repriceInFlight = repriceAndAssemble(disc)
+    .then(body => { _cache = makeEntry(body, Date.now()); return body; })
+    .finally(() => { _repriceInFlight = null; });
+  return _repriceInFlight;
+}
+
+// ─── background refresh loop ─────────────────────────────────────────────────
+// Requests never wait on the network: a timer keeps the cache continuously hot, so
+// every GET is a memory read (<5 ms) of quotes that are at most REPRICE_MS old.
+// Rediscovery (new fixtures) runs far less often because it is ~6× more expensive.
+// Repricing is a couple of batch calls (~200 ms), so it can run sub-second without
+// approaching either venue's rate limit — verified at this cadence with zero 429s.
+const REPRICE_MS = 700;
+const REDISCOVER_MS = 90_000;
+
+// Dev HMR re-evaluates this module, so a module-local flag would let each reload start
+// another timer and multiply the upstream load. Pin the guard to the process instead.
+const LOOP_FLAG = Symbol.for('arb.opportunities.refreshLoop');
+type LoopHost = { [LOOP_FLAG]?: boolean };
+
+function startRefreshLoop() {
+  const host = globalThis as unknown as LoopHost;
+  if (host[LOOP_FLAG]) return;
+  host[LOOP_FLAG] = true;
+  const tick = async () => {
+    try {
+      const needsDiscovery = !_discovery || Date.now() - _discovery.at > REDISCOVER_MS;
+      if (needsDiscovery) await rebuild();
+      else await reprice();
+    } catch (err) {
+      console.error('[opportunities] refresh tick failed:', err);
+    }
+  };
+  const timer = setInterval(() => { void tick(); }, REPRICE_MS);
+  // Don't hold the process open on shutdown.
+  (timer as unknown as { unref?: () => void }).unref?.();
 }
 
 // ─── YES-side alignment helpers ──────────────────────────────────────────────
@@ -107,24 +176,44 @@ function partyOf(q: string): 'r' | 'd' | 'i' | null {
   return null;
 }
 
-async function buildOpportunities(): Promise<OpportunitiesResponse> {
+// ─── discovery vs pricing ────────────────────────────────────────────────────
+// Discovery — finding which markets exist and pairing them up — is the expensive part
+// (~1.2 s of paging both APIs) but changes slowly: new fixtures appear hourly. Prices
+// change by the second. Keeping them separate lets prices refresh in ~200 ms via the
+// venues' batch endpoints, so quotes stay current without re-walking every series.
+interface Discovery {
+  pairsByCategory: Map<Category, MatchedPair[]>;
+  counts: Partial<Record<Category, { pm: number; kalshi: number }>>;
+  totalPm: number;
+  totalKalshi: number;
+  /** Just the markets that actually got matched — the only ones worth re-quoting. */
+  matchedPm: PolymarketMarketWithKind[];
+  matchedKalshi: UnifiedMarket[];
+  at: number;
+}
+
+async function discover(): Promise<Discovery> {
   const [pmByCategory, kalshiByCategory] = await Promise.all([
     getPolymarketMarketsForAllCategories(),
     getKalshiMarketsForAllCategories(),
   ]);
 
-  const allOpportunities: ArbitrageOpportunity[] = [];
-  const allPairsDetail: PairInfo[] = [];
-  const byCategory: OpportunitiesResponse['stats']['byCategory'] = {};
+  const pairsByCategory = new Map<Category, MatchedPair[]>();
+  const counts: Discovery['counts'] = {};
+  const matchedPm: PolymarketMarketWithKind[] = [];
+  const matchedKalshi: UnifiedMarket[] = [];
+  const seenPm = new Set<string>();
+  const seenKal = new Set<string>();
 
   const allCategories: Category[] = [...SPORT_CATEGORIES, 'politics' as Category];
 
   for (const cat of allCategories) {
     const pmMarkets = pmByCategory.get(cat) ?? [];
     const kalshiMarkets = kalshiByCategory.get(cat) ?? [];
+    counts[cat] = { pm: pmMarkets.length, kalshi: kalshiMarkets.length };
 
     if (pmMarkets.length === 0 || kalshiMarkets.length === 0) {
-      byCategory[cat] = { pm: pmMarkets.length, kalshi: kalshiMarkets.length, pairs: 0 };
+      pairsByCategory.set(cat, []);
       continue;
     }
 
@@ -140,6 +229,33 @@ async function buildOpportunities(): Promise<OpportunitiesResponse> {
       politics: cat === 'politics',
       aliases: SPORT_ALIASES[cat],
     });
+
+    pairsByCategory.set(cat, pairs);
+    // Collect the matched markets once so repricing touches only what's on screen.
+    for (const p of pairs) {
+      if (!seenPm.has(p.polymarket.id)) { seenPm.add(p.polymarket.id); matchedPm.push(p.polymarket as PolymarketMarketWithKind); }
+      if (!seenKal.has(p.kalshi.id)) { seenKal.add(p.kalshi.id); matchedKalshi.push(p.kalshi); }
+    }
+  }
+
+  return {
+    pairsByCategory, counts, matchedPm, matchedKalshi, at: Date.now(),
+    totalPm: [...pmByCategory.values()].reduce((s, v) => s + v.length, 0),
+    totalKalshi: [...kalshiByCategory.values()].reduce((s, v) => s + v.length, 0),
+  };
+}
+
+// Pure CPU: rebuild the response from whatever prices the matched markets currently
+// hold. Called after discovery and after every reprice, so both paths run identical
+// alignment, fee and edge logic.
+function assemble(disc: Discovery): OpportunitiesResponse {
+  const allOpportunities: ArbitrageOpportunity[] = [];
+  const allPairsDetail: PairInfo[] = [];
+  const byCategory: OpportunitiesResponse['stats']['byCategory'] = {};
+
+  for (const [cat, pairs] of disc.pairsByCategory) {
+    const c = disc.counts[cat] ?? { pm: 0, kalshi: 0 };
+    byCategory[cat] = { pm: c.pm, kalshi: c.kalshi, pairs: pairs.length };
 
     const typedPairs: PairWithKind[] = pairs.flatMap(p => {
       const pmYes = p.polymarket.yesPriceCents;
@@ -227,26 +343,38 @@ async function buildOpportunities(): Promise<OpportunitiesResponse> {
     // and auto-exec has its own (positive) threshold, so nothing loss-making trades.
     const opps = findArbitrageOpportunities(typedPairs, NEAR_MISS_FLOOR_PERCENT);
     allOpportunities.push(...opps);
-    byCategory[cat] = { pm: pmMarkets.length, kalshi: kalshiMarkets.length, pairs: pairs.length };
   }
 
   allOpportunities.sort((a, b) => b.edgePercent - a.edgePercent);
-
-  const totalPm = [...pmByCategory.values()].reduce((s, v) => s + v.length, 0);
-  const totalKalshi = [...kalshiByCategory.values()].reduce((s, v) => s + v.length, 0);
   const totalPairs = Object.values(byCategory).reduce((s, v) => s + (v?.pairs ?? 0), 0);
 
   return {
     opportunities: allOpportunities,
     pairsDetail: allPairsDetail,
     stats: {
-      pmMarkets: totalPm,
-      kalshiMarkets: totalKalshi,
+      pmMarkets: disc.totalPm,
+      kalshiMarkets: disc.totalKalshi,
       matchedPairs: totalPairs,
       byCategory,
       fetchedAt: new Date().toISOString(),
     },
   };
+}
+
+// Re-quote only the matched markets, then recompute. ~200 ms versus ~1.2 s for a full
+// rediscovery, which is what makes second-by-second freshness affordable.
+async function repriceAndAssemble(disc: Discovery): Promise<OpportunitiesResponse> {
+  await Promise.all([
+    refreshKalshiPrices(disc.matchedKalshi),
+    refreshPolymarketPrices(disc.matchedPm),
+  ]);
+  return assemble(disc);
+}
+
+async function buildOpportunities(): Promise<OpportunitiesResponse> {
+  const disc = await discover();
+  _discovery = disc;
+  return assemble(disc);
 }
 
 // Kick off a build the moment this module loads. In local dev the module is loaded
@@ -255,6 +383,7 @@ async function buildOpportunities(): Promise<OpportunitiesResponse> {
 // request arrives while the warm is still running, it awaits the same Promise
 // instead of starting a second parallel build.
 let _warmupPromise: Promise<void> | null = (() => {
+  startRefreshLoop();
   return rebuild()
     .then(() => { /* cache populated by rebuild() */ })
     .catch(err => console.error('[opportunities] startup warm failed:', err))
@@ -266,10 +395,18 @@ let _warmupPromise: Promise<void> | null = (() => {
 // request never reached the server.
 const cacheHeaders = { 'Cache-Control': 'no-store, max-age=0' };
 
-// Stamp how old the quotes actually are, so the UI can report real data age instead of
-// "just now" (which only ever meant "the response arrived just now").
-function withAge(body: OpportunitiesResponse, builtAt: number): OpportunitiesResponse {
-  return { ...body, stats: { ...body.stats, builtAt: new Date(builtAt).toISOString(), ageMs: Math.max(0, Date.now() - builtAt) } };
+// Send the pre-built payload: gzip when the client accepts it (~37 KB vs ~200 KB),
+// otherwise the cached string. Either way there is no per-request JSON or compression
+// work — the response is a buffer that was produced once when prices last refreshed.
+function send(entry: CacheEntry, acceptsGzip: boolean): Response {
+  if (acceptsGzip) {
+    return new Response(new Uint8Array(entry.gzip), {
+      headers: { ...cacheHeaders, 'Content-Type': 'application/json', 'Content-Encoding': 'gzip', 'Vary': 'Accept-Encoding' },
+    });
+  }
+  return new Response(entry.json, {
+    headers: { ...cacheHeaders, 'Content-Type': 'application/json', 'Vary': 'Accept-Encoding' },
+  });
 }
 
 export async function GET(request: Request) {
@@ -277,36 +414,39 @@ export async function GET(request: Request) {
   // shown match the venues right now, and an opportunity that has evaporated disappears.
   let forceFresh = false;
   try { forceFresh = new URL(request.url).searchParams.get('fresh') === '1'; } catch { /* ignore */ }
+  const acceptsGzip = /\bgzip\b/i.test(request.headers.get('accept-encoding') ?? '');
 
   // If the startup warm is still in flight, wait for it rather than firing a second build.
   if (_warmupPromise) await _warmupPromise;
 
   if (forceFresh) {
+    // Already current (the loop just ticked) — answer from memory instead of paying
+    // a network round-trip the user would feel.
+    if (_cache && Date.now() - _cache.builtAt < REPRICE_MS) return send(_cache, acceptsGzip);
     try {
-      const body = await rebuild();
-      return NextResponse.json(withAge(body, _cache?.builtAt ?? Date.now()), { headers: cacheHeaders });
+      await reprice();
+      if (_cache) return send(_cache, acceptsGzip);
     } catch (err) {
       console.error('[opportunities] forced refresh failed:', err);
       // Serve the last good data rather than an empty screen; the age makes it obvious.
-      if (_cache) return NextResponse.json(withAge(_cache.body, _cache.builtAt), { headers: cacheHeaders });
+      if (_cache) return send(_cache, acceptsGzip);
     }
   }
 
-  const age = _cache ? Date.now() - _cache.builtAt : Infinity;
-
-  // Stale: return current data immediately and refresh in the background
-  if (_cache && age > CACHE_TTL_MS) {
-    rebuild().catch(err => console.error('[opportunities] background rebuild failed:', err));
-    return NextResponse.json(withAge(_cache.body, _cache.builtAt), { headers: cacheHeaders });
+  // Serve from memory. The background loop keeps this within REPRICE_MS, so a request
+  // never blocks on the venues; only nudge a refresh if the loop has fallen behind.
+  if (_cache) {
+    if (Date.now() - _cache.builtAt > CACHE_TTL_MS) {
+      reprice().catch(err => console.error('[opportunities] background reprice failed:', err));
+    }
+    return send(_cache, acceptsGzip);
   }
 
-  // Fresh cache: instant return
-  if (_cache) return NextResponse.json(withAge(_cache.body, _cache.builtAt), { headers: cacheHeaders });
-
-  // No cache at all (warm failed) — build now. Just-built, so age is effectively zero.
+  // No cache at all (warm failed) — build now.
   try {
-    const body = await rebuild();
-    return NextResponse.json(withAge(body, Date.now()), { headers: cacheHeaders });
+    await rebuild();
+    if (_cache) return send(_cache, acceptsGzip);
+    throw new Error('build produced no cache entry');
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error('[/api/opportunities]', message);

@@ -70,6 +70,35 @@ function parseResolutionDay(t?: string): string | null {
   return /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : null;
 }
 
+// Club-name boilerplate that many unrelated teams share, so an overlap on one of these
+// carries no evidence that two markets are the same fixture. Squad numbers (Schalke 04,
+// Mainz 05) are stripped separately. Deliberately excludes 'as' — that is a real Kalshi
+// code for the Athletics.
+const GENERIC_TEAM_TOKENS = new Set([
+  'fc', 'sc', 'afc', 'cf', 'ac', 'sv', 'fk', 'bk', 'cd', 'ud', 'rc', 'cfc', 'sk',
+  'united', 'city', 'club', 'sporting', 'real', 'athletic', 'atletico', 'deportivo',
+  'sociedad', 'town', 'county', 'wanderers', 'rovers', 'albion', 'inter',
+  'sport', 'sports', 'football', 'soccer', 'team', 'women', 'reserves',
+]);
+
+// Keep only tokens that actually identify a club.
+function distinctiveTokens(tokens: Set<string>): Set<string> {
+  const out = new Set<string>();
+  for (const t of tokens) {
+    if (GENERIC_TEAM_TOKENS.has(t)) continue;
+    if (/^\d+$/.test(t)) continue; // "04" in Schalke 04, "05" in Mainz 05
+    out.add(t);
+  }
+  return out;
+}
+
+// Same, but never returns an empty set: if a name is entirely boilerplate there is
+// nothing better to compare on, so keep the original rather than dropping the team.
+function identifyingTokens(tokens: Set<string>): Set<string> {
+  const d = distinctiveTokens(tokens);
+  return d.size > 0 ? d : tokens;
+}
+
 // Split "Team A vs Team B" into two token sets.
 function splitTeams(q: string): [Set<string>, Set<string>] {
   const bracketMatch = q.match(/\[(.*?)\]$/);
@@ -174,6 +203,10 @@ export function matchMarkets(
   const kalshiSplits = isSport
     ? kalshiMarkets.map(k => splitTeams(k.question))
     : null;
+  // Identifying (non-boilerplate) tokens, precomputed so the PM×Kalshi loop stays cheap.
+  const kalshiIdent = isSport
+    ? kalshiSplits!.map(([a, b]) => [identifyingTokens(a), identifyingTokens(b)] as [Set<string>, Set<string>])
+    : null;
   const kalshiKeys = isPolitics
     ? kalshiMarkets.map(k => parsePolitics(k.question))
     : null;
@@ -198,6 +231,8 @@ export function matchMarkets(
     } else if (isSport) {
       // Precompute PM team split once per PM market instead of once per PM×K pair.
       const [pmA, pmB] = splitTeams(pm.question);
+      const pmAi = identifyingTokens(pmA);
+      const pmBi = identifyingTokens(pmB);
 
       for (let ki = 0; ki < kalshiMarkets.length; ki++) {
         const kDay = kalshiDays![ki];
@@ -211,16 +246,26 @@ export function matchMarkets(
           // PM market missing team tokens — fall back to whole-title Jaccard
           matches = jaccardSim(tokenize(pm.question), tokenize(k.question), aliases, expandCache) >= 0.15;
         } else if (kB.size === 0) {
-          // Kalshi single-team market (e.g. "NYY to win")
-          matches = matchedCount(kA, pmA, aliases, expandCache) > 0
-                 || matchedCount(kA, pmB, aliases, expandCache) > 0;
+          // Kalshi named only ONE side (e.g. "San Diego FC wins"), so only half the
+          // fixture can be compared. Require the overlap to be on a DISTINCTIVE token:
+          // club boilerplate ("fc", "united", "city") and squad numbers ("04") are shared
+          // by unrelated clubs, and matching on those paired "San Diego FC wins" with
+          // "FC Schalke 04 vs FC Bayern München".
+          const kD = distinctiveTokens(kA);
+          matches = kD.size > 0 && (
+            matchedCount(kD, distinctiveTokens(pmA), aliases, expandCache) > 0
+            || matchedCount(kD, distinctiveTokens(pmB), aliases, expandCache) > 0
+          );
         } else {
-          // Both sides have two teams — check direct and flipped
-          const direct = matchedCount(pmA, kA, aliases, expandCache) > 0
-                      && matchedCount(pmB, kB, aliases, expandCache) > 0;
+          // Both sides name two teams — require BOTH to correspond, comparing only
+          // identifying tokens. Without that, two unrelated fixtures whose teams each
+          // carry "FC" (common in soccer) satisfy both halves and falsely pair.
+          const [kAi, kBi] = kalshiIdent![ki];
+          const direct = matchedCount(pmAi, kAi, aliases, expandCache) > 0
+                      && matchedCount(pmBi, kBi, aliases, expandCache) > 0;
           matches = direct || (
-            matchedCount(pmA, kB, aliases, expandCache) > 0
-            && matchedCount(pmB, kA, aliases, expandCache) > 0
+            matchedCount(pmAi, kBi, aliases, expandCache) > 0
+            && matchedCount(pmBi, kAi, aliases, expandCache) > 0
           );
         }
         if (matches) rawPairs.push({ polymarket: pm, kalshi: k });

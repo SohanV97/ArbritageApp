@@ -118,6 +118,69 @@ function parseBookPrices(m: GammaMarket): { yes: number; no: number } | null {
   };
 }
 
+// ─── fast price refresh ──────────────────────────────────────────────────────
+// The CLOB serves whole order books in bulk: POST /books with N token ids returns N
+// books in ~150 ms, versus ~1 s to re-walk every event page. Prices are derived
+// exactly as parseBookPrices does (buy YES at the best ask, buy NO at 1 − best bid,
+// rounded up so cost is never understated). Mutates markets in place; a market whose
+// book can't be read keeps its previous price rather than being zeroed.
+const POLYMARKET_CLOB_API = 'https://clob.polymarket.com';
+const PM_BOOK_BATCH = 100;
+
+interface ClobBook {
+  asset_id?: string;
+  bids?: { price?: string }[];
+  asks?: { price?: string }[];
+}
+
+const bestPrice = (side: 'ask' | 'bid', levels: { price?: string }[] | undefined): number | null => {
+  if (!Array.isArray(levels) || levels.length === 0) return null;
+  const prices = levels.map(l => parseFloat(l.price ?? '')).filter(Number.isFinite);
+  if (prices.length === 0) return null;
+  return side === 'ask' ? Math.min(...prices) : Math.max(...prices);
+};
+
+export async function refreshPolymarketPrices(markets: PolymarketMarketWithKind[]): Promise<number> {
+  const byToken = new Map<string, PolymarketMarketWithKind[]>();
+  for (const m of markets) {
+    if (!m.yesTokenId) continue;
+    const list = byToken.get(m.yesTokenId) ?? [];
+    list.push(m);
+    byToken.set(m.yesTokenId, list);
+  }
+  const tokens = [...byToken.keys()];
+  if (tokens.length === 0) return 0;
+
+  const batches: string[][] = [];
+  for (let i = 0; i < tokens.length; i += PM_BOOK_BATCH) batches.push(tokens.slice(i, i + PM_BOOK_BATCH));
+
+  let updated = 0;
+  await Promise.all(batches.map(async (chunk) => {
+    try {
+      const res = await fetch(`${POLYMARKET_CLOB_API}/books`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(chunk.map(token_id => ({ token_id }))),
+      });
+      if (!res.ok) return;
+      const books = (await res.json()) as ClobBook[];
+      for (const b of Array.isArray(books) ? books : []) {
+        const targets = b.asset_id ? byToken.get(b.asset_id) : undefined;
+        if (!targets) continue;
+        const ask = bestPrice('ask', b.asks);
+        const bid = bestPrice('bid', b.bids);
+        if (ask === null || bid === null) continue;
+        if (bid <= 0 || ask <= 0 || bid >= 1 || ask >= 1 || ask < bid) continue;
+        const yes = Math.max(1, Math.min(99, Math.ceil(ask * 100)));
+        const no = Math.max(1, Math.min(99, Math.ceil((1 - bid) * 100)));
+        for (const t of targets) { t.yesPriceCents = yes; t.noPriceCents = no; }
+        updated++;
+      }
+    } catch { /* keep last good prices */ }
+  }));
+  return updated;
+}
+
 export interface PolymarketMarketWithKind extends UnifiedMarket {
   polymarketFeeKind: PolymarketMarketKind;
   yesTokenId?: string;
@@ -196,7 +259,10 @@ function normalizeEvents(
   for (const event of events) {
     const markets = event.markets ?? [];
     const eventTitle = (event.title ?? '').trim(); // PM titles can carry trailing spaces
-    const eventSlug = event.slug ?? event.id ?? '';
+    // Only a real slug addresses a page — event.id is a numeric id and would 404, so it
+    // must never outrank the market slug when choosing the link below.
+    const eventSlug = typeof event.slug === 'string' ? event.slug : '';
+    const eventIdFallback = typeof event.id === 'string' ? event.id : '';
     const endDate = event.end_date_iso;
 
     for (const m of markets) {
@@ -238,14 +304,16 @@ function normalizeEvents(
         }
       } catch { /* ok */ }
 
-      // Build the /event/ deep-link. Polymarket's URL always takes an EVENT slug.
-      // - Sports: each game is its own event whose slug equals the moneyline market
-      //   slug (e.g. mlb-mil-stl-2026-05-05), so the market slug deep-links the game.
-      // - Politics: the candidate/party markets live inside one multi-outcome event
-      //   ("Arkansas Senate Election Winner") and have no standalone page, so only the
-      //   event slug resolves — the market slug (will-the-republicans-win-…) 404s.
+      // Build the /event/ deep-link. Polymarket pages are addressed ONLY by event slug,
+      // so always use it. A market slug is a different namespace and generally 404s:
+      //   soccer   market "mls-atl-clt-2026-08-29-clt" (one market per team)  -> no page
+      //   politics market "will-the-republicans-win-…"                        -> no page
+      //   MLB      market slug happens to EQUAL the event slug, which is the only
+      //            reason using it ever appeared to work.
+      // Verified against Gamma: event slugs resolved 12/12, market slugs 0/12.
+      // Fall back to the market slug only if an event slug is genuinely absent.
       const marketSlug = m.slug ?? m.market_slug ?? '';
-      const urlSlug = isSport ? (marketSlug || eventSlug) : (eventSlug || marketSlug);
+      const urlSlug = eventSlug || marketSlug || eventIdFallback;
       out.push({
         id: `pm-${conditionId || slug}`,
         venue: 'polymarket',
@@ -253,9 +321,9 @@ function normalizeEvents(
         yesPriceCents: yes,
         noPriceCents: no,
         resolutionTime,
-        url: urlSlug
-          ? `https://polymarket.com/event/${urlSlug}`
-          : `https://polymarket.com/event/${eventSlug}`,
+        // Without any slug there is no addressable page — send the user to the market
+        // list rather than a URL that is guaranteed to 404.
+        url: urlSlug ? `https://polymarket.com/event/${urlSlug}` : 'https://polymarket.com/markets',
         polymarketFeeKind: feeKind,
         yesTokenId,
         noTokenId,

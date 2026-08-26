@@ -5,7 +5,10 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "check:links": "node scripts/check-links.mjs",
+    "check:markets": "node scripts/check-markets.mjs",
+    "check": "npm run check:markets && npm run check:links"
   },
   "dependencies": {
     "@polymarket/clob-client": "^5.8.1",

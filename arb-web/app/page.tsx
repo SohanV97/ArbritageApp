@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ArbitrageOpportunity, Category } from '@/lib/market-types';
 import { MIN_ORDER_CONTRACTS } from '@/lib/market-types';
 import type { OpportunitiesResponse, PairInfo } from './api/opportunities/route';
@@ -104,7 +104,10 @@ function EdgeBadge({ ep }: { ep: number }) {
 
 // ─── PairRow ────────────────────────────────────────────────────────────────
 
-function PairRow({ pair }: { pair: PairInfo }) {
+// Memoised: polling replaces the whole list about once a second, and re-rendering
+// every row when only a couple of prices moved is what makes the UI feel heavy.
+// Comparing the fields actually rendered lets untouched rows skip the work entirely.
+const PairRow = memo(function PairRow({ pair }: { pair: PairInfo }) {
   const c = CATEGORY_COLORS[pair.category];
   const diffColor = pair.priceDiff > 25 ? '#f87171' : pair.priceDiff > 10 ? '#fbbf24' : '#4ade80';
   const rowOpacity = pair.filteredOut ? 0.4 : 1;
@@ -183,7 +186,13 @@ function PairRow({ pair }: { pair: PairInfo }) {
       </div>
     </div>
   );
-}
+}, (a, b) => {
+  const x = a.pair, y = b.pair;
+  return x.pmId === y.pmId && x.kalId === y.kalId
+    && x.pmPrice === y.pmPrice && x.kalPrice === y.kalPrice
+    && x.priceDiff === y.priceDiff && x.datesMatch === y.datesMatch
+    && x.filteredOut === y.filteredOut;
+});
 
 // ─── OpportunityCard ────────────────────────────────────────────────────────
 
@@ -192,7 +201,10 @@ interface CardExecState {
   result?: ExecuteResponse;
 }
 
-function OpportunityCard({ opp, amount, bankroll, persistence, onUseKelly, onExecuted, onExecuteStart }: {
+// Memoised for the same reason as PairRow: ~100 of these re-render on every poll
+// otherwise. Every value the card renders from is compared below, so a card only
+// re-renders when something it actually shows has changed.
+const OpportunityCard = memo(function OpportunityCard({ opp, amount, bankroll, persistence, onUseKelly, onExecuted, onExecuteStart }: {
   opp: ArbitrageOpportunity;
   amount: number;
   bankroll: number;
@@ -303,7 +315,7 @@ function OpportunityCard({ opp, amount, bankroll, persistence, onUseKelly, onExe
                 style={{ background: '#0284c711', color: '#7dd3fc', border: '1px solid #0284c733' }}
                 className="text-xs px-2 py-0.5 rounded-full font-mono"
               >
-                Seen {persistence}× · {persistence * 7}s
+                Seen {persistence}× · {Math.round(persistence * POLL_MS / 1000)}s
               </span>
             )}
             {lockupDays != null && lockupDays > 2 && (
@@ -538,7 +550,30 @@ function OpportunityCard({ opp, amount, bankroll, persistence, onUseKelly, onExe
       )}
     </div>
   );
-}
+}, (a, b) => {
+  // Identity + every rendered number. Prices/edge/depth drive the whole card, and
+  // amount/bankroll/persistence drive the sizing and badges.
+  if (a.amount !== b.amount || a.bankroll !== b.bankroll || a.persistence !== b.persistence) return false;
+  if (a.onUseKelly !== b.onUseKelly || a.onExecuted !== b.onExecuted || a.onExecuteStart !== b.onExecuteStart) return false;
+  const x = a.opp, y = b.opp;
+  return x.edgePercent === y.edgePercent
+    && x.totalCostCents === y.totalCostCents
+    && x.maxContracts === y.maxContracts
+    && x.legA.priceCents === y.legA.priceCents && x.legA.feeCents === y.legA.feeCents
+    && x.legA.side === y.legA.side && x.legA.venue === y.legA.venue
+    && x.legB.priceCents === y.legB.priceCents && x.legB.feeCents === y.legB.feeCents
+    && x.legB.side === y.legB.side && x.legB.venue === y.legB.venue
+    && x.pair.polymarket.id === y.pair.polymarket.id
+    && x.pair.kalshi.id === y.pair.kalshi.id
+    && x.pair.polymarket.question === y.pair.polymarket.question
+    && x.pair.kalshi.question === y.pair.kalshi.question
+    && x.pair.polymarket.url === y.pair.polymarket.url
+    && x.pair.kalshi.url === y.pair.kalshi.url
+    && x.pair.polymarket.spreadCents === y.pair.polymarket.spreadCents
+    && x.pair.polymarket.liquidityUsd === y.pair.polymarket.liquidityUsd
+    && x.pair.polymarket.resolutionTime === y.pair.polymarket.resolutionTime
+    && x.pair.kalshi.resolutionTime === y.pair.kalshi.resolutionTime;
+});
 
 // ─── ExecutionPendingScreen ──────────────────────────────────────────────────
 
@@ -695,7 +730,7 @@ function ExecutionPendingScreen({
 
         {isPending && (
           <p className="text-xs text-center mt-4" style={{ color: 'var(--text-muted)' }}>
-            Market scanning continues in background · prices refresh every 7s
+            Market scanning continues in background · prices refresh every ~1.5s
           </p>
         )}
       </div>
@@ -868,6 +903,9 @@ type ExecPhase =
 
 const ALL_CATEGORIES: Category[] = ['mlb', 'soccer', 'politics'];
 const COUNTDOWN_START = 10;
+// Responses come from a warm in-memory cache (~13 ms, ~36 KB gzipped), so polling is
+// bounded by how fast the server re-quotes rather than by request cost.
+const POLL_MS = 800;
 
 export default function Home() {
   const [data, setData] = useState<OpportunitiesResponse | null>(null);
@@ -995,10 +1033,12 @@ export default function Home() {
     }
   }, []);
 
-  // Poll every 7s
+  // The server keeps quotes hot in memory and answers in ~15 ms, so polling can run
+  // near real time — an edge that appears is on screen within about a second instead
+  // of after a multi-second fetch, by which point it has usually already gone.
   useEffect(() => {
     load();
-    const id = setInterval(() => load(), 7_000);
+    const id = setInterval(() => load(), POLL_MS);
     return () => clearInterval(id);
   }, [load]);
 
@@ -1062,12 +1102,14 @@ export default function Home() {
     setExecPhase(null);
   }
 
-  function handleExecuteStart(opp: ArbitrageOpportunity) {
+  // useCallback so the memoised cards see stable props — a fresh function identity on
+  // every poll would make React.memo bail out and re-render all ~100 cards anyway.
+  const handleExecuteStart = useCallback((opp: ArbitrageOpportunity) => {
     // Block auto-exec from firing this pair while a manual execute is in flight.
     executedPairs.current.add(`${opp.pair.polymarket.id}|${opp.pair.kalshi.id}`);
-  }
+  }, []);
 
-  function handleCardExecuted(opp: ArbitrageOpportunity, betAmount: number, result: ExecuteResponse) {
+  const handleCardExecuted = useCallback((opp: ArbitrageOpportunity, betAmount: number, result: ExecuteResponse) => {
     setExecLog(prev => [{
       ts: new Date().toISOString(),
       question: opp.pair.polymarket.question,
@@ -1078,7 +1120,7 @@ export default function Home() {
     // Re-arm only when cleanly hedged; a naked/partial/failed leg stays blocked.
     const key = `${opp.pair.polymarket.id}|${opp.pair.kalshi.id}`;
     if (result.hedged) setTimeout(() => executedPairs.current.delete(key), 5 * 60_000);
-  }
+  }, []);
 
   // Derived values — MUST be computed before any early return below, or the hook
   // count changes between renders (Rules of Hooks) and React crashes the moment
@@ -1106,7 +1148,11 @@ export default function Home() {
   const profitableCount = useMemo(() => opportunities.filter(o => o.edgePercent > 0).length, [opportunities]);
   // Quotes older than ~20s are worth flagging: at prediction-market speed an edge can be
   // gone by then, which is exactly the "site says arb, venue disagrees" complaint.
-  const quotesStale = (data?.stats.ageMs ?? 0) > 20_000;
+  // Quote age is derived from the server's builtAt stamp rather than a per-request
+  // field, so the payload stays byte-identical between refreshes and can be served
+  // pre-compressed. Past ~8s the refresh loop has stalled and prices aren't actionable.
+  const quoteAgeMs = data?.stats.builtAt ? Date.now() - Date.parse(data.stats.builtAt) : 0;
+  const quotesStale = quoteAgeMs > 8_000;
 
   // ── two-screen auto-exec views ─────────────────────────────────────────────
   if (execPhase?.phase === 'pending' || execPhase?.phase === 'executing') {
@@ -1560,7 +1606,7 @@ export default function Home() {
       )}
 
       <div className="mt-12 pt-6 border-t border-[--border] text-xs text-[--text-muted] flex flex-wrap gap-x-6 gap-y-2">
-        <span>Prices refresh every 7s</span>
+        <span>Prices refresh every ~1.5s</span>
         <span>Fees included in edge calculation</span>
         <span>Amount = payout when winning leg resolves</span>
         <span>Kelly = fractional Kelly sizing based on bankroll</span>

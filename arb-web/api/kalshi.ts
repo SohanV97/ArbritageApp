@@ -75,6 +75,78 @@ function readPriceCents(m: KalshiMarket, dollarsKey: string, centsKey: string): 
       ?? extractCents(getPrice(m, centsKey), 'cents');
 }
 
+// Contracts fillable at the quoted price. Fractional sizes below one contract floor to
+// 0, which is not a tradeable depth — report undefined rather than a zero that reads
+// like a real number ("Max fill ~$0.00", $0 Kelly suggestion).
+function parseFp(v: number | string | undefined): number | undefined {
+  const n = typeof v === 'number' ? v : typeof v === 'string' ? parseFloat(v) : NaN;
+  if (!Number.isFinite(n) || n < 1) return undefined;
+  const floored = Math.floor(n);
+  return floored >= 1 ? floored : undefined;
+}
+
+// A quoted two-sided book: asks must sum near 100 (the overround). Shared by the full
+// fetch and the fast reprice path so both accept exactly the same quotes.
+function readAsks(m: KalshiMarket): { yes: number; no: number } | null {
+  const yes = readPriceCents(m, 'yes_ask_dollars', 'yes_ask');
+  const no = readPriceCents(m, 'no_ask_dollars', 'no_ask');
+  if (!yes || !no || yes + no > 105 || yes + no < 95) return null;
+  return { yes, no };
+}
+
+// ─── fast price refresh ──────────────────────────────────────────────────────
+// Re-quoting the markets we already matched is far cheaper than rediscovering them:
+// `?tickers=A,B,C` returns exactly the requested markets (~45 ms per batch), versus
+// ~1 s to re-walk every series. Mutates the passed markets in place and returns how
+// many were re-quoted. A market that fails to refresh keeps its previous price rather
+// than being zeroed or dropped.
+const KALSHI_TICKER_BATCH = 90;
+
+export async function refreshKalshiPrices(markets: UnifiedMarket[]): Promise<number> {
+  const bySymbol = new Map<string, UnifiedMarket[]>();
+  for (const m of markets) {
+    if (!m.symbol) continue;
+    const list = bySymbol.get(m.symbol) ?? [];
+    list.push(m);
+    bySymbol.set(m.symbol, list);
+  }
+  const tickers = [...bySymbol.keys()];
+  if (tickers.length === 0) return 0;
+
+  const headers: Record<string, string> = {};
+  const key = getKalshiApiKey();
+  if (key) headers['KALSHI-ACCESS-KEY'] = key;
+
+  let updated = 0;
+  const batches: string[][] = [];
+  for (let i = 0; i < tickers.length; i += KALSHI_TICKER_BATCH) {
+    batches.push(tickers.slice(i, i + KALSHI_TICKER_BATCH));
+  }
+  await Promise.all(batches.map(async (chunk) => {
+    try {
+      const url = `${KALSHI_API_BASE}/markets?limit=${chunk.length}&tickers=${encodeURIComponent(chunk.join(','))}`;
+      const res = await fetch(url, { headers });
+      if (!res.ok) return;
+      const data = (await res.json()) as KalshiMarketsResponse;
+      for (const raw of data.markets ?? []) {
+        if (typeof raw.ticker !== 'string') continue;
+        const targets = bySymbol.get(raw.ticker);
+        if (!targets) continue;
+        const asks = readAsks(raw);
+        if (!asks) continue; // unquotable right now — keep the last good price
+        for (const t of targets) {
+          t.yesPriceCents = asks.yes;
+          t.noPriceCents = asks.no;
+          t.yesDepth = parseFp(raw.yes_ask_size_fp);
+          t.noDepth = parseFp(raw.yes_bid_size_fp);
+        }
+        updated++;
+      }
+    } catch { /* keep last good prices */ }
+  }));
+  return updated;
+}
+
 async function fetchKalshiMarketsPage(opts: {
   cursor?: string | null;
   seriesTicker?: string;
@@ -192,6 +264,28 @@ function kalshiMarketUrl(m: KalshiMarket): string {
 }
 
 export function normalizeKalshiMarkets(markets: KalshiMarket[], category?: Category): UnifiedMarket[] {
+  const isSportCat = category === 'mlb' || category === 'soccer';
+
+  // Kalshi titles game markets one team at a time ("Vancouver wins", "San Diego FC wins"),
+  // which names only ONE side of the matchup. Matching a half-named game against a
+  // Polymarket "A vs B" market can only compare a single team, and a generic club word
+  // ("FC") is then enough to pair completely unrelated fixtures — that is how
+  // "San Diego FC wins" matched "FC Schalke 04 vs FC Bayern München".
+  // Both teams are recoverable: every market in an event carries its own team in
+  // yes_sub_title, so collect them per event and restate the full matchup below.
+  const teamsByEvent = new Map<string, string[]>();
+  if (isSportCat) {
+    for (const m of markets) {
+      const et = typeof m.event_ticker === 'string' ? m.event_ticker : '';
+      const sub = typeof m.yes_sub_title === 'string' ? m.yes_sub_title.trim() : '';
+      if (!et || !sub) continue;
+      if (/^(tie|draw)$/i.test(sub)) continue; // draw contract is not a team
+      const teams = teamsByEvent.get(et) ?? [];
+      if (!teams.includes(sub)) teams.push(sub);
+      teamsByEvent.set(et, teams);
+    }
+  }
+
   const result: UnifiedMarket[] = [];
   for (const m of markets) {
     // A market with no ticker is unusable (it's the order key and the URL/date source)
@@ -202,11 +296,12 @@ export function normalizeKalshiMarkets(markets: KalshiMarket[], category?: Categ
     // Executable BUY price is the ASK on each side. Never fall back to the bid or
     // synthesize the complement (100 − other side): buying at the bid is not fillable
     // and fabricates phantom arbs. A market missing either ask isn't tradeable → skip.
-    const yesCents = readPriceCents(m, 'yes_ask_dollars', 'yes_ask');
-    const noCents = readPriceCents(m, 'no_ask_dollars', 'no_ask');
-    // A real two-sided book's asks sum to ≥100 (the overround). A sum well below 100
-    // means a stale/crossed quote — reject it rather than surface an impossible price.
-    if (!yesCents || !noCents || yesCents + noCents > 105 || yesCents + noCents < 95) continue;
+    // Executable BUY price is the ASK on each side; a real two-sided book's asks sum
+    // near 100. Shared with the fast reprice path so both accept the same quotes.
+    const asks = readAsks(m);
+    if (!asks) continue;
+    const yesCents = asks.yes;
+    const noCents = asks.no;
 
     // Use event_ticker for date extraction — it encodes the actual game date in the URL
     // (e.g. KXMLBGAME-26JUL061410PHIKC). The market ticker (m.ticker) may carry a
@@ -227,24 +322,24 @@ export function normalizeKalshiMarkets(markets: KalshiMarket[], category?: Categ
       yesTeam = `${code} ${sub}`.trim() || undefined;
     }
 
-    // Contracts fillable at the quoted prices. Kalshi's book is unified: a NO buy
-    // fills against the YES bid, so NO-side depth is the YES bid size.
-    // Fractional sizes below one contract floor to 0, which is not a tradeable depth —
-    // it surfaced as "Max fill ~$0.00" and a $0 Kelly suggestion. Report undefined
-    // (unknown/none) rather than a zero that reads like a real number.
-    const parseFp = (v: number | string | undefined): number | undefined => {
-      const n = typeof v === 'number' ? v : typeof v === 'string' ? parseFloat(v) : NaN;
-      if (!Number.isFinite(n) || n < 1) return undefined;
-      const floored = Math.floor(n);
-      return floored >= 1 ? floored : undefined;
-    };
+    // Restate a one-sided game title as the full matchup so matching compares BOTH
+    // teams (the same "A vs B Winner?" shape MLB already uses). Falls back to the raw
+    // title when an event didn't yield exactly two teams.
+    let question: string;
+    if (category === 'politics') {
+      question = buildKalshiPoliticsQuestion(m);
+    } else {
+      const rawTitle = m.title ?? m.subtitle ?? m.ticker ?? '';
+      const teams = isSportCat ? teamsByEvent.get(eventTicker) : undefined;
+      question = (teams && teams.length === 2)
+        ? `${teams[0]} vs ${teams[1]} Winner?`
+        : rawTitle;
+    }
 
     result.push({
       id: `kalshi-${m.ticker}`,
       venue: 'kalshi',
-      question: category === 'politics'
-        ? buildKalshiPoliticsQuestion(m)
-        : (m.title ?? m.subtitle ?? m.ticker ?? ''),
+      question,
       symbol: m.ticker,
       yesPriceCents: yesCents,
       noPriceCents: noCents,
