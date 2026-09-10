@@ -6,7 +6,7 @@ import { MIN_ORDER_CONTRACTS } from '@/lib/market-types';
 import type { OpportunitiesResponse, PairInfo } from './api/opportunities/route';
 import type { ExecuteResponse, ConnectionTestResponse } from './api/execute/route';
 import { CATEGORY_LABELS, CATEGORY_COLORS } from '@/lib/categories';
-import { kellyBet } from '@/lib/kelly';
+import { sizeByRisk } from '@/lib/sizing';
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -204,13 +204,14 @@ interface CardExecState {
 // Memoised for the same reason as PairRow: ~100 of these re-render on every poll
 // otherwise. Every value the card renders from is compared below, so a card only
 // re-renders when something it actually shows has changed.
-const OpportunityCard = memo(function OpportunityCard({ opp, amount, bankroll, firstSeenAt, onUseKelly, onExecuted, onExecuteStart }: {
+const OpportunityCard = memo(function OpportunityCard({ opp, amount, riskDollars, firstSeenAt, onUseSuggestedSize, onExecuted, onExecuteStart }: {
   opp: ArbitrageOpportunity;
   amount: number;
-  bankroll: number;
+  /** Dollars to deploy across both legs combined, from the Risk box. */
+  riskDollars: number;
   /** Timestamp this opportunity was first seen, for the "how long has this lasted" badge. */
   firstSeenAt: number;
-  onUseKelly: (n: number) => void;
+  onUseSuggestedSize: (n: number) => void;
   onExecuted: (opp: ArbitrageOpportunity, amount: number, result: ExecuteResponse) => void;
   onExecuteStart: (opp: ArbitrageOpportunity) => void;
 }) {
@@ -228,13 +229,15 @@ const OpportunityCard = memo(function OpportunityCard({ opp, amount, bankroll, f
   const totalCostDollars = (totalCostCents / 100) * amount;
   const payoutDollars = amount;
   const profitDollars = payoutDollars - totalCostDollars;
-  // Cap the Kelly suggestion at what the Kalshi book can actually fill —
-  // a $690 suggestion against a 19-contract book is fiction.
-  const kellyRaw = kellyBet(bankroll, edgePercent);
-  // Never suggest a size that can't actually be placed: cap by book depth, but never
-  // below the venue minimum (a $0 or $2 suggestion is not a tradeable order).
-  const kellyCapped = opp.maxContracts != null ? Math.min(kellyRaw, opp.maxContracts) : kellyRaw;
-  const kellySuggestion = Math.max(MIN_ORDER_CONTRACTS, kellyCapped);
+  // Turn the dollar budget into a contract count for THIS pair of prices, capped by what
+  // the thinner book can actually fill — a $300 budget against a 19-contract book is fiction.
+  const sized = sizeByRisk({
+    riskDollars,
+    legAPriceCents: legA.priceCents,
+    legBPriceCents: legB.priceCents,
+    maxContracts: opp.maxContracts,
+    minContracts: MIN_ORDER_CONTRACTS,
+  });
   const exceedsDepth = opp.maxContracts != null && amount > opp.maxContracts;
   // Polymarket rejects orders under 5 shares; Kalshi accepts 1. Placing a smaller pair
   // would fill only the Kalshi leg, so the trade must be blocked entirely.
@@ -341,13 +344,21 @@ const OpportunityCard = memo(function OpportunityCard({ opp, amount, bankroll, f
         </div>
         <div className="flex flex-col items-end gap-1 flex-shrink-0">
           <EdgeBadge ep={edgePercent} />
-          <button
-            onClick={() => onUseKelly(kellySuggestion)}
-            className="text-xs font-mono hover:underline"
-            style={{ color: '#fbbf24' }}
-          >
-            Kelly: {fmtUsd(kellySuggestion)}
-          </button>
+          {sized.contracts > 0 ? (
+            <button
+              onClick={() => onUseSuggestedSize(sized.contracts)}
+              className="text-xs font-mono hover:underline text-right"
+              style={{ color: '#fbbf24' }}
+              title={`${sized.contracts} contracts · ${sized.limitedBy === 'depth' ? 'capped by book depth' : 'sized to your risk budget'}`}
+            >
+              Risk {fmtUsd(sized.costDollars)} → {sized.contracts}
+              {sized.limitedBy === 'depth' && <span style={{ color: 'var(--text-muted)' }}> (depth)</span>}
+            </button>
+          ) : (
+            <span className="text-xs font-mono" style={{ color: 'var(--text-muted)' }}>
+              under {MIN_ORDER_CONTRACTS}-share min
+            </span>
+          )}
         </div>
       </div>
 
@@ -560,9 +571,9 @@ const OpportunityCard = memo(function OpportunityCard({ opp, amount, bankroll, f
   );
 }, (a, b) => {
   // Identity + every rendered number. Prices/edge/depth drive the whole card, and
-  // amount/bankroll/firstSeenAt drive the sizing and badges.
-  if (a.amount !== b.amount || a.bankroll !== b.bankroll || a.firstSeenAt !== b.firstSeenAt) return false;
-  if (a.onUseKelly !== b.onUseKelly || a.onExecuted !== b.onExecuted || a.onExecuteStart !== b.onExecuteStart) return false;
+  // amount/riskDollars/firstSeenAt drive the sizing and badges.
+  if (a.amount !== b.amount || a.riskDollars !== b.riskDollars || a.firstSeenAt !== b.firstSeenAt) return false;
+  if (a.onUseSuggestedSize !== b.onUseSuggestedSize || a.onExecuted !== b.onExecuted || a.onExecuteStart !== b.onExecuteStart) return false;
   const x = a.opp, y = b.opp;
   return x.edgePercent === y.edgePercent
     && x.totalCostCents === y.totalCostCents
@@ -914,7 +925,9 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
   // locking capital the whole time. 'all' opts in explicitly.
   const [autoExecScope, setAutoExecScope] = useState<'sports' | 'all'>('sports');
   const [execThreshold, setExecThreshold] = useState(1.5);
-  const [bankroll, setBankroll] = useState(10000);
+  // Dollars to put at risk per trade, across both legs combined. Contracts are derived
+  // from this per-market, because a contract's cost depends on the pair of prices.
+  const [riskDollars, setRiskDollars] = useState(100);
   const [execLog, setExecLog] = useState<ExecLogEntry[]>([]);
   const [execPhase, setExecPhase] = useState<ExecPhase | null>(null);
   const [connTest, setConnTest] = useState<{ state: 'idle' | 'pending' | 'done'; result?: ConnectionTestResponse }>({ state: 'idle' });
@@ -1087,13 +1100,18 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
       if (autoExecScope === 'sports' && opp.pair.polymarket.category === 'politics') continue;
       const key = `${opp.pair.polymarket.id}|${opp.pair.kalshi.id}`;
       if (executedPairs.current.has(key)) continue;
-      // Never auto-size beyond the Kalshi book depth — an oversized IOC leg partially
-      // fills and cancels, leaving the fully-filled Polymarket leg naked.
-      const kelly = kellyBet(bankroll, opp.edgePercent);
-      const betAmount = opp.maxContracts != null ? Math.min(kelly, opp.maxContracts) : kelly;
-      // Skip anything that can't be placed on BOTH venues: under Polymarket's 5-share
-      // minimum the PM leg is rejected while Kalshi fills, leaving a naked position.
-      if (betAmount < MIN_ORDER_CONTRACTS) continue;
+      // Size from the dollar budget, never beyond what the thinner book can fill — an
+      // oversized leg partially fills and cancels, leaving the other one naked. sizeByRisk
+      // returns 0 when the budget cannot reach the venue minimum, which is a skip, not a
+      // small trade: below it the Polymarket leg is rejected while Kalshi fills.
+      const betAmount = sizeByRisk({
+        riskDollars,
+        legAPriceCents: opp.legA.priceCents,
+        legBPriceCents: opp.legB.priceCents,
+        maxContracts: opp.maxContracts,
+        minContracts: MIN_ORDER_CONTRACTS,
+      }).contracts;
+      if (betAmount <= 0) continue;
       executedPairs.current.add(key);
       // Fire immediately. This used to open a 10-second confirmation countdown, which
       // defeated the point: an arb edge is usually gone within a second or two, so by the
@@ -1105,7 +1123,7 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
       executeOpportunity(opp, betAmount, key);
       break; // one at a time
     }
-  }, [data, autoExec, autoExecScope, execThreshold, bankroll, execPhase, executeOpportunity]);
+  }, [data, autoExec, autoExecScope, execThreshold, riskDollars, execPhase, executeOpportunity]);
 
   function handleDismiss() {
     setExecPhase(null);
@@ -1293,18 +1311,23 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
 
         <div style={{ width: 1, height: 36, background: 'var(--border)' }} />
 
-        {/* Bankroll */}
+        {/* Risk budget — the number a trader actually thinks in. Contracts are derived. */}
         <div className="flex flex-col gap-1">
-          <label htmlFor="arb-bankroll" className="text-xs text-[--text-muted]">Bankroll ($)</label>
+          <label htmlFor="arb-risk" className="text-xs text-[--text-muted]">Risk / trade ($)</label>
           <input
-            id="arb-bankroll"
+            id="arb-risk"
             type="number"
             min={1}
-            value={bankroll}
-            onChange={e => setBankroll(Math.max(1, parseInt(e.target.value) || 1))}
+            step={10}
+            value={riskDollars}
+            onChange={e => {
+              const v = parseFloat(e.target.value);
+              setRiskDollars(Number.isFinite(v) && v > 0 ? v : 1);
+            }}
             style={{ background: 'var(--card)', border: '1px solid var(--border)', color: 'var(--foreground)' }}
             className="w-28 px-2 py-1.5 rounded-lg text-sm font-mono text-right"
           />
+          <span className="text-[10px]" style={{ color: 'var(--text-muted)' }}>total, both legs</span>
         </div>
 
         {/* Auto-exec toggle */}
@@ -1393,7 +1416,7 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
           >
             <div className="w-2 h-2 rounded-full bg-[#4ade80] animate-pulse" />
             <span className="text-xs text-[#4ade80] font-medium">
-              Auto-trading {autoExecScope === 'sports' ? 'sports only' : 'all categories'} · Kelly sizing · {execLog.length} executed
+              Auto-trading {autoExecScope === 'sports' ? 'sports only' : 'all categories'} · {fmtUsd(riskDollars)}/trade · {execLog.length} executed
             </span>
           </div>
         )}
@@ -1584,9 +1607,9 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
                   key={`${opp.pair.polymarket.id}|${opp.pair.kalshi.id}`}
                   opp={opp}
                   amount={amount}
-                  bankroll={bankroll}
+                  riskDollars={riskDollars}
                   firstSeenAt={persistMap.get(k) ?? Date.now()}
-                  onUseKelly={setAmount}
+                  onUseSuggestedSize={setAmount}
                   onExecuted={handleCardExecuted}
                   onExecuteStart={handleExecuteStart}
                 />
@@ -1685,7 +1708,7 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
         <span>Prices refresh every ~1.5s</span>
         <span>Fees included in edge calculation</span>
         <span>Amount = payout when winning leg resolves</span>
-        <span>Kelly = fractional Kelly sizing based on bankroll</span>
+        <span>Risk = dollars deployed across both legs; contracts are derived per market</span>
         <span>Always verify prices before enabling auto-execute</span>
       </div>
     </div>

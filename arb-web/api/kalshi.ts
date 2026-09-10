@@ -119,7 +119,7 @@ function readPriceCents(m: KalshiMarket, dollarsKey: string, centsKey: string): 
 
 // Contracts fillable at the quoted price. Fractional sizes below one contract floor to
 // 0, which is not a tradeable depth — report undefined rather than a zero that reads
-// like a real number ("Max fill ~$0.00", $0 Kelly suggestion).
+// like a real number ("Max fill ~$0.00", a $0 suggested size).
 function parseFp(v: number | string | undefined): number | undefined {
   const n = typeof v === 'number' ? v : typeof v === 'string' ? parseFloat(v) : NaN;
   if (!Number.isFinite(n) || n < 1) return undefined;

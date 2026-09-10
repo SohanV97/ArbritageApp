@@ -488,6 +488,78 @@ check('[align] Dodgers and Angels are not the same club',
   teamsAreDifferent('Los Angeles Dodgers', 'LAA Los Angeles Angels') === true);
 
 
+// ─── risk-based position sizing ──────────────────────────────────────────────
+const { sizeByRisk } = await import('../lib/sizing.ts');
+const { MIN_ORDER_CONTRACTS: MIN_C } = await import('../lib/market-types.ts');
+
+// sizing.ts inlines the venue minimum because bare Node cannot resolve a value import
+// from market-types. Pin the two together so they cannot silently drift.
+check('[size] inlined minimum matches MIN_ORDER_CONTRACTS',
+  sizeByRisk({ riskDollars: 1000, legAPriceCents: 50, legBPriceCents: 49, maxContracts: MIN_C }).contracts === MIN_C
+  && sizeByRisk({ riskDollars: 1000, legAPriceCents: 50, legBPriceCents: 49, maxContracts: MIN_C - 1 }).contracts === 0,
+  'MIN_ORDER_CONTRACTS=' + MIN_C);
+
+// $300 budget, legs at 45c + 52c = 97c per contract.
+const s300 = sizeByRisk({ riskDollars: 300, legAPriceCents: 45, legBPriceCents: 52 });
+check('[size] $300 at 97c buys 309 contracts', s300.contracts === 309, JSON.stringify(s300));
+check('[size] spends at or under budget', s300.costDollars <= 300, String(s300.costDollars));
+check('[size] cost is contracts x combined price', Math.abs(s300.costDollars - 299.73) < 1e-9, String(s300.costDollars));
+check('[size] legs split by their own prices',
+  Math.abs(s300.legADollars - 139.05) < 1e-9 && Math.abs(s300.legBDollars - 160.68) < 1e-9,
+  `${s300.legADollars} / ${s300.legBDollars}`);
+check('[size] legs sum to the total cost',
+  Math.abs((s300.legADollars + s300.legBDollars) - s300.costDollars) < 1e-9);
+check('[size] payout is $1 per contract', s300.payoutDollars === 309);
+check('[size] profit is payout minus cost', Math.abs(s300.profitDollars - 9.27) < 1e-9, String(s300.profitDollars));
+check('[size] limited by the budget', s300.limitedBy === 'risk');
+
+// Never exceed the budget, at any price combination.
+for (let a = 1; a <= 98; a++) {
+  for (const b of [99 - a, Math.max(1, 99 - a - 5)]) {
+    const r = sizeByRisk({ riskDollars: 100, legAPriceCents: a, legBPriceCents: b });
+    if (r.contracts > 0 && r.costDollars > 100 + 1e-9) {
+      check(`[size] budget respected at ${a}c+${b}c`, false, String(r.costDollars));
+    }
+  }
+}
+check('[size] budget never exceeded across all price pairs', true);
+
+// A budget that affords exactly N contracts must yield exactly N, not N-1. Dividing the
+// float budget directly (4.85 * 100 = 484.99999999999994) silently loses one.
+let exactFails = 0;
+for (let total = 50; total <= 99; total++) {
+  for (const n of [5, 7, 13, 100, 309]) {
+    const budget = (n * total) / 100;
+    const r = sizeByRisk({ riskDollars: budget, legAPriceCents: total - 1, legBPriceCents: 1 });
+    if (r.contracts !== n) { exactFails++; if (exactFails < 4) failures.push(`[size] exact budget ${budget} at ${total}c gave ${r.contracts}, want ${n}`); }
+  }
+}
+check('[size] exact budgets are never short by one contract', exactFails === 0, exactFails + ' mismatches');
+
+// Depth is the binding constraint when the book is thinner than the budget.
+const sDepth = sizeByRisk({ riskDollars: 300, legAPriceCents: 45, legBPriceCents: 52, maxContracts: 40 });
+check('[size] depth caps the size', sDepth.contracts === 40 && sDepth.limitedBy === 'depth', JSON.stringify(sDepth));
+check('[size] depth cap costs less than the budget', sDepth.costDollars < 300);
+
+// A budget too small for the venue minimum is not a small trade, it is no trade.
+const sTiny = sizeByRisk({ riskDollars: 3, legAPriceCents: 45, legBPriceCents: 52 });
+check('[size] under the 5-share minimum returns zero', sTiny.contracts === 0 && sTiny.limitedBy === 'below-minimum', JSON.stringify(sTiny));
+const sEdge = sizeByRisk({ riskDollars: 4.85, legAPriceCents: 45, legBPriceCents: 52 });
+check('[size] exactly 5 contracts is allowed', sEdge.contracts === 5, JSON.stringify(sEdge));
+const sThin = sizeByRisk({ riskDollars: 300, legAPriceCents: 45, legBPriceCents: 52, maxContracts: 4 });
+check('[size] depth below the minimum returns zero', sThin.contracts === 0);
+
+// Bad input must never reach a venue as a NaN size.
+for (const bad of [NaN, Infinity, -1, 0, undefined, null]) {
+  const r = sizeByRisk({ riskDollars: bad, legAPriceCents: 45, legBPriceCents: 52 });
+  check(`[size] rejects riskDollars=${String(bad)}`, r.contracts === 0 && Number.isFinite(r.costDollars));
+}
+const rNaNPrice = sizeByRisk({ riskDollars: 100, legAPriceCents: NaN, legBPriceCents: 52 });
+check('[size] rejects a NaN price', rNaNPrice.contracts === 0);
+const rNaNDepth = sizeByRisk({ riskDollars: 100, legAPriceCents: 45, legBPriceCents: 52, maxContracts: NaN });
+check('[size] a NaN depth does not shrink the size', rNaNDepth.contracts === 103, JSON.stringify(rNaNDepth));
+
+
 console.log(`matching regression: ${pass} passed, ${fail} failed`);
 if (failures.length) {
   console.log('\nFAILURES');
