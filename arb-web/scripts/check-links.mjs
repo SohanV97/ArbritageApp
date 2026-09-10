@@ -24,17 +24,31 @@ const GAMMA = 'https://gamma-api.polymarket.com';
 const KALSHI = 'https://api.elections.kalshi.com/trade-api/v2';
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function pmEventExists(slug) {
+// Resolving is not the same as being usable. An event can exist in Gamma and still be
+// closed, archived, deactivated, or hold no market that still accepts orders — you click
+// through to a real page and cannot find anything to trade, which reads as a broken link
+// even though the slug was valid. Report WHY rather than a bare true/false.
+async function pmEventState(slug) {
   for (let i = 0; i < 3; i++) {
     try {
       const r = await fetch(`${GAMMA}/events?slug=${encodeURIComponent(slug)}`);
       if (r.status === 429) { await wait(600 * (i + 1)); continue; }
-      if (!r.ok) return false;
+      if (!r.ok) return 'slug does not resolve as an event';
       const j = await r.json();
-      return Array.isArray(j) && j.length > 0;
+      if (!Array.isArray(j) || j.length === 0) return 'slug does not resolve as an event';
+      const e = j[0];
+      if (e.closed) return 'event is CLOSED — nothing to trade on the page';
+      if (e.archived) return 'event is ARCHIVED — nothing to trade on the page';
+      if (e.active === false) return 'event is INACTIVE — nothing to trade on the page';
+      const markets = e.markets || [];
+      if (markets.length > 0 &&
+          !markets.some(m => !m.closed && m.active !== false && m.acceptingOrders !== false)) {
+        return 'event has no market still accepting orders';
+      }
+      return null; // usable
     } catch { await wait(300); }
   }
-  return false;
+  return 'lookup failed after retries';
 }
 
 // Retry 429s: a throttled response must not be mistaken for a broken link.
@@ -53,7 +67,7 @@ async function kalshiEvent(ticker) {
 async function main() {
   let data;
   try {
-    const res = await fetch(`${BASE}/api/opportunities?fresh=1`, { cache: 'no-store' });
+    const res = await fetch(`${BASE}/api/opportunities?fresh=1&pairs=1`, { cache: 'no-store' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     data = await res.json();
   } catch (err) {
@@ -80,9 +94,13 @@ async function main() {
 
   for (const [url, meta] of pm) {
     const slug = url.split('/event/')[1] || '';
-    let ok = url.startsWith('https://polymarket.com/') && !!slug;
-    if (ok) ok = await pmEventExists(slug);
-    if (ok) okCount++; else broken.push({ venue: 'polymarket', url, cat: meta.cat, q: meta.q, why: slug ? 'slug does not resolve as an event' : 'no slug in url' });
+    if (!url.startsWith('https://polymarket.com/') || !slug) {
+      broken.push({ venue: 'polymarket', url, cat: meta.cat, q: meta.q, why: 'no slug in url' });
+      continue;
+    }
+    const why = await pmEventState(slug);
+    if (why) broken.push({ venue: 'polymarket', url, cat: meta.cat, q: meta.q, why });
+    else okCount++;
   }
 
   for (const [url, meta] of kal) {

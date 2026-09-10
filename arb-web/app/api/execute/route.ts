@@ -5,6 +5,10 @@ import { placeKalshiOrder, testKalshiAuth } from '@/api/kalshi-trading';
 import { placePolymarketOrder, testPolymarketAuth } from '@/api/polymarket-trading';
 import type { KalshiAuthTest } from '@/api/kalshi-trading';
 import type { PolymarketAuthTest } from '@/api/polymarket-trading';
+import { getKalshiQuote, getKalshiOrderbook } from '@/api/kalshi';
+import { getPolymarketQuote, getPolymarketBooks } from '@/api/polymarket';
+import { fillableContracts, kalshiAskLadder, polymarketAskLadder } from '@/lib/depth';
+import { estimatePolymarketFeeCents, estimateKalshiFeeCents } from '@/lib/fees';
 
 export interface LegResult {
   ok: boolean;
@@ -22,6 +26,13 @@ export interface ExecuteResponse {
   bothOk: boolean;      // both legs accepted by their venue (no API error)
   hedged: boolean;      // both legs actually FILLED with matching size — position is safe
   hedgeNote?: string;   // explanation whenever the position is not a clean hedge (naked-leg warning)
+  /** true when the pre-order price re-check refused to trade (nothing was sent). */
+  abortedOnPriceMove?: boolean;
+  /** ms spent re-quoting both venues immediately before ordering. */
+  revalidateMs?: number;
+  /** edge the client was showing vs. the edge at the moment of execution. */
+  quotedEdgePercent?: number;
+  freshEdgePercent?: number;
 }
 
 interface ExecuteRequest {
@@ -171,18 +182,105 @@ export async function POST(request: Request): Promise<Response> {
     return executeError(`Order size ${contracts} is below Polymarket's ${MIN_ORDER_CONTRACTS}-share minimum. A smaller order would fill only the Kalshi leg and leave it unhedged.`);
   }
 
-  // Place both legs simultaneously — this minimizes price-movement risk between legs
+  // ── pre-order price re-check ────────────────────────────────────────────────
+  // The card the user clicked was priced up to a second ago; an edge can be gone by
+  // then. Re-quote BOTH venues in parallel (two targeted requests, ~100 ms total) and
+  // refuse to trade if the edge no longer exists. Nothing has been sent at this point,
+  // so backing out here costs nothing.
+  const quotedEdgePercent = Number.isFinite(opportunity.edgePercent) ? opportunity.edgePercent : undefined;
+  const revalStart = Date.now();
+  const [kQuote, pmQuote, kOrderbook, pmBooks] = await Promise.all([
+    getKalshiQuote(kalshiTicker),
+    getPolymarketQuote(pmRich.yesTokenId ?? ''),
+    // Depth is checked in the SAME parallel round trip as the prices, so verifying it
+    // costs no extra wall-clock time before the order goes out.
+    getKalshiOrderbook(kalshiTicker),
+    getPolymarketBooks([pmRich.yesTokenId ?? '']),
+  ]);
+  const revalidateMs = Date.now() - revalStart;
+
+  if (!kQuote || !pmQuote) {
+    return executeError(
+      `Could not re-quote ${!kQuote ? 'Kalshi' : 'Polymarket'} before ordering (${revalidateMs}ms) — refusing to trade on unverified prices.`,
+      409);
+  }
+
+  // Prices live right now, for the exact sides this order would buy.
+  const freshPmPrice = pmLeg.side === 'yes' ? pmQuote.yes : pmQuote.no;
+  const freshKalPrice = actualKalshiSide === 'yes' ? kQuote.yes : kQuote.no;
+  // Derive the fee model server-side rather than trusting the posted market.
+  const feeKind = pair.polymarket.category === 'politics' ? 'fee_free' : 'sports';
+  const freshCost = freshPmPrice + estimatePolymarketFeeCents(feeKind, freshPmPrice, 1)
+                  + freshKalPrice + estimateKalshiFeeCents(freshKalPrice, 1);
+  const freshEdgePercent = 100 - freshCost;
+
+  if (freshEdgePercent <= 0) {
+    const body: ExecuteResponse = {
+      kalshi: { ok: false, error: 'Not placed — price moved' },
+      polymarket: { ok: false, error: 'Not placed — price moved' },
+      executedAt: new Date().toISOString(),
+      bothOk: false,
+      hedged: false,
+      abortedOnPriceMove: true,
+      revalidateMs,
+      quotedEdgePercent,
+      freshEdgePercent,
+      hedgeNote: `Backed out in ${revalidateMs}ms: the edge is now ${freshEdgePercent.toFixed(2)}%` +
+        (quotedEdgePercent !== undefined ? ` (was ${quotedEdgePercent.toFixed(2)}%)` : '') +
+        `. No orders were sent.`,
+    };
+    console.log('[execute] aborted on price move', JSON.stringify({ ticker: kalshiTicker, revalidateMs, quotedEdgePercent, freshEdgePercent }));
+    return NextResponse.json(body, { status: 409 });
+  }
+
+  // ── pre-order depth re-check ───────────────────────────────────────────────
+  // A price that still looks good can have almost nothing behind it. Both venues publish
+  // the whole ladder, so confirm the requested size can actually be bought on BOTH sides
+  // while the pair stays profitable. Without this the Kalshi leg fills and the Polymarket
+  // leg does not, which is the naked position this app exists to avoid — one live pair
+  // advertised 10,000 contracts of depth when Polymarket had 190.
+  const kalLadder = kalshiAskLadder(kOrderbook, actualKalshiSide);
+  const pmLadder = polymarketAskLadder(pmBooks.get(pmRich.yesTokenId ?? ''), pmLeg.side);
+  const feePerContract = (pmPrice: number, kalPrice: number) =>
+    estimatePolymarketFeeCents(feeKind, pmPrice, 1) + estimateKalshiFeeCents(kalPrice, 1);
+  const fill = fillableContracts(pmLadder, kalLadder, feePerContract, contracts);
+
+  if (fill.contracts < MIN_ORDER_CONTRACTS) {
+    const body: ExecuteResponse = {
+      kalshi: { ok: false, error: 'Not placed — not enough depth' },
+      polymarket: { ok: false, error: 'Not placed — not enough depth' },
+      executedAt: new Date().toISOString(),
+      bothOk: false,
+      hedged: false,
+      abortedOnPriceMove: true,
+      revalidateMs,
+      quotedEdgePercent,
+      freshEdgePercent,
+      hedgeNote: `Backed out in ${revalidateMs}ms: only ${fill.contracts} contract(s) can be filled ` +
+        `profitably across both books, below the ${MIN_ORDER_CONTRACTS}-share minimum. No orders were sent.`,
+    };
+    console.log('[execute] aborted on depth', JSON.stringify({ ticker: kalshiTicker, requested: contracts, fillable: fill.contracts }));
+    return NextResponse.json(body, { status: 409 });
+  }
+
+  // Never buy more than both books can absorb. Trimming keeps the two legs equal, which
+  // is what makes the position hedged; sending the full size would fill them unevenly.
+  const plannedContracts = Math.min(contracts, fill.contracts);
+
+  // Place both legs simultaneously — this minimizes price-movement risk between legs.
+  // Limits are the FRESH prices, so a market that moved is quoted at what it is now
+  // rather than at a stale price that would simply fail to fill.
   const [kalshiRaw, pmRaw] = await Promise.all([
     placeKalshiOrder({
       ticker: kalshiTicker,
       side: actualKalshiSide,
-      count: contracts,
-      priceCents: kalLeg.priceCents,
+      count: plannedContracts,
+      priceCents: freshKalPrice,
     }),
     placePolymarketOrder({
       tokenId: pmTokenId,
-      count: contracts,
-      priceCents: pmLeg.priceCents,
+      count: plannedContracts,
+      priceCents: freshPmPrice,
     }),
   ]);
 
@@ -200,11 +298,16 @@ export async function POST(request: Request): Promise<Response> {
     bothOk,
     hedged,
     hedgeNote: note,
+    abortedOnPriceMove: false,
+    revalidateMs,
+    quotedEdgePercent,
+    freshEdgePercent,
   };
 
   // Audit log (server-side only). Order IDs + fill counts, no error bodies with secrets.
   console.log('[execute]', JSON.stringify({
     ticker: kalshiTicker, contracts, bothOk, hedged, hedgeNote: note,
+    revalidateMs, quotedEdgePercent, freshEdgePercent,
     kalshi: { ok: kalshiResult.ok, filled: kalshiResult.filledCount, orderId: kalshiResult.orderId },
     polymarket: { ok: pmResult.ok, filled: pmResult.filledCount, orderId: pmResult.orderId },
   }));

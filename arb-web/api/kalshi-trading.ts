@@ -111,26 +111,41 @@ export async function testKalshiAuth(): Promise<KalshiAuthTest> {
 }
 
 export async function placeKalshiOrder(req: KalshiOrderRequest): Promise<KalshiOrderResult> {
-  const path = '/trade-api/v2/portfolio/orders';
+  // Kalshi deprecated POST /portfolio/orders between 18–25 June 2026; it now answers 410
+  // "Please switch to the V2 endpoints" and places nothing. The replacement is
+  // /portfolio/events/orders, which is not just a new path — it changes the whole shape:
+  //
+  //   * side is the YES book only — `bid` = buy YES, `ask` = sell YES. There is no "no"
+  //     side any more. Buying NO at n is quoted as selling YES at (1 - n).
+  //   * price is a fixed-point DOLLAR string ("0.4800"), not integer cents.
+  //   * count is a fixed-point string ("5"), not a number.
+  //   * self_trade_prevention_type is required.
+  //
+  // Getting the side mapping wrong would buy the opposite contract and leave the arb
+  // unhedged, so the NO -> ask/(1-price) conversion is applied on the way out and undone
+  // on the way back when reporting the fill price.
+  const path = '/trade-api/v2/portfolio/events/orders';
   const signed = signKalshiRequest('POST', path);
   if ('error' in signed) return { ok: false, error: signed.error };
+
+  const buyingYes = req.side === 'yes';
+  // YES: bid at our price. NO at n cents: ask (sell YES) at (100 - n) cents.
+  const yesSidePriceCents = buyingYes ? req.priceCents : 100 - req.priceCents;
 
   const body: Record<string, unknown> = {
     ticker: req.ticker,
     client_order_id: crypto.randomUUID(),
-    type: 'limit',
-    action: 'buy',
-    side: req.side,
-    count: req.count,
+    side: buyingYes ? 'bid' : 'ask',
+    count: String(req.count),
+    price: (yesSidePriceCents / 100).toFixed(4),
     // Arb legs must never rest one-sided on the book: fill what's available at our
     // limit right now, cancel the remainder.
     time_in_force: 'immediate_or_cancel',
+    self_trade_prevention_type: 'taker_at_cross',
   };
-  // Kalshi expects yes_price for YES orders, no_price for NO orders (integer cents)
-  body[req.side === 'yes' ? 'yes_price' : 'no_price'] = req.priceCents;
 
   try {
-    const res = await fetch(`${KALSHI_API_BASE}/portfolio/orders`, {
+    const res = await fetch(`${KALSHI_API_BASE}/portfolio/events/orders`, {
       method: 'POST',
       headers: signed.headers,
       body: JSON.stringify(body),
@@ -139,24 +154,34 @@ export async function placeKalshiOrder(req: KalshiOrderRequest): Promise<KalshiO
     const text = await res.text();
     if (!res.ok) return { ok: false, error: kalshiErrorText(res.status, text) };
 
+    // V2 returns the fill inline (201) rather than nesting it under `order`.
     const data = JSON.parse(text) as {
-      order?: {
-        order_id?: string;
-        status?: string;
-        filled_count?: number;
-        avg_yes_price?: number;
-        avg_no_price?: number;
-      };
+      order_id?: string;
+      fill_count?: string;
+      remaining_count?: string;
+      average_fill_price?: string;
     };
-    const order = data.order ?? {};
-    const avgPrice = req.side === 'yes' ? order.avg_yes_price : order.avg_no_price;
+
+    const filled = data.fill_count != null ? Number(data.fill_count) : undefined;
+    const remaining = data.remaining_count != null ? Number(data.remaining_count) : undefined;
+    // average_fill_price is always a YES-side price; convert back to the side we bought.
+    const avgYes = data.average_fill_price != null ? Number(data.average_fill_price) : undefined;
+    const avgPriceCents = avgYes != null && Number.isFinite(avgYes)
+      ? Math.round((buyingYes ? avgYes : 1 - avgYes) * 100)
+      : undefined;
+
+    // IOC: anything not filled immediately is cancelled, so a leftover remainder means a
+    // partial fill, not a resting order.
+    const status = filled === 0 ? 'canceled'
+      : remaining && remaining > 0 ? 'partially_filled'
+      : 'executed';
 
     return {
       ok: true,
-      orderId: order.order_id,
-      status: order.status,
-      filledCount: order.filled_count,
-      avgPriceCents: avgPrice != null ? Math.round(avgPrice) : undefined,
+      orderId: data.order_id,
+      status,
+      filledCount: filled,
+      avgPriceCents,
     };
   } catch (err) {
     return { ok: false, error: String(err) };

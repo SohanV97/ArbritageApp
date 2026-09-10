@@ -1,28 +1,31 @@
 /**
- * Polymarket CLOB trading.
+ * Polymarket trading, on the PUSD-era SDK.
  *
  * Environment variables (OS env vars and .env.local both work):
- *   POLYMARKET_PRIVATE_KEY=0x...your_polygon_wallet_private_key...
- *   POLYMARKET_FUNDER_ADDRESS=0x...   (optional — only if your USDC sits in a
- *                                      Polymarket proxy wallet, i.e. you signed up
- *                                      through the website rather than an EOA)
- *   POLYMARKET_SIGNATURE_TYPE=1|2     (optional override: 1 = email/Magic signup,
- *                                      2 = browser-wallet signup; default 2 when
- *                                      a funder address is set)
+ *   POLYMARKET_PRIVATE_KEY=0x...      the key that signs orders (0x + 64 hex)
+ *   POLYMARKET_FUNDER_ADDRESS=0x...   the wallet holding your collateral. Omit it and the
+ *                                     SDK derives the signer's deterministic Deposit
+ *                                     Wallet, which only works if that wallet is already
+ *                                     deployed — pass the address Polymarket shows you.
  *
- * Flow: the private key (L1) signs a request deriving the CLOB API credentials
- * (L2, cached after first derivation), then orders are created + posted with them.
- * The clob-client auto-resolves tick size, negRisk (multi-outcome politics events),
- * and the taker feeRateBps per market, and signs against the correct exchange
- * contract. Orders post as FAK (fill-and-kill): fill whatever is available at the
- * limit price immediately, cancel the rest — an arb leg must never rest one-sided.
+ * ─── why this was rewritten ───────────────────────────────────────────────────
+ * This module used @polymarket/clob-client, whose Polygon config hardcodes the collateral
+ * token as USDC.e (0x2791Bca1…). Polymarket has since migrated to its own token, PUSD
+ * (0xC011a7E1…). A genuinely funded account therefore reported a balance of $0.00 — the
+ * client was reading a token the account did not hold, and would have signed orders against
+ * the wrong exchange. The symptom was indistinguishable from "you have no money".
  *
- * EOA note: a fresh wallet must approve USDC/CTF allowances for the Polymarket
- * exchange contracts once before its first trade (the website does this for proxy
- * wallets automatically). If the preflight shows allowance 0 with a positive
- * balance, that approval is what's missing.
+ * @polymarket/client is the current SDK: its production config names PUSD as the collateral
+ * token, and it targets the same clob.polymarket.com the app already used. The conditional
+ * token contract (0x4D97DCd9…) is unchanged between the two, so this is the same venue and
+ * the same markets — only the dollar token and the client moved.
+ *
+ * Orders are placed as marketable LIMIT orders: priced at (or through) the resting ask so
+ * they fill immediately against existing liquidity rather than resting on the book. An arb
+ * leg must never sit one-sided, and a limit price keeps the fill size exact, which matters
+ * because both legs must end up with the same number of contracts to stay hedged.
  */
-import type { ClobClient as ClobClientType } from '@polymarket/clob-client';
+import type { SecureClient } from '@polymarket/client';
 
 export interface PolymarketOrderRequest {
   tokenId: string;    // YES or NO CLOB token ID
@@ -40,125 +43,256 @@ export interface PolymarketOrderResult {
 
 export interface PolymarketAuthTest {
   ok: boolean;
+  /** The signer derived from POLYMARKET_PRIVATE_KEY. This is NOT where funds live. */
   address?: string;
+  /** The wallet collateral is held in and orders are funded from. */
+  funderAddress?: string;
+  /** Spendable collateral, in dollars. Denominated in PUSD since the migration. */
   usdcBalance?: number;
-  usdcAllowance?: number;
+  /** Balance read straight from Polygon, independent of Polymarket's API. */
+  onChainUsdc?: number;
+  /** False when the wallet still needs its one-time trading approvals. */
+  approvalsReady?: boolean;
+  /** Plain-language explanation when something is off, rather than a silent zero. */
+  diagnosis?: string;
   error?: string;
 }
 
-// L2 creds are derived deterministically from the wallet key — derive once, reuse.
-let _cachedClient: { key: string; client: ClobClientType } | null = null;
+// ─── on-chain reads ──────────────────────────────────────────────────────────
+// Polymarket settles in PUSD, not the bridged USDC.e it used to. Reading the balance
+// straight from the chain is what distinguishes "this wallet is empty" from "the SDK is
+// looking at the wrong token" — the failure that made a funded account read as $0.00.
+const PUSD_POLYGON = '0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB';
+const USDC_E_POLYGON = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+const POLYGON_RPCS = [
+  'https://polygon-bor-rpc.publicnode.com',
+  'https://polygon.llamarpc.com',
+];
 
-async function getTradingClient(): Promise<{ client: ClobClientType; address: string } | { error: string }> {
-  const privateKey = process.env.POLYMARKET_PRIVATE_KEY;
-  if (!privateKey) {
+async function erc20Balance(token: string, address: string): Promise<number | undefined> {
+  if (!/^0x[0-9a-fA-F]{40}$/.test(address)) return undefined;
+  const data = '0x70a08231' + address.toLowerCase().slice(2).padStart(64, '0');
+  for (const url of POLYGON_RPCS) {
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to: token, data }, 'latest'] }),
+      });
+      if (!res.ok) continue;
+      const j = await res.json() as { result?: string; error?: unknown };
+      if (j.error || !j.result || j.result === '0x') continue;
+      return Number(BigInt(j.result)) / 1e6;   // PUSD and USDC.e are both 6-decimal
+    } catch { /* try the next endpoint */ }
+  }
+  return undefined;
+}
+
+/** Spendable collateral on Polygon: PUSD, falling back to legacy USDC.e. */
+async function onChainCollateral(address: string): Promise<number | undefined> {
+  const pusd = await erc20Balance(PUSD_POLYGON, address);
+  if (typeof pusd === 'number' && pusd > 0) return pusd;
+  const usdc = await erc20Balance(USDC_E_POLYGON, address);
+  if (typeof usdc === 'number' && usdc > 0) return usdc;
+  return pusd ?? usdc;
+}
+
+// ─── client ──────────────────────────────────────────────────────────────────
+// createSecureClient authenticates over the network, so build it once and reuse it. Keyed
+// on the credentials so an env change during dev is picked up rather than cached forever.
+type CachedClient = { key: string; wallet: string; client: SecureClient };
+let _cached: CachedClient | null = null;
+
+async function getSecureClient(): Promise<{ client: SecureClient; address: string; wallet: string } | { error: string }> {
+  const key = process.env.POLYMARKET_PRIVATE_KEY?.trim();
+  if (!key) {
     return {
-      error: 'POLYMARKET_PRIVATE_KEY not set — orders are signed by your Polygon wallet key (0x + 64 hex chars), ' +
-        'which is separate from the API key UUID (that only covers market data). Set it as an environment variable ' +
-        'and restart the terminal. Wallet apps expose it under account details → show private key.',
+      error: 'POLYMARKET_PRIVATE_KEY not set — orders are signed by your Polygon wallet key ' +
+        '(0x + 64 hex chars), which is separate from the API key UUID (that only covers market ' +
+        'data). Set it as an environment variable and restart.',
     };
   }
-  try {
-    const { Wallet } = await import('ethers');
-    const { ClobClient } = await import('@polymarket/clob-client');
+  if (!/^0x[0-9a-fA-F]{64}$/.test(key)) {
+    return { error: `POLYMARKET_PRIVATE_KEY is not a private key (${key.length} chars). Expected 0x followed by 64 hex characters.` };
+  }
+  const wallet = process.env.POLYMARKET_FUNDER_ADDRESS?.trim() ?? '';
 
-    const wallet = new Wallet(privateKey);
-    if (_cachedClient && _cachedClient.key === privateKey) {
-      return { client: _cachedClient.client, address: wallet.address };
+  try {
+    const { privateKey } = await import('@polymarket/client/viem');
+    const { createSecureClient } = await import('@polymarket/client');
+    const signer = privateKey(key as `0x${string}`);
+    const address = await signer.getAddress();
+
+    if (_cached && _cached.key === key && _cached.wallet === wallet) {
+      return { client: _cached.client, address, wallet: wallet || address };
     }
 
-    // clob-client accepts an ethers-v5-style signer exposing `_signTypedData`;
-    // ethers v6 renamed it, so shim it back on.
-    const signer = Object.assign(wallet, {
-      _signTypedData: wallet.signTypedData.bind(wallet),
-    });
+    // Passing `wallet` explicitly matters: without it the SDK derives the signer's
+    // deterministic Deposit Wallet and tries to DEPLOY it, which needs a relayer key the
+    // app does not hold. The deposit wallet Polymarket already created is the one to use.
+    const client = wallet
+      ? await createSecureClient({ signer, wallet })
+      : await createSecureClient({ signer });
 
-    const host = 'https://clob.polymarket.com';
-    const funder = process.env.POLYMARKET_FUNDER_ADDRESS;
-    // 1 = email/Magic-link signup proxy, 2 = browser-wallet signup (Gnosis Safe).
-    const signatureType = funder
-      ? Number(process.env.POLYMARKET_SIGNATURE_TYPE ?? 2)
-      : undefined;
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const l1Client = new ClobClient(host, 137, signer as any, undefined, signatureType, funder);
-    const creds = await l1Client.createOrDeriveApiKey();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const client = new ClobClient(host, 137, signer as any, creds, signatureType, funder);
-    _cachedClient = { key: privateKey, client };
-    return { client, address: wallet.address };
+    _cached = { key, wallet, client };
+    return { client, address, wallet: wallet || address };
   } catch (err) {
-    return { error: `Failed to initialize CLOB client: ${String(err)}` };
+    return { error: `Failed to initialize Polymarket client: ${describeError(err)}` };
   }
 }
 
-// Translate raw CLOB rejections into something actionable.
-function mapClobError(raw: string): string {
-  const s = raw.toLowerCase();
-  if (s.includes('not enough balance') || s.includes('allowance')) {
-    return `${raw} — fund the wallet with USDC on Polygon and/or approve the Polymarket exchange allowance (run one trade through the website, or set POLYMARKET_FUNDER_ADDRESS if your funds live in a Polymarket account wallet)`;
-  }
-  if (s.includes('minimum') || s.includes('min size')) {
-    return `${raw} — order below this market's minimum size; increase the amount`;
-  }
-  if (s.includes('invalid price') || s.includes('tick')) {
-    return `${raw} — price does not conform to this market's tick size`;
-  }
-  return raw;
+function describeError(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  try { return JSON.stringify(err, (_k, v) => (typeof v === 'bigint' ? v.toString() : v)); }
+  catch { return String(err); }
 }
 
-// Verifies key, L2 credential derivation, and reads USDC balance + exchange
-// allowance — the exact prerequisites for an order to succeed. Places nothing.
+// The venue rejects with a machine-readable code; turn the ones a trader can act on into
+// instructions rather than passing the bare enum through to the UI.
+function mapOrderError(code: string, message: string): string {
+  switch (code) {
+    case 'insufficient_balance_or_allowance':
+      return `${message} — either the wallet is short of collateral, or it has not granted the ` +
+        `exchange permission to move it. Run "npm run setup:approvals" to grant the approvals; ` +
+        `a connection test reports the balance.`;
+    case 'market_not_ready':
+      return `${message} — this market is not accepting orders yet.`;
+    case 'unmatched':
+    case 'fok_not_filled':
+    case 'fak_not_filled':
+      return `${message} — no resting liquidity at this price; the book moved between the ` +
+        `quote and the order.`;
+    case 'invalid_nonce':
+      return `${message} — the signing nonce is stale, which usually means orders were ` +
+        `cancelled elsewhere. Retry.`;
+    case 'post_only_would_cross':
+    case 'post_only_mode':
+      return `${message} — the market is post-only right now, so an immediate-fill order ` +
+        `cannot be placed.`;
+    default:
+      return message || `order rejected (${code})`;
+  }
+}
+
+/**
+ * Build the client ahead of any order. Authentication is a network round trip, and paying it
+ * on the first order costs ~half a second — long enough on a live in-play edge for the price
+ * to move and the trade to abort.
+ */
+export async function warmPolymarketTrading(): Promise<void> {
+  try { await getSecureClient(); } catch { /* warming must never break startup */ }
+}
+
 export async function testPolymarketAuth(): Promise<PolymarketAuthTest> {
-  const init = await getTradingClient();
+  const init = await getSecureClient();
   if ('error' in init) return { ok: false, error: init.error };
+
   try {
-    const { AssetType } = await import('@polymarket/clob-client');
-    const bal = await init.client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
-    // Values are reported in USDC micro-units (6 decimals)
-    const toUsd = (v: string) => { const n = parseFloat(v); return Number.isFinite(n) ? n / 1e6 : 0; };
+    const onChainUsdc = await onChainCollateral(init.wallet);
+
+    // The exchange cannot move collateral until the wallet grants it permission. This is a
+    // one-time on-chain setup that the website does for you; without it a funded account
+    // still cannot trade, and the order rejection alone does not say so.
+    let approvalsReady: boolean | undefined;
+    try {
+      const state = await init.client.fetchTradingApprovalsState();
+      approvalsReady = state?.isFullyApproved === true;
+    } catch { approvalsReady = undefined; }
+
+    const balance = onChainUsdc ?? 0;
+    let diagnosis: string | undefined;
+    if (balance === 0) {
+      diagnosis =
+        `No collateral at ${init.wallet}. Polymarket settles in PUSD (0xC011a7E1…) — check that ` +
+        `POLYMARKET_FUNDER_ADDRESS is the wallet Polymarket shows for your account, and that the ` +
+        `deposit has landed there.`;
+    } else if (approvalsReady === false) {
+      diagnosis =
+        `$${balance.toFixed(2)} is available at ${init.wallet}, but the wallet has not granted the ` +
+        `exchange permission to move it, so every order will be rejected. Granting that is a ` +
+        `one-time step: run "npm run setup:approvals". Polymarket pays the gas, so it costs nothing.`;
+    }
+
     return {
       ok: true,
       address: init.address,
-      usdcBalance: toUsd(bal.balance),
-      usdcAllowance: toUsd(bal.allowance),
+      funderAddress: init.wallet,
+      usdcBalance: balance,
+      onChainUsdc,
+      approvalsReady,
+      diagnosis,
     };
   } catch (err) {
-    return { ok: false, error: mapClobError(String(err)) };
+    return { ok: false, error: describeError(err) };
   }
 }
 
 export async function placePolymarketOrder(req: PolymarketOrderRequest): Promise<PolymarketOrderResult> {
-  const init = await getTradingClient();
+  const init = await getSecureClient();
   if ('error' in init) return { ok: false, error: init.error };
 
   try {
-    const { Side, OrderType } = await import('@polymarket/clob-client');
+    const { OrderSide } = await import('@polymarket/client');
 
-    const order = await init.client.createOrder({
-      tokenID: req.tokenId,
-      price: req.priceCents / 100,
-      side: Side.BUY,
+    // Marketable limit: priced at the ask we already quoted, so it crosses immediately
+    // against resting liquidity instead of sitting on the book. A limit keeps the size and
+    // the worst-case price exact, which is what holds the two legs of the hedge equal.
+    const result = await init.client.placeLimitOrder({
+      assetId: req.tokenId,
+      price: (req.priceCents / 100).toFixed(4),
       size: req.count,
+      side: OrderSide.BUY,
     });
 
-    // FAK: immediate fill up to our size at the limit, cancel any remainder.
-    const resp = await init.client.postOrder(order, OrderType.FAK);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const r = resp as any;
-    // OrderResponse: { success, errorMsg, orderID, status, takingAmount, makingAmount }.
-    // takingAmount = outcome shares received on a BUY = the amount actually filled.
-    if (r.success === false || r.errorMsg || r.errorCode || r.error) {
-      return { ok: false, error: mapClobError(String(r.errorMsg ?? r.errorCode ?? r.error ?? 'order rejected')) };
+    if (!result.ok) {
+      return { ok: false, error: mapOrderError(result.code, result.message) };
     }
-    const filled = Math.round(parseFloat(r.takingAmount ?? '0'));
+
+    // On a BUY the taker asset is the outcome share, so takingAmount is the number of
+    // contracts filled. It is '0' for an order that rested without matching — the caller
+    // compares this against the other leg to decide whether the position is actually hedged,
+    // so an unfilled order must report 0 rather than the requested size.
+    const filled = Number(result.takingAmount);
     return {
       ok: true,
-      orderId: r.orderID ?? r.order_id ?? r.id,
-      status: r.status,
+      orderId: result.orderId,
+      status: result.status,
       filledCount: Number.isFinite(filled) ? filled : undefined,
     };
   } catch (err) {
-    return { ok: false, error: mapClobError(String(err)) };
+    return { ok: false, error: describeError(err) };
+  }
+}
+
+/**
+ * Grants the exchange the one-time on-chain approvals trading requires: an ERC-20 allowance
+ * over the collateral token, and ERC-1155 operator approvals over the outcome tokens. Until
+ * these exist every order is rejected as "insufficient balance or allowance", even with money
+ * in the wallet — the exchange simply cannot move funds it was never permitted to touch.
+ *
+ * Normally the Polymarket website does this the first time you trade there. This exists so an
+ * account funded but never traded on can be made ready without leaving the app.
+ *
+ * These are real transactions against a real wallet, so this is deliberately NOT called during
+ * warm-up or order placement. It is invoked only by `npm run setup:approvals`. Polymarket's
+ * relayer pays the gas, so the wallet needs no MATIC.
+ */
+export async function setupPolymarketApprovals(): Promise<{ ok: boolean; alreadyApproved?: boolean; error?: string }> {
+  const init = await getSecureClient();
+  if ('error' in init) return { ok: false, error: init.error };
+
+  try {
+    const before = await init.client.fetchTradingApprovalsState();
+    if (before.isFullyApproved) return { ok: true, alreadyApproved: true };
+
+    await init.client.setupTradingApprovals();
+
+    // Confirm against chain state rather than trusting the call returned cleanly.
+    const after = await init.client.fetchTradingApprovalsState();
+    return after.isFullyApproved
+      ? { ok: true }
+      : { ok: false, error: 'Approvals were submitted but the wallet still reads as not fully approved. Re-run to retry the remaining ones.' };
+  } catch (err) {
+    return { ok: false, error: describeError(err) };
   }
 }

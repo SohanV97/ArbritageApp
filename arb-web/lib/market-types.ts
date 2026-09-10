@@ -1,4 +1,4 @@
-export type Category = 'mlb' | 'soccer' | 'politics';
+export type Category = 'mlb' | 'soccer' | 'nfl' | 'cfb' | 'politics';
 
 // Polymarket's CLOB rejects orders under 5 shares (INVALID_ORDER_MIN_SIZE); verified
 // against live /markets data — every market reports minimum_order_size = 5. Kalshi's
@@ -34,6 +34,12 @@ export interface UnifiedMarket {
   noDepth?: number;
   spreadCents?: number;
   liquidityUsd?: number;
+  /** Whether the venue itself still accepts orders on this market. This is the only
+   *  reliable "is it still live" signal for a game IN PROGRESS: a synthetic date cutoff
+   *  cannot tell a game that is mid-innings from one that finished, and both venues keep
+   *  trading a game until a winner is declared. Undefined means the venue said nothing,
+   *  which is treated as tradeable. */
+  tradeable?: boolean;
 }
 
 export interface MatchedPair {

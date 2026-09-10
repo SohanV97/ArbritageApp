@@ -27,9 +27,20 @@ const GENERIC = new Set([
 ]);
 const STOP = /\b(the|on|end|in|be|or|draw|baseball|mlb|nba|nfl|nhl|game|moneyline|winner|will|beat|to|win|hockey|basketball|football)\b/g;
 
+// Saint-prefixed place names, spelled out so "St. Louis" is never read as "State".
+const SAINT_PLACES = ['louis', 'paul', 'petersburg', 'johns', 'gallen', 'etienne', 'pauli', 'mirren', 'kitts', 'thomas'];
+const SAINT_PREFIX = new RegExp(String.raw`\bst\.?\s+(?=(?:${SAINT_PLACES.join('|')})\b)`, 'g');
+
 const norm = (s) => s.toLowerCase()
+  // Fold accents, matching the app. Without this "CF Montréal" normalizes to "montr al"
+  // and the checker reports six perfectly correct Montréal fixtures as cross-fixture.
+  .normalize('NFD').replace(/[̀-ͯ]/g, '')
   .replace(/\d{4}-\d{2}-\d{2}/g, ' ').replace(/'s\b/g, 's')
-  .replace(/[^\w\s@]/g, ' ').replace(STOP, ' ').replace(/\s+/g, ' ').trim();
+  .replace(SAINT_PREFIX, 'saint ')
+  .replace(/[^\w\s@]/g, ' ').replace(STOP, ' ')
+  // Re-join dotted initialisms ("d c united" -> "dc united"), matching the app.
+  .replace(/\b[a-z](?:\s+[a-z])+\b/g, (m) => m.replace(/\s+/g, ''))
+  .replace(/\s+/g, ' ').trim();
 const toks = (s) => new Set(norm(s).replace(/\b(?:vs\.?|at|@)\b/g, ' ').split(/\s+/).filter((t) => t.length > 1));
 const identifying = (set) => {
   const out = new Set();
@@ -53,15 +64,11 @@ const overlaps = (a, b, aliases) => {
   return false;
 };
 
-// Minimal alias sets for the ambiguous cases this check must not trip over.
-const ALIASES = {
-  mlb: {
-    ath: ['athletics'], athletics: ['ath'], as: ['athletics'],
-    nyy: ['yankees'], nym: ['mets'], chc: ['cubs'], cws: ['white', 'sox'],
-    sf: ['giants'], lad: ['dodgers'], laa: ['angels'], tb: ['rays'], kc: ['royals'],
-  },
-  soccer: {},
-};
+// Use the SAME alias table the app matches with, rather than a copy. A local copy went
+// stale the moment football was added: Polymarket writes NFL nicknames ("Raiders vs.
+// Chargers") while Kalshi writes cities ("Las Vegas (LV) vs Los Angeles C (LAC)"), which
+// share no word at all — so every correct NFL pair was reported as a cross-fixture.
+const { SPORT_ALIASES: ALIASES } = await import('../lib/categories.ts');
 
 const fail = [];
 const note = (msg) => fail.push(msg);
@@ -69,7 +76,7 @@ const note = (msg) => fail.push(msg);
 async function main() {
   let d;
   try {
-    const r = await fetch(`${BASE}/api/opportunities?fresh=1`, { cache: 'no-store' });
+    const r = await fetch(`${BASE}/api/opportunities?fresh=1&pairs=1`, { cache: 'no-store' });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     d = await r.json();
   } catch (err) {

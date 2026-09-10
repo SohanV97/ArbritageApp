@@ -1,11 +1,47 @@
 import type { UnifiedMarket, Category } from '@/lib/market-types';
 import type { PolymarketMarketKind } from '@/lib/fees';
+import { isPoliticsMarket } from '@/lib/politicsFilter';
+import { isSportMoneyline } from '@/lib/moneylineFilter';
+import { easternDateOf } from '@/lib/gameDate';
+import { askCents, noAskCents, clampCents } from '@/lib/depth';
 import {
   POLYMARKET_SPORT_KEYWORDS,
   POLYMARKET_POLITICS_TAG_SLUGS,
+  SPORT_CATEGORY_LIST,
+  isSportCategory,
 } from '@/lib/categories';
 
 const POLYMARKET_GAMMA_API = 'https://gamma-api.polymarket.com';
+
+// ─── Gamma request gate ──────────────────────────────────────────────────────
+// Gamma's throughput saturates at roughly 8 concurrent requests; past that it queues and
+// per-request latency grows linearly rather than the work going faster. Measured against
+// one endpoint: 1 concurrent = 231ms/req, 8 = 197ms, 16 = 291ms, 32 = 611ms, 64 = 1008ms.
+//
+// Discovery fans out over every series AND tag id of all five categories at once — soccer
+// alone has 39 ids — so ~60 requests were permanently in flight and each one paid the
+// ~1s queued latency. That is why the cold start spent 31.5s inside Polymarket while
+// fetching only ~11k events, most of them duplicates across overlapping ids.
+//
+// Holding the fan-out at the saturation point makes the same work finish far sooner.
+const GAMMA_MAX_INFLIGHT = 8;
+let _gammaInflight = 0;
+const _gammaWaiters: Array<() => void> = [];
+
+async function gammaFetch(url: string, init?: RequestInit): Promise<Response> {
+  // Queue if full OR anyone is already waiting — otherwise a request arriving while a slot
+  // is free jumps ahead of queued ones, starving whichever category fanned out last.
+  if (_gammaInflight >= GAMMA_MAX_INFLIGHT || _gammaWaiters.length > 0) {
+    await new Promise<void>(resolve => _gammaWaiters.push(resolve));
+  }
+  _gammaInflight++;
+  try {
+    return await fetch(url, init);
+  } finally {
+    _gammaInflight--;
+    _gammaWaiters.shift()?.();
+  }
+}
 
 function getPolymarketApiKey(): string | null {
   // EXPO_PUBLIC_ fallback: the key may still live in the OS env under the old
@@ -39,6 +75,12 @@ interface GammaMarket {
   clobTokenIds?: string;
   market_slug?: string;
   groupItemTitle?: string;
+  // Liveness, straight from the venue. A game in progress is still `acceptingOrders`;
+  // it flips only once the market settles, which is the signal a date cannot provide.
+  closed?: boolean;
+  active?: boolean;
+  acceptingOrders?: boolean;
+  gameStartTime?: string;
   [key: string]: unknown;
 }
 
@@ -73,7 +115,7 @@ let _cachedTags: { data: GammaTag[]; ts: number } | null = null;
 async function fetchSportsMetadata(): Promise<GammaSportMetadata[]> {
   if (_cachedSportsData && Date.now() - _cachedSportsData.ts < PM_META_TTL_MS) return _cachedSportsData.data;
   try {
-    const res = await fetch(`${POLYMARKET_GAMMA_API}/sports`, { headers: polymarketHeaders() });
+    const res = await gammaFetch(`${POLYMARKET_GAMMA_API}/sports`, { headers: polymarketHeaders() });
     if (res.ok) {
       const data = await res.json() as GammaSportMetadata[];
       _cachedSportsData = { data: Array.isArray(data) ? data : [], ts: Date.now() };
@@ -86,7 +128,7 @@ async function fetchSportsMetadata(): Promise<GammaSportMetadata[]> {
 async function fetchAllTags(): Promise<GammaTag[]> {
   if (_cachedTags && Date.now() - _cachedTags.ts < PM_META_TTL_MS) return _cachedTags.data;
   try {
-    const res = await fetch(`${POLYMARKET_GAMMA_API}/tags`, { headers: polymarketHeaders() });
+    const res = await gammaFetch(`${POLYMARKET_GAMMA_API}/tags`, { headers: polymarketHeaders() });
     if (res.ok) {
       const data = await res.json() as GammaTag[];
       _cachedTags = { data: Array.isArray(data) ? data : [], ts: Date.now() };
@@ -113,8 +155,8 @@ function parseBookPrices(m: GammaMarket): { yes: number; no: number } | null {
   if (bid === null || ask === null) return null;
   if (bid <= 0 || ask <= 0 || bid >= 1 || ask >= 1 || ask < bid) return null;
   return {
-    yes: Math.max(1, Math.min(99, Math.ceil(ask * 100))),
-    no: Math.max(1, Math.min(99, Math.ceil((1 - bid) * 100))),
+    yes: clampCents(askCents(ask)),
+    no: clampCents(noAskCents(bid)),
   };
 }
 
@@ -127,10 +169,12 @@ function parseBookPrices(m: GammaMarket): { yes: number; no: number } | null {
 const POLYMARKET_CLOB_API = 'https://clob.polymarket.com';
 const PM_BOOK_BATCH = 100;
 
-interface ClobBook {
+export interface ClobBook {
   asset_id?: string;
-  bids?: { price?: string }[];
-  asks?: { price?: string }[];
+  // `size` is contracts resting at that price. The price path ignores it, but sizing needs
+  // it: how much of a hedged pair is fillable depends on the whole ladder, not the top.
+  bids?: { price?: string; size?: string }[];
+  asks?: { price?: string; size?: string }[];
 }
 
 const bestPrice = (side: 'ask' | 'bid', levels: { price?: string }[] | undefined): number | null => {
@@ -139,6 +183,61 @@ const bestPrice = (side: 'ask' | 'bid', levels: { price?: string }[] | undefined
   if (prices.length === 0) return null;
   return side === 'ask' ? Math.min(...prices) : Math.max(...prices);
 };
+
+// Single-market live quote for the pre-order price re-check. Always pass the YES token
+// (outcome[0]) — both sides are derived from that one book, exactly as the pipeline does.
+export async function getPolymarketQuote(yesTokenId: string): Promise<{ yes: number; no: number } | null> {
+  if (!yesTokenId) return null;
+  try {
+    const res = await fetch(`${POLYMARKET_CLOB_API}/books`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify([{ token_id: yesTokenId }]),
+    });
+    if (!res.ok) return null;
+    const books = (await res.json()) as ClobBook[];
+    const b = (Array.isArray(books) ? books : [])[0];
+    if (!b) return null;
+    const ask = bestPrice('ask', b.asks);
+    const bid = bestPrice('bid', b.bids);
+    if (ask === null || bid === null) return null;
+    if (bid <= 0 || ask <= 0 || bid >= 1 || ask >= 1 || ask < bid) return null;
+    return {
+      yes: clampCents(askCents(ask)),
+      no: clampCents(noAskCents(bid)),
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Whole books for sizing. The price path already fetches these and keeps only the best
+// level; depth needs every level, because the fillable size of a hedged pair is set by
+// whichever venue runs out first, not by Kalshi's top of book. One request covers many
+// tokens, and both sides of a pair come from the YES token's book (asks = buy YES,
+// bids mirrored = buy NO), so no second fetch is needed.
+export async function getPolymarketBooks(tokenIds: string[]): Promise<Map<string, ClobBook>> {
+  const out = new Map<string, ClobBook>();
+  const ids = tokenIds.filter(Boolean);
+  if (ids.length === 0) return out;
+  const batches: string[][] = [];
+  for (let i = 0; i < ids.length; i += PM_BOOK_BATCH) batches.push(ids.slice(i, i + PM_BOOK_BATCH));
+  await Promise.all(batches.map(async (chunk) => {
+    try {
+      const res = await fetch(`${POLYMARKET_CLOB_API}/books`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(chunk.map(token_id => ({ token_id }))),
+      });
+      if (!res.ok) return;
+      const books = (await res.json()) as ClobBook[];
+      for (const b of Array.isArray(books) ? books : []) {
+        if (b?.asset_id) out.set(b.asset_id, b);
+      }
+    } catch { /* a book we cannot read simply has no depth data */ }
+  }));
+  return out;
+}
 
 export async function refreshPolymarketPrices(markets: PolymarketMarketWithKind[]): Promise<number> {
   const byToken = new Map<string, PolymarketMarketWithKind[]>();
@@ -171,8 +270,8 @@ export async function refreshPolymarketPrices(markets: PolymarketMarketWithKind[
         const bid = bestPrice('bid', b.bids);
         if (ask === null || bid === null) continue;
         if (bid <= 0 || ask <= 0 || bid >= 1 || ask >= 1 || ask < bid) continue;
-        const yes = Math.max(1, Math.min(99, Math.ceil(ask * 100)));
-        const no = Math.max(1, Math.min(99, Math.ceil((1 - bid) * 100)));
+        const yes = clampCents(askCents(ask));
+        const no = clampCents(noAskCents(bid));
         for (const t of targets) { t.yesPriceCents = yes; t.noPriceCents = no; }
         updated++;
       }
@@ -254,7 +353,7 @@ function normalizeEvents(
   category: Category,
   feeKind: PolymarketMarketKind
 ): PolymarketMarketWithKind[] {
-  const isSport = category === 'mlb' || category === 'soccer';
+  const isSport = isSportCategory(category);
   const out: PolymarketMarketWithKind[] = [];
   for (const event of events) {
     const markets = event.markets ?? [];
@@ -287,9 +386,21 @@ function normalizeEvents(
       const slug = m.slug ?? m.market_slug ?? m.condition_id ?? m.conditionId ?? m.id ?? '';
       const conditionId = m.condition_id ?? m.conditionId ?? m.id ?? '';
 
-      // For sports: extract game date from slug (more reliable than end_date_iso,
-      // which PM sets to the series/event settlement date, not the game date).
-      const slugDate = isSport ? extractDateFromSlug(m.slug ?? m.market_slug ?? '') : null;
+      // For sports: the game date, which is the key both venues must agree on to pair a
+      // fixture. Prefer gameStartTime over the slug — Polymarket is not self-consistent
+      // about which timezone the slug encodes, and Kalshi always uses the US Eastern date:
+      //   NFL  "nfl-ne-sea-2026-09-10"  kicks off 00:20 UTC -> Eastern date 09-09,
+      //                                 which is what Kalshi's ticker says (26SEP09).
+      //   MLB  "mlb-cin-lad-2026-09-08" starts 02:10 UTC the 9th -> Eastern 09-08,
+      //                                 and the slug already says 09-08.
+      // So NFL slugs are UTC while MLB slugs are Eastern. Every NFL prime-time game
+      // (Thursday/Sunday/Monday night) therefore looked like a different day on each venue
+      // and could not be paired: 7 of 32 games this week, all of them night games.
+      // Converting the real kick-off timestamp to Eastern makes both venues agree without
+      // loosening the same-day rule — which must stay strict, because MLB plays the same
+      // opponent on consecutive days and a +/-1 day tolerance would cross-match a series.
+      const startDate = isSport ? easternDateOf(m.gameStartTime) : null;
+      const slugDate = startDate ?? (isSport ? extractDateFromSlug(m.slug ?? m.market_slug ?? '') : null);
       const resolutionTime = slugDate
         ? `${slugDate}T23:59:00Z`
         : (m.end_date_iso ?? m.endDateIso ?? endDate);
@@ -334,6 +445,10 @@ function normalizeEvents(
         noTeam: !isSport ? undefined : (!isYesNo ? outcomesArr[1] : ynTeams.no),
         spreadCents: (() => { const s = toNum(m.spread); return s !== null ? Math.round(s * 100) : undefined; })(),
         liquidityUsd: toNum(m.liquidityClob ?? m.liquidity) ?? undefined,
+        // Gamma's own liveness flags. These are what distinguishes a game that is
+        // mid-innings from one that has finished — the game date cannot, because a game
+        // runs for hours past the date in its slug.
+        tradeable: !(m.closed === true) && m.active !== false && m.acceptingOrders !== false,
       });
     }
   }
@@ -342,135 +457,79 @@ function normalizeEvents(
 
 // ─── sport moneyline filter ──────────────────────────────────────────────────
 
-const SPORT_JUNK: Record<string, string[]> = {
-  mlb: ['nhl', 'hockey', 'nba', 'basketball', 'nfl', 'soccer', 'football'],
-  soccer: ['mlb', 'baseball', 'nhl', 'hockey', 'nba', 'basketball', 'nfl'],
-};
 
-const COMMON_SPORT_JUNK = [
-  'championship', 'award', 'mvp', 'rookie', 'draft', 'most valuable',
-  'division winner', 'pennant', 'wild card', 'make the playoffs', 'series winner',
-  'margin', 'stats', 'will be traded', 'trade destination',
-  // Esports / gaming — these appear in PM's "sports" feed but Kalshi doesn't cover them
-  'valorant', 'vct', 'vcl', 'esports', 'e-sports', 'gaming',
-  'map 1', 'map 2', 'map 3', 'map 4', 'map 5', 'bo1', 'bo3', 'bo5',
-  'league of legends', 'counter-strike', 'cs:go', 'dota', 'overwatch',
-  'mobile legends', 'bang bang', 'mlbb', 'mid season cup',
-  // Prop-bet markets about commentary / broadcasting — not the same as match winner
-  'announcer', 'commentator', 'broadcast',
-];
-
-// Sport-specific additional junk on top of COMMON_SPORT_JUNK
-const SPORT_EXTRA_JUNK: Record<string, string[]> = {
-  mlb: ['strikeout', 'home run', 'batting', 'earned run', 'hits allowed', 'run line', 'inning', 'draw', 'tie', ' fc', 'fc '],
-  soccer: [
-    // Prop bets and non-moneyline markets — Kalshi only has game-level moneylines
-    'score', 'goal', 'assist', 'save', 'shot',
-    'qualify', 'advance', 'group stage', 'knockout',
-    'player', 'player prop',
-    'clean sheet', 'penalty kick', 'penalty shootout', 'corner', 'free kick', 'foul', 'offside',
-    'both teams', 'first half', 'second half', 'halftime', 'half time',
-    'golden boot', 'top scorer', 'red card', 'yellow card', 'offsides',
-    // Time/outcome prop markets — NOT the same as a match winner market
-    'extra time', 'overtime', 'over time',
-    'draw', 'tie',
-    // Polymarket "More Markets" sub-events contain props like extra time, draw, etc.
-    // The event title is prefixed with "- More Markets:" so blocking this catches them all.
-    'more markets',
-  ],
-};
-
-function isSportMoneyline(market: PolymarketMarketWithKind, cat: Category): boolean {
-  const q = market.question.toLowerCase();
-  // ' at ' excluded — too ambiguous ("score at least", "win at home"); ' @ ' covers venue format
-  if (![' vs ', ' vs. ', ' versus ', ' @ '].some(t => q.includes(t))) return false;
-  const junk = [...COMMON_SPORT_JUNK, ...(SPORT_JUNK[cat] ?? []), ...(SPORT_EXTRA_JUNK[cat] ?? [])];
-  if (junk.some(word => q.includes(word))) return false;
-  if (['spread', 'over/under', 'o/u', 'cover', 'total', 'nrfi', 'run line'].some(word => q.includes(word))) return false;
-  if (/(?:\s|^)[+-]\d+(\.\d+)?(?:\s|$)/.test(q)) return false;
-  // Exact score patterns like "Switzerland 0 - 3 Canada" or "2-1"
-  // Strip ISO dates first so "2026-06-23" (which contains "06-23") isn't a false hit
-  if (/\b\d+\s*-\s*\d+\b/.test(q.replace(/\d{4}-\d{2}-\d{2}/g, ''))) return false;
-  if (market.resolutionTime && Date.parse(market.resolutionTime) < Date.now()) return false;
-  return true;
-}
-
-// States with 2026 Senate races that Kalshi lists (mirrors CATEGORY_SERIES in kalshi.ts).
-const KALSHI_SENATE_STATES = [
-  'texas', 'iowa', 'alaska', 'georgia', 'michigan', 'wisconsin',
-  'montana', 'maine', 'new jersey', 'new hampshire', 'colorado',
-  'new mexico', 'north carolina', 'oregon', 'illinois', 'maryland',
-  'virginia', 'nevada', 'delaware', 'louisiana', 'alabama',
-  'arkansas', 'idaho', 'kansas', 'minnesota', 'south carolina',
-  'massachusetts', 'rhode island', 'west virginia', 'oklahoma',
-  'tennessee', 'mississippi', 'nebraska',
-];
-
-// Kalshi politics coverage is narrow: individual 2026 Senate races + Senate/House control.
-// Filtering PM down to the same slice prevents false matches with approval ratings,
-// Supreme Court picks, policy bills, foreign elections, and other things Kalshi ignores.
-function isPoliticsMarket(market: PolymarketMarketWithKind): boolean {
-  if (market.resolutionTime && Date.parse(market.resolutionTime) < Date.now()) return false;
-  const q = market.question.toLowerCase();
-
-  // Kalshi has no primaries, runoffs, caucuses, or governor races
-  if (/\bprimary\b|\bprimaries\b|\brunoff\b|\bcaucus\b|\bgovernor\b|\bgov\b/.test(q)) return false;
-
-  // Drop Polymarket's placeholder candidate/party slots ("Person A", "Party B",
-  // "a candidate not listed above", "another party") — they have no real prices.
-  if (/\b(person|party|candidate)\s+[a-l]\b/.test(q)) return false;
-  if (/not listed|another party|other party/.test(q)) return false;
-
-  // Compound / derivative markets that LOOK like control markets but resolve on a
-  // different event: trifecta, supermajority, "all core four races", seat counts,
-  // "lose a seat", "before the midterms" timing markets, House+Senate combos.
-  if (/\btrifecta\b|\bsupermajority\b|\bcore four\b|\bhow many\b|\bincumbent|\bsweep\b|\bswept\b|\blose\b|\bflip\b|\bbefore the midterm/.test(q)) return false;
-  if (/\bhouse\b/.test(q) && /\bsenate\b/.test(q)) return false;
-
-  // Must name a real party so the structured matcher can align it.
-  const hasParty = /\b(republican|republicans|democrat|democrats|democratic)\b/.test(q);
-  if (!hasParty) return false;
-
-  const hasSenate = /\bsenate\b|\bsenator\b/.test(q);
-  const hasControl = /\bcontrol\b|\bmajority\b/.test(q);
-
-  // Senate race in a state Kalshi covers
-  if (hasSenate && KALSHI_SENATE_STATES.some(s => q.includes(s))) return true;
-
-  // "Which party controls / wins the Senate / House / Congress?"
-  if ((hasControl || hasSenate) && /\b(senate|house|congress)\b/.test(q)) return true;
-
-  return false;
-}
 
 // ─── event fetching helpers ──────────────────────────────────────────────────
+
+// Gamma silently caps page size at 100 however large a `limit` you ask for. Asking for
+// 200 therefore returned 100, the "short page means last page" check fired immediately,
+// and pagination stopped after ONE page. Because Gamma also returns events oldest-first,
+// that single page was mostly games already played: of 223 college-football events only
+// 11 upcoming ones were ever seen (134 exist), and of 269 MLB events only 61 of 229.
+// The limit must match the real cap for the short-page check to mean anything.
+const GAMMA_PAGE_LIMIT = 100;
+
+// Gamma returns events OLDEST-first by default. Combined with a page cap that means the
+// cap truncates exactly the wrong end: for a tag holding 2000+ events we kept the oldest
+// 1200 and threw away the upcoming games — the only ones tradeable. Ordering newest-first
+// puts the games we want on page 0 and turns the cap into a harmless floor.
+//
+// It also lets paging stop as soon as a page holds nothing inside the window we trade,
+// instead of walking an entire season every rediscovery.
+const GAMMA_ORDER = '&order=startDate&ascending=false';
+
+// Games worth keeping: anything from yesterday onward. Yesterday (not today) because a
+// late game started on one UTC date runs into the next, and it is still live.
+function gammaEventInWindow(e: GammaEvent): boolean {
+  const m = (e.slug ?? '').match(/(\d{4}-\d{2}-\d{2})/);
+  if (!m) return true;   // no date in the slug (politics, futures) — never page past it
+  const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+  return m[1] >= yesterday;
+}
+
+// Stop after this many consecutive pages with nothing in the window. One page of slack
+// absorbs the fact that startDate (when the market opened) only loosely tracks game date.
+const GAMMA_DRY_PAGES = 2;
+
+async function pageGamma(
+  buildUrl: (offset: number) => string,
+  maxPages: number,
+  earlyStop = true,
+): Promise<GammaEvent[]> {
+  const limit = GAMMA_PAGE_LIMIT;
+  const events: GammaEvent[] = [];
+  let offset = 0;
+  let dry = 0;
+  for (let page = 0; page < maxPages; page++) {
+    try {
+      const res = await gammaFetch(buildUrl(offset), { headers: polymarketHeaders() });
+      if (!res.ok) break;
+      const pageEvents = await res.json() as GammaEvent[];
+      if (!Array.isArray(pageEvents) || pageEvents.length === 0) break;
+      events.push(...pageEvents);
+      if (earlyStop) {
+        dry = pageEvents.some(gammaEventInWindow) ? 0 : dry + 1;
+        if (dry >= GAMMA_DRY_PAGES) break;
+      }
+      if (pageEvents.length < limit) break;
+      offset += limit;
+    } catch { break; }
+  }
+  return events;
+}
 
 async function fetchEventsByIds(
   idParam: string,
   ids: Set<string>,
-  maxPages = 3
+  maxPages = 12
 ): Promise<GammaEvent[]> {
-  const limit = 200;
-  // Fetch all IDs in parallel (was sequential — with 10+ tag IDs this saved several seconds).
-  const perIdResults = await Promise.all([...ids].map(async (id) => {
-    const events: GammaEvent[] = [];
-    let offset = 0;
-    let pagesFetched = 0;
-    while (pagesFetched < maxPages) {
-      try {
-        const url = `${POLYMARKET_GAMMA_API}/events?${idParam}=${encodeURIComponent(id)}&active=true&closed=false&limit=${limit}&offset=${offset}`;
-        const res = await fetch(url, { headers: polymarketHeaders() });
-        if (!res.ok) break;
-        const page = await res.json() as GammaEvent[];
-        if (!Array.isArray(page) || page.length === 0) break;
-        events.push(...page);
-        pagesFetched++;
-        if (page.length < limit) break;
-        offset += limit;
-      } catch { break; }
-    }
-    return events;
-  }));
+  // Fetch all IDs in parallel; the Gamma gate holds the real fan-out at the saturation point.
+  const perIdResults = await Promise.all([...ids].map(id =>
+    pageGamma(
+      offset => `${POLYMARKET_GAMMA_API}/events?${idParam}=${encodeURIComponent(id)}&active=true&closed=false&limit=${GAMMA_PAGE_LIMIT}&offset=${offset}${GAMMA_ORDER}`,
+      maxPages,
+    )
+  ));
   return perIdResults.flat();
 }
 
@@ -479,22 +538,15 @@ async function fetchEventsByIds(
 // `category=politics&limit=100` call never reached them — it only saw the noisy
 // top of the feed (Kraken IPO, celebrity markets, foreign elections).
 async function fetchEventsByTagSlug(slug: string, maxPages = 12): Promise<GammaEvent[]> {
-  const limit = 200;
-  const events: GammaEvent[] = [];
-  let offset = 0;
-  for (let page = 0; page < maxPages; page++) {
-    try {
-      const url = `${POLYMARKET_GAMMA_API}/events?tag_slug=${encodeURIComponent(slug)}&active=true&closed=false&limit=${limit}&offset=${offset}`;
-      const res = await fetch(url, { headers: polymarketHeaders() });
-      if (!res.ok) break;
-      const pageEvents = await res.json() as GammaEvent[];
-      if (!Array.isArray(pageEvents) || pageEvents.length === 0) break;
-      events.push(...pageEvents);
-      if (pageEvents.length < limit) break;
-      offset += limit;
-    } catch { break; }
-  }
-  return events;
+  // NO newest-first ordering here. Politics markets carry no game date and are long-lived:
+  // the 2026 Senate races opened months ago, so ordering by startDate descending pushed them
+  // past the page cap and cut the usable politics set from 72 markets to 25. Sports need the
+  // recency ordering; politics needs the opposite, so it keeps the original walk.
+  return pageGamma(
+    offset => `${POLYMARKET_GAMMA_API}/events?tag_slug=${encodeURIComponent(slug)}&active=true&closed=false&limit=${GAMMA_PAGE_LIMIT}&offset=${offset}`,
+    maxPages,
+    false,
+  );
 }
 
 function dedupeEvents(events: GammaEvent[]): GammaEvent[] {
@@ -517,7 +569,7 @@ export async function getPolymarketMarketsForAllCategories(): Promise<Map<Catego
 
   // ── Sports + Politics in parallel ────────────────────────────────────────
   // Sports and politics both need allTags (already fetched), so run them concurrently.
-  const sportCategories: Category[] = ['mlb', 'soccer'];
+  const sportCategories: Category[] = SPORT_CATEGORY_LIST;
 
   await Promise.all([
     // Sports: MLB + soccer in parallel, capped at 5 pages each
@@ -546,11 +598,13 @@ export async function getPolymarketMarketsForAllCategories(): Promise<Map<Catego
       }
     }
 
-    // 3 pages × 200/page = 600 events; covers 15+ days of upcoming games.
+    // Page all the way through. Gamma orders events oldest-first, so stopping early
+    // discards precisely the upcoming games we need — a season's series runs to a few
+    // hundred events (MLB ~269, CFB ~223), and paging stops on its own at a short page.
     const allEvents: GammaEvent[] = [];
     const [bySeriesEvents, byTagEvents] = await Promise.all([
-      seriesIds.size > 0 ? fetchEventsByIds('series_id', seriesIds, 3) : Promise.resolve([]),
-      tagIds.size > 0 ? fetchEventsByIds('tag_id', tagIds, 3) : Promise.resolve([]),
+      seriesIds.size > 0 ? fetchEventsByIds('series_id', seriesIds) : Promise.resolve([]),
+      tagIds.size > 0 ? fetchEventsByIds('tag_id', tagIds) : Promise.resolve([]),
     ]);
     allEvents.push(...bySeriesEvents, ...byTagEvents);
 

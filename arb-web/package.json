@@ -7,10 +7,14 @@
     "build": "next build",
     "start": "next start",
     "check:links": "node scripts/check-links.mjs",
-    "check:markets": "node scripts/check-markets.mjs",
-    "check": "npm run check:markets && npm run check:links"
+    "check:markets": "node --experimental-strip-types --no-warnings scripts/check-markets.mjs",
+    "test:matching": "node --experimental-strip-types --no-warnings scripts/test-matching.mjs",
+    "check": "npm run test:matching && npm run check:markets && npm run check:links",
+    "check:wallet": "node scripts/check-wallet.mjs",
+    "setup:approvals": "node --experimental-strip-types --no-warnings scripts/setup-approvals.mjs"
   },
   "dependencies": {
+    "@polymarket/client": "^0.10.0",
     "@polymarket/clob-client": "^5.8.1",
     "ethers": "^6.17.0",
     "next": "16.2.9",

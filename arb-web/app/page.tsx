@@ -204,11 +204,12 @@ interface CardExecState {
 // Memoised for the same reason as PairRow: ~100 of these re-render on every poll
 // otherwise. Every value the card renders from is compared below, so a card only
 // re-renders when something it actually shows has changed.
-const OpportunityCard = memo(function OpportunityCard({ opp, amount, bankroll, persistence, onUseKelly, onExecuted, onExecuteStart }: {
+const OpportunityCard = memo(function OpportunityCard({ opp, amount, bankroll, firstSeenAt, onUseKelly, onExecuted, onExecuteStart }: {
   opp: ArbitrageOpportunity;
   amount: number;
   bankroll: number;
-  persistence: number;
+  /** Timestamp this opportunity was first seen, for the "how long has this lasted" badge. */
+  firstSeenAt: number;
   onUseKelly: (n: number) => void;
   onExecuted: (opp: ArbitrageOpportunity, amount: number, result: ExecuteResponse) => void;
   onExecuteStart: (opp: ArbitrageOpportunity) => void;
@@ -216,6 +217,9 @@ const OpportunityCard = memo(function OpportunityCard({ opp, amount, bankroll, p
   const [showDebug, setShowDebug] = useState(false);
   const [cardExec, setCardExec] = useState<CardExecState>({ state: 'idle' });
   const { pair, legA, legB, totalCostCents, edgePercent } = opp;
+  // Whole seconds only: this re-renders on every poll, and a value that changed on each
+  // one would keep re-measuring the badge and nudging its neighbours.
+  const heldForSec = Math.floor((Date.now() - firstSeenAt) / 1000);
   const isArb = edgePercent >= 0.5;
   // Strictly positive edge after fees = the only case worth (and safe) to execute.
   const isProfitable = edgePercent > 0;
@@ -310,12 +314,12 @@ const OpportunityCard = memo(function OpportunityCard({ opp, amount, bankroll, p
         <div className="flex-1 min-w-0 flex flex-col gap-1.5">
           <div className="flex items-center gap-2 flex-wrap">
             <CategoryBadge category={category} />
-            {persistence >= 2 && (
+            {heldForSec >= 2 && (
               <span
                 style={{ background: '#0284c711', color: '#7dd3fc', border: '1px solid #0284c733' }}
-                className="text-xs px-2 py-0.5 rounded-full font-mono"
+                className="text-xs px-2 py-0.5 rounded-full font-mono tabular-nums"
               >
-                Seen {persistence}× · {Math.round(persistence * POLL_MS / 1000)}s
+                Held {heldForSec}s
               </span>
             )}
             {lockupDays != null && lockupDays > 2 && (
@@ -390,7 +394,9 @@ const OpportunityCard = memo(function OpportunityCard({ opp, amount, bankroll, p
             )}
             {leg.venue === 'kalshi' && opp.maxContracts != null && (
               <p className="text-xs font-mono" style={{ color: exceedsDepth ? '#f87171' : 'var(--text-muted)' }}>
-                depth ≈ {fmtUsd(opp.maxContracts)} at this price
+                {/* Both venues, not just this leg: the fillable size of a hedged pair is set
+                    by whichever book runs out first. */}
+                ~{fmtUsd(opp.maxContracts)} fillable on both books
               </p>
             )}
           </a>
@@ -429,7 +435,9 @@ const OpportunityCard = memo(function OpportunityCard({ opp, amount, bankroll, p
       </div>
       {exceedsDepth && (
         <p className="text-xs -mt-2" style={{ color: '#f87171' }}>
-          Amount exceeds visible Kalshi book depth — the order may only partially fill at this price.
+          Only ~{fmtUsd(opp.maxContracts ?? 0)} can be filled across both books while this stays
+          profitable. Ordering more would fill one leg further than the other and leave the
+          difference unhedged — use Max fill or less.
         </p>
       )}
 
@@ -552,8 +560,8 @@ const OpportunityCard = memo(function OpportunityCard({ opp, amount, bankroll, p
   );
 }, (a, b) => {
   // Identity + every rendered number. Prices/edge/depth drive the whole card, and
-  // amount/bankroll/persistence drive the sizing and badges.
-  if (a.amount !== b.amount || a.bankroll !== b.bankroll || a.persistence !== b.persistence) return false;
+  // amount/bankroll/firstSeenAt drive the sizing and badges.
+  if (a.amount !== b.amount || a.bankroll !== b.bankroll || a.firstSeenAt !== b.firstSeenAt) return false;
   if (a.onUseKelly !== b.onUseKelly || a.onExecuted !== b.onExecuted || a.onExecuteStart !== b.onExecuteStart) return false;
   const x = a.opp, y = b.opp;
   return x.edgePercent === y.edgePercent
@@ -754,9 +762,13 @@ function ExecutionResultScreen({
   const { pair, totalCostCents, edgePercent } = opp;
   const hedged = result.hedged;
   // hedgeNote present without hedged = a naked/partial position needing attention.
-  const naked = !hedged && !!result.hedgeNote;
+  // Backing out on a price move is a SAFE outcome — no orders were sent — so it must not
+  // be presented with the same alarm as a half-filled position.
+  const abortedSafely = result.abortedOnPriceMove === true;
+  const naked = !hedged && !abortedSafely && !!result.hedgeNote;
   const profitDollars = amount - (totalCostCents / 100) * amount;
-  const accent = hedged ? '#16a34a' : '#dc2626';
+  // amber (a deliberate, harmless no-trade) rather than red (money at risk)
+  const accent = hedged ? '#16a34a' : abortedSafely ? '#d97706' : '#dc2626';
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center px-4 py-12">
@@ -775,16 +787,21 @@ function ExecutionResultScreen({
               style={{
                 background: `${accent}22`,
                 border: `1px solid ${accent}55`,
-                color: hedged ? '#4ade80' : '#f87171',
+                color: hedged ? '#4ade80' : abortedSafely ? '#fbbf24' : '#f87171',
               }}
               className="w-12 h-12 rounded-full flex items-center justify-center text-xl font-bold flex-shrink-0"
             >
-              {hedged ? '✓' : '⚠'}
+              {hedged ? '✓' : abortedSafely ? '⤺' : '⚠'}
             </div>
             <div>
-              <h2 className="text-xl font-bold">{hedged ? 'Hedge Complete' : naked ? 'Position Needs Attention' : 'Execution Failed'}</h2>
+              <h2 className="text-xl font-bold">
+                {hedged ? 'Hedge Complete'
+                  : abortedSafely ? 'Backed Out — No Orders Sent'
+                  : naked ? 'Position Needs Attention' : 'Execution Failed'}
+              </h2>
               <p className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
                 {new Date(result.executedAt).toLocaleString()}
+                {result.revalidateMs !== undefined && ` · price re-checked in ${result.revalidateMs}ms`}
               </p>
             </div>
           </div>
@@ -798,6 +815,12 @@ function ExecutionResultScreen({
               <p className="text-sm font-semibold" style={{ color: naked ? '#f87171' : '#fbbf24' }}>
                 {result.hedgeNote}
               </p>
+              {abortedSafely && (
+                <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
+                  Your balance is untouched — the edge disappeared between loading the card and
+                  confirming the price, so the trade was skipped rather than filled at a loss.
+                </p>
+              )}
             </div>
           )}
 
@@ -885,12 +908,20 @@ function ExecutionResultScreen({
 // ─── exec log ────────────────────────────────────────────────────────────────
 
 interface ExecLogEntry {
+  /** Stable identity for dismissal. Auto-execute PREPENDS entries, so a list index
+   *  captured at render time shifts underneath a click and would remove the wrong row.
+   *  Optional because entries saved before this existed are read back from localStorage;
+   *  those are given an id on load so everything in state always has one. */
+  id?: string;
   ts: string;
   question: string;
   edgePercent: number;
   amount: number;
   result: ExecuteResponse;
 }
+
+const makeExecId = (): string =>
+  globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
 // ─── exec phase type ────────────────────────────────────────────────────────
 
@@ -901,24 +932,38 @@ type ExecPhase =
 
 // ─── main page ───────────────────────────────────────────────────────────────
 
-const ALL_CATEGORIES: Category[] = ['mlb', 'soccer', 'politics'];
+const ALL_CATEGORIES: Category[] = ['mlb', 'nfl', 'cfb', 'soccer', 'politics'];
 const COUNTDOWN_START = 10;
 // Responses come from a warm in-memory cache (~13 ms, ~36 KB gzipped), so polling is
 // bounded by how fast the server re-quotes rather than by request cost.
-const POLL_MS = 800;
+//
+// The server now re-quotes games in progress every 250ms, which made this poll the
+// dominant source of staleness: the price on screen could be a full poll behind even
+// though the server had fresher data sitting in memory. During a live game that gap is
+// exactly what makes a click arrive after the edge has gone, and the execution abort
+// (correctly) refuses to trade it. Polling faster costs a memory read per request.
+const POLL_MS = 350;
 
 export default function Home() {
   const [data, setData] = useState<OpportunitiesResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [lastFetch, setLastFetch] = useState<string | null>(null);
-  const [view, setView] = useState<'opportunities' | 'pairs'>('opportunities');
-  const [edgeFilter, setEdgeFilter] = useState<'all' | 'arb' | 'profit' | 'near'>('all');
+  // 'sports' is the default view: politics settles months out, so those markets dominate
+  // the list by count while being the least actionable day to day.
+  const [view, setView] = useState<'sports' | 'opportunities' | 'pairs'>('sports');
+  // Every listed opportunity is already profitable, so the bands narrow by size only.
+  const [edgeFilter, setEdgeFilter] = useState<'all' | 'strong' | 'arb'>('all');
   const [catFilter, setCatFilter] = useState<Category | 'all'>('all');
   const [pairsCatFilter, setPairsCatFilter] = useState<Category | 'all'>('all');
   const [amount, setAmount] = useState(100);
 
   // Persistence tracking: how many consecutive polls each opportunity has appeared in
-  const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
+  // Maps an opportunity to the timestamp it was FIRST seen. Previously this counted polls,
+// so the badge text grew with the poll rate ("Seen 9x" -> "Seen 10x") several times a
+// second, widening the badge and shifting everything beside it. A first-seen timestamp is
+// constant while the opportunity lives, so the value stops churning and the derived age is
+// correct regardless of how fast we poll.
+const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
 
   // Auto-exec state
   const [autoExec, setAutoExec] = useState(false);
@@ -944,6 +989,11 @@ export default function Home() {
   const executedPairs = useRef(new Set<string>());
   const isFetching = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
+  // `load` is a stable callback (empty dep list) so the poll interval is never torn down
+  // and rebuilt. It still needs to know which tab is open, to decide whether to ask for
+  // pairsDetail — a ref gives it the current value without making it a dependency.
+  const viewRef = useRef(view);
+  viewRef.current = view;
   const execLogLoaded = useRef(false);
 
   // Persist the execution log across refreshes/crashes — order history is a record
@@ -953,7 +1003,9 @@ export default function Home() {
   useEffect(() => {
     try {
       const saved = localStorage.getItem(EXEC_LOG_KEY);
-      if (saved) setExecLog(JSON.parse(saved) as ExecLogEntry[]);
+      // Backfill ids on history written before dismissal existed, so every entry in state
+      // can be addressed individually.
+      if (saved) setExecLog((JSON.parse(saved) as ExecLogEntry[]).map(e => ({ ...e, id: e.id ?? makeExecId() })));
     } catch { /* ignore corrupt/absent storage */ }
   }, []);
   useEffect(() => {
@@ -985,16 +1037,21 @@ export default function Home() {
     setExecPhase({ phase: 'result', opp, amount: betAmount, result });
     // Always log — successes AND failures — so a naked/failed leg is never silently dropped.
     setExecLog(prev => [{
+      id: makeExecId(),
       ts: new Date().toISOString(),
       question: opp.pair.polymarket.question,
       edgePercent: opp.edgePercent,
       amount: betAmount,
       result,
     }, ...prev].slice(0, 50));
-    // Re-arm auto-exec for this pair ONLY when the position is cleanly hedged. A naked,
-    // partial, or failed leg stays blocked so we never auto-fire a second order onto it.
+    // Re-arm when no position is at risk: a clean hedge, or a price-move abort where
+    // nothing was sent. A naked/partial/failed leg stays blocked so we never auto-fire a
+    // second order onto it. Backing out must not blacklist a pair for five minutes —
+    // the edge often returns within seconds.
     if (result.hedged) {
       setTimeout(() => executedPairs.current.delete(key), 5 * 60_000);
+    } else if (result.abortedOnPriceMove) {
+      setTimeout(() => executedPairs.current.delete(key), 10_000);
     }
   }, []);
 
@@ -1004,16 +1061,35 @@ export default function Home() {
     abortRef.current?.abort();
     abortRef.current = new AbortController();
     isFetching.current = true;
-    setLoading(true);
+    // Only a user-initiated Refresh shows the loading state. Background polls run every
+    // 350ms, and toggling it there swapped the button between "Refresh prices" and
+    // "Fetching live prices…" — two different widths — so the whole header reflowed about
+    // three times a second. The poll is meant to be invisible.
+    if (force) setLoading(true);
     try {
       // force -> ?fresh=1 makes the server rebuild from the venues and wait for it, so
       // Refresh shows the prices that are live right now and drops opportunities that
       // have already evaporated. cache:'no-store' stops the browser answering from its
       // own cache, which previously made Refresh look like it did nothing.
-      const res = await fetch(`/api/opportunities${force ? '?fresh=1' : ''}`, {
+      // pairsDetail is 93% of the payload and only the Matched Pairs tab renders it, so ask
+      // for it only when that tab is open. The tab LABEL uses stats.matchedPairs, which is
+      // always present, so the count stays correct without shipping the array.
+      const params = new URLSearchParams();
+      if (force) params.set('fresh', '1');
+      if (viewRef.current === 'pairs') params.set('pairs', '1');
+      const qs = params.toString();
+      const res = await fetch(`/api/opportunities${qs ? `?${qs}` : ''}`, {
         signal: abortRef.current.signal,
         cache: 'no-store',
       });
+      // A dev recompile (and any server error page) answers with HTML, not JSON. Parsing
+      // that threw `SyntaxError: Unexpected token '<'` and surfaced as a red overlay over
+      // an otherwise working app. Check before parsing and treat it as a transient miss —
+      // the next poll a few hundred ms later succeeds.
+      const contentType = res.headers.get('content-type') ?? '';
+      if (!res.ok || !contentType.includes('application/json')) {
+        return; // keep the last good data on screen
+      }
       const json = await res.json() as OpportunitiesResponse;
       setData(json);
       setLastFetch(new Date().toISOString());
@@ -1021,14 +1097,22 @@ export default function Home() {
         const next = new Map<string, number>();
         for (const opp of (json.opportunities ?? [])) {
           const k = `${opp.pair.polymarket.id}|${opp.pair.kalshi.id}`;
-          next.set(k, (prev.get(k) ?? 0) + 1);
+          next.set(k, prev.get(k) ?? Date.now());
         }
         return next;
       });
     } catch (e) {
-      if ((e as Error).name !== 'AbortError') console.error(e);
+      const err = e as Error;
+      // A dev-server recompile (or the cold-start window) drops the connection mid-flight
+      // and surfaces as `TypeError: Failed to fetch`. It is transient and the next poll
+      // 800ms later succeeds, so keep the last good data on screen and don't raise it to
+      // console.error — that painted a red overlay over a working app.
+      const transient = err.name === 'AbortError' ||
+        err instanceof SyntaxError ||
+        (err instanceof TypeError && /failed to fetch|load failed|networkerror/i.test(err.message));
+      if (!transient) console.error(err);
     } finally {
-      setLoading(false);
+      if (force) setLoading(false);
       isFetching.current = false;
     }
   }, []);
@@ -1041,6 +1125,12 @@ export default function Home() {
     const id = setInterval(() => load(), POLL_MS);
     return () => clearInterval(id);
   }, [load]);
+
+  // Switching to Matched Pairs changes what the request must ask for, so fetch straight
+  // away instead of waiting up to a poll for the tab to fill in.
+  useEffect(() => {
+    if (view === 'pairs') load();
+  }, [view, load]);
 
   // Auto-exec: queue a pending execution when a new qualifying opportunity appears
   useEffect(() => {
@@ -1109,17 +1199,27 @@ export default function Home() {
     executedPairs.current.add(`${opp.pair.polymarket.id}|${opp.pair.kalshi.id}`);
   }, []);
 
+  // Remove one row from the log. Dismissing is display-only — it does not cancel or undo
+  // an order that was actually placed; the position (if any) still stands at the venue.
+  const dismissExecEntry = useCallback((id: string | undefined) => {
+    if (!id) return;
+    setExecLog(prev => prev.filter(e => e.id !== id));
+  }, []);
+
   const handleCardExecuted = useCallback((opp: ArbitrageOpportunity, betAmount: number, result: ExecuteResponse) => {
     setExecLog(prev => [{
+      id: makeExecId(),
       ts: new Date().toISOString(),
       question: opp.pair.polymarket.question,
       edgePercent: opp.edgePercent,
       amount: betAmount,
       result,
     }, ...prev].slice(0, 50));
-    // Re-arm only when cleanly hedged; a naked/partial/failed leg stays blocked.
+    // Re-arm only when nothing is at risk; a naked/partial/failed leg stays blocked.
+    // A price-move abort sent no orders, so it clears quickly.
     const key = `${opp.pair.polymarket.id}|${opp.pair.kalshi.id}`;
     if (result.hedged) setTimeout(() => executedPairs.current.delete(key), 5 * 60_000);
+    else if (result.abortedOnPriceMove) setTimeout(() => executedPairs.current.delete(key), 10_000);
   }, []);
 
   // Derived values — MUST be computed before any early return below, or the hook
@@ -1127,25 +1227,51 @@ export default function Home() {
   // an execution screen shows.
   const opportunities = useMemo(() => data?.opportunities ?? [], [data]);
 
+  // Both opportunity tabs share the same controls and card list; only their scope differs.
+  const isOppView = view === 'sports' || view === 'opportunities';
+
+  // Politics can be selected on the All tab; carrying that choice into Sports would show
+  // an empty list with no matching chip to clear it, so drop back to "All".
+  useEffect(() => {
+    if (view === 'sports' && catFilter === 'politics') setCatFilter('all');
+  }, [view, catFilter]);
+
+  // The Sports view hides politics entirely; every count and filter below derives from
+  // this, so the tab is genuinely a separate list rather than a styling change.
+  const viewScoped = useMemo(
+    () => view === 'sports' ? opportunities.filter(o => o.pair.polymarket.category !== 'politics') : opportunities,
+    [opportunities, view]
+  );
+
   const catFiltered = useMemo(
-    () => catFilter === 'all' ? opportunities : opportunities.filter(o => o.pair.polymarket.category === catFilter),
-    [opportunities, catFilter]
+    () => catFilter === 'all' ? viewScoped : viewScoped.filter(o => o.pair.polymarket.category === catFilter),
+    [viewScoped, catFilter]
   );
 
   const filtered = useMemo(
-    () =>
-      edgeFilter === 'arb' ? catFiltered.filter(o => o.edgePercent >= 2) :
-      edgeFilter === 'profit' ? catFiltered.filter(o => o.edgePercent > 0) :
-      edgeFilter === 'near' ? catFiltered.filter(o => o.edgePercent > -1 && o.edgePercent <= 0) :
-      catFiltered,
+    () => {
+      const list =
+        edgeFilter === 'arb' ? catFiltered.filter(o => o.edgePercent >= 2) :
+        edgeFilter === 'strong' ? catFiltered.filter(o => o.edgePercent >= 1) :
+        catFiltered;
+      // The server sorts by exact edge, which changes on every reprice — two rows at 1.86%
+      // and 1.85% swapped places several times a second and the whole list visibly danced.
+      // Rank on a coarse bucket instead and break ties on a stable identity, so a card only
+      // moves when its edge changes by an amount actually worth noticing.
+      const key = (o: ArbitrageOpportunity) => `${o.pair.polymarket.id}|${o.pair.kalshi.id}`;
+      const bucket = (e: number) => Math.round(e * 4) / 4;   // 0.25% steps
+      return [...list].sort((a, b) => {
+        const d = bucket(b.edgePercent) - bucket(a.edgePercent);
+        return d !== 0 ? d : key(a).localeCompare(key(b));
+      });
+    },
     [catFiltered, edgeFilter]
   );
 
   const arbCount = useMemo(() => catFiltered.filter(o => o.edgePercent >= 2).length, [catFiltered]);
-  const profitCount = useMemo(() => catFiltered.filter(o => o.edgePercent > 0).length, [catFiltered]);
-  // "So close" band: unprofitable but within a point of flipping positive.
-  const nearCount = useMemo(() => catFiltered.filter(o => o.edgePercent > -1 && o.edgePercent <= 0).length, [catFiltered]);
-  const profitableCount = useMemo(() => opportunities.filter(o => o.edgePercent > 0).length, [opportunities]);
+  const strongCount = useMemo(() => catFiltered.filter(o => o.edgePercent >= 1).length, [catFiltered]);
+  // Scoped to the active tab so the Sports view never reports politics in its totals.
+  const profitableCount = useMemo(() => viewScoped.filter(o => o.edgePercent > 0).length, [viewScoped]);
   // Quotes older than ~20s are worth flagging: at prediction-market speed an edge can be
   // gone by then, which is exactly the "site says arb, venue disagrees" complaint.
   // Quote age is derived from the server's builtAt stamp rather than a per-request
@@ -1185,7 +1311,7 @@ export default function Home() {
         <div>
           <h1 className="text-2xl font-bold tracking-tight">Arb Finder</h1>
           <p className="text-sm text-[--text-muted] mt-1">
-            Kalshi × Polymarket · MLB · Soccer · Politics
+            Kalshi × Polymarket · MLB · NFL · CFB · Soccer · Politics
           </p>
         </div>
         <div className="flex items-center gap-3 flex-shrink-0 flex-wrap">
@@ -1203,20 +1329,29 @@ export default function Home() {
 
       {/* View tabs */}
       <div className="flex gap-1 mb-5 p-1 rounded-xl w-fit" style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}>
-        {(['opportunities', 'pairs'] as const).map(v => (
-          <button
-            key={v}
-            onClick={() => setView(v)}
-            style={{
-              background: view === v ? 'var(--card)' : 'transparent',
-              color: view === v ? 'var(--foreground)' : 'var(--text-muted)',
-              border: view === v ? '1px solid var(--border)' : '1px solid transparent',
-            }}
-            className="px-4 py-1.5 rounded-lg text-sm font-medium transition-colors"
-          >
-            {v === 'opportunities' ? `Opportunities${data ? ` (${data.opportunities.length})` : ''}` : `Matched Pairs${data ? ` (${data.pairsDetail?.length ?? 0})` : ''}`}
-          </button>
-        ))}
+        {(['sports', 'opportunities', 'pairs'] as const).map(v => {
+          const sportsCount = data ? data.opportunities.filter(o => o.pair.polymarket.category !== 'politics').length : 0;
+          const label =
+            v === 'sports' ? `Sports${data ? ` (${sportsCount})` : ''}` :
+            v === 'opportunities' ? `All${data ? ` (${data.opportunities.length})` : ''}` :
+            // stats.matchedPairs is always sent; pairsDetail only when this tab is open.
+            `Matched Pairs${data ? ` (${data.stats?.matchedPairs ?? 0})` : ''}`;
+          return (
+            <button
+              key={v}
+              onClick={() => setView(v)}
+              title={v === 'sports' ? 'MLB, NFL, CFB and soccer — politics excluded' : undefined}
+              style={{
+                background: view === v ? 'var(--card)' : 'transparent',
+                color: view === v ? 'var(--foreground)' : 'var(--text-muted)',
+                border: view === v ? '1px solid var(--border)' : '1px solid transparent',
+              }}
+              className="px-4 py-1.5 rounded-lg text-sm font-medium transition-colors"
+            >
+              {label}
+            </button>
+          );
+        })}
       </div>
 
       {/* Controls bar */}
@@ -1370,7 +1505,10 @@ export default function Home() {
         >
           {([
             { label: 'Kalshi', r: connTest.result.kalshi, detail: connTest.result.kalshi.ok ? `balance $${connTest.result.kalshi.balanceDollars?.toFixed(2) ?? '?'}` : connTest.result.kalshi.error },
-            { label: 'Polymarket', r: connTest.result.polymarket, detail: connTest.result.polymarket.ok ? `USDC $${connTest.result.polymarket.usdcBalance?.toFixed(2) ?? '?'} · allowance $${connTest.result.polymarket.usdcAllowance?.toFixed(2) ?? '?'}` : connTest.result.polymarket.error },
+            // Name the wallet the balance was read FROM. A bare "$0.00" gave no way to tell
+            // an unfunded account apart from one pointed at the wrong address — which is
+            // exactly what happened when a real deposit landed in a different wallet.
+            { label: 'Polymarket', r: connTest.result.polymarket, detail: connTest.result.polymarket.ok ? `PUSD ${connTest.result.polymarket.usdcBalance?.toFixed(2) ?? '?'} · approvals ${connTest.result.polymarket.approvalsReady === undefined ? 'unknown' : connTest.result.polymarket.approvalsReady ? 'ready' : 'MISSING'} · wallet ${connTest.result.polymarket.funderAddress ?? connTest.result.polymarket.address ?? '?'}` : connTest.result.polymarket.error },
           ] as const).map(({ label, r, detail }) => (
             <div key={label} className="flex items-start gap-2 text-xs font-mono">
               <span style={{ color: r.ok ? '#4ade80' : '#f87171' }} className="flex-shrink-0 font-bold">
@@ -1379,9 +1517,9 @@ export default function Home() {
               <span style={{ color: 'var(--text-muted)' }} className="break-all">{detail}</span>
             </div>
           ))}
-          {connTest.result.polymarket.ok && (connTest.result.polymarket.usdcAllowance ?? 0) === 0 && (connTest.result.polymarket.usdcBalance ?? 0) > 0 && (
-            <p className="text-xs" style={{ color: '#fbbf24' }}>
-              USDC present but exchange allowance is 0 — approve once via a small trade on the Polymarket website, then re-test.
+          {connTest.result.polymarket.diagnosis && (
+            <p className="text-xs leading-relaxed" style={{ color: '#fbbf24' }}>
+              {connTest.result.polymarket.diagnosis}
             </p>
           )}
         </div>
@@ -1396,9 +1534,9 @@ export default function Home() {
           {[
             { label: 'PM markets', val: data.stats.pmMarkets },
             { label: 'Kalshi markets', val: data.stats.kalshiMarkets },
-            { label: 'Tracked (incl. near-miss)', val: opportunities.length },
+            { label: 'Tracked (incl. near-miss)', val: viewScoped.length },
             { label: 'Profitable (>0%)', val: profitableCount, highlight: profitableCount > 0 },
-            { label: 'True arb (≥2%)', val: opportunities.filter(o => o.edgePercent >= 2).length, highlight: opportunities.filter(o => o.edgePercent >= 2).length > 0 },
+            { label: 'True arb (≥2%)', val: viewScoped.filter(o => o.edgePercent >= 2).length, highlight: viewScoped.filter(o => o.edgePercent >= 2).length > 0 },
           ].map(({ label, val, highlight }) => (
             <div key={label}>
               <p className="text-xs text-[--text-muted]">{label}</p>
@@ -1439,9 +1577,10 @@ export default function Home() {
         </div>
       )}
 
-      {/* Category filter — opportunities view only */}
-      {view === 'opportunities' && <div className="flex gap-2 mb-3 flex-wrap">
-        {(['all', ...ALL_CATEGORIES] as const).map(cat => {
+      {/* Category filter — opportunity views only. The Sports tab drops the Politics chip
+          so the choices match what the tab can actually show. */}
+      {isOppView && <div className="flex gap-2 mb-3 flex-wrap">
+        {(['all', ...(view === 'sports' ? ALL_CATEGORIES.filter(c => c !== 'politics') : ALL_CATEGORIES)] as const).map(cat => {
           const isActive = catFilter === cat;
           const c = cat !== 'all' ? CATEGORY_COLORS[cat] : null;
           return (
@@ -1462,8 +1601,8 @@ export default function Home() {
       </div>}
 
       {/* Edge filter — opportunities view only */}
-      {view === 'opportunities' && <div className="flex gap-2 mb-5 flex-wrap">
-        {(['all', 'profit', 'arb', 'near'] as const).map(f => (
+      {isOppView && <div className="flex gap-2 mb-5 flex-wrap">
+        {(['all', 'strong', 'arb'] as const).map(f => (
           <button
             key={f}
             onClick={() => setEdgeFilter(f)}
@@ -1474,20 +1613,22 @@ export default function Home() {
             }}
             className="px-4 py-1.5 rounded-full text-sm font-medium transition-colors"
           >
-            {f === 'all' ? `All (${catFiltered.length})` :
-             f === 'profit' ? `Profitable (${profitCount})` :
-             f === 'arb' ? `True arb ≥2% (${arbCount})` :
-             `So close −1–0% (${nearCount})`}
+            {f === 'all' ? `All profitable (${catFiltered.length})` :
+             f === 'strong' ? `≥1% (${strongCount})` :
+             `≥2% (${arbCount})`}
           </button>
         ))}
       </div>}
 
       {/* Content */}
-      {loading && !data && (
+      {/* `warming` means the server answered instantly with a placeholder while its cold
+          discovery runs, so keep showing the spinner rather than "no edge found" — the
+          poll picks up real data the moment the build lands. */}
+      {(!data || data.warming) && (
         <div className="flex flex-col items-center justify-center py-24 gap-4">
           <div className="w-8 h-8 border-2 border-[--border] border-t-[--pm-light] rounded-full animate-spin" />
           <p className="text-sm text-[--text-muted]">Fetching markets across all categories…</p>
-          <p className="text-xs text-[--text-muted]">This takes 3–6s on first load</p>
+          <p className="text-xs text-[--text-muted]">First load pages every open market on both venues — up to ~20s</p>
         </div>
       )}
 
@@ -1501,19 +1642,21 @@ export default function Home() {
         </div>
       )}
 
-      {view === 'opportunities' && (
+      {isOppView && (
         <>
-          {data && !loading && filtered.length === 0 && (
+          {data && !data.warming && filtered.length === 0 && (
             <div className="py-16 text-center">
               <p className="text-[--text-muted]">
                 {edgeFilter === 'all'
-                  ? 'No matched markets right now.'
-                  : edgeFilter === 'profit'
-                  ? `No profitable edge right now — ${catFiltered.length} market${catFiltered.length === 1 ? '' : 's'} tracked. Switch to "All" to see how close they are.`
-                  : edgeFilter === 'arb'
-                  ? `No ≥2% arb right now — ${catFiltered.length} tracked.`
-                  : `Nothing in the −1–0% band right now — ${catFiltered.length} tracked.`}
+                  ? 'No profitable edge right now.'
+                  : `Nothing at ${edgeFilter === 'arb' ? '≥2%' : '≥1%'} right now — ${catFiltered.length} profitable market${catFiltered.length === 1 ? '' : 's'} listed.`}
               </p>
+              {edgeFilter === 'all' && (
+                <p className="text-xs mt-2" style={{ color: 'var(--text-muted)' }}>
+                  {data.stats.matchedPairs} markets are being tracked and re-priced about once a second.
+                  Only trades that profit after fees are listed here — see Matched Pairs for everything being watched.
+                </p>
+              )}
             </div>
           )}
           <div className="flex flex-col gap-4">
@@ -1525,7 +1668,7 @@ export default function Home() {
                   opp={opp}
                   amount={amount}
                   bankroll={bankroll}
-                  persistence={persistMap.get(k) ?? 1}
+                  firstSeenAt={persistMap.get(k) ?? Date.now()}
                   onUseKelly={setAmount}
                   onExecuted={handleCardExecuted}
                   onExecuteStart={handleExecuteStart}
@@ -1578,12 +1721,14 @@ export default function Home() {
           <div className="flex flex-col gap-2">
             {execLog.map((entry, i) => (
               <div
-                key={`${entry.ts}-${i}`}
+                key={entry.id ?? `${entry.ts}-${i}`}
                 style={{
                   background: 'var(--surface)',
                   border: `1px solid ${entry.result.hedged ? '#16a34a44' : '#f8717144'}`,
                 }}
-                className="rounded-lg px-4 py-3 flex items-center justify-between gap-4 flex-wrap"
+                // `group` drives the dismiss button's hover reveal; `pr-9` reserves room for
+                // it so it never sits on top of the KAL/PM status text.
+                className="group relative rounded-lg pl-4 pr-9 py-3 flex items-center justify-between gap-4 flex-wrap"
               >
                 <div className="flex flex-col gap-0.5 min-w-0">
                   <p className="text-xs font-medium truncate">{entry.question}</p>
@@ -1599,6 +1744,20 @@ export default function Home() {
                     PM {entry.result.polymarket.ok ? `✓ ${entry.result.polymarket.orderId?.slice(0, 8)}` : `✗ ${entry.result.polymarket.error?.slice(0, 30)}`}
                   </span>
                 </div>
+                {/* Hidden until the row is hovered, per the request — but also revealed on
+                    keyboard focus, otherwise the control is unreachable without a mouse. */}
+                <button
+                  type="button"
+                  onClick={() => dismissExecEntry(entry.id)}
+                  aria-label="Remove this entry from the log"
+                  title="Remove from log (does not cancel the order)"
+                  className="absolute top-2 right-2 w-5 h-5 flex items-center justify-center rounded
+                             text-sm leading-none text-[--text-muted]
+                             opacity-0 group-hover:opacity-100 focus-visible:opacity-100
+                             hover:text-white hover:bg-white/10 transition-opacity cursor-pointer"
+                >
+                  ×
+                </button>
               </div>
             ))}
           </div>
