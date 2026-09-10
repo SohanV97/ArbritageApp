@@ -56,6 +56,13 @@ export interface PolymarketAuthTest {
   onChainUsdc?: number;
   /** False when the wallet still needs its one-time trading approvals. */
   approvalsReady?: boolean;
+  /**
+   * False when the signing key is not the wallet's owner, so orders will be rejected however
+   * healthy everything else looks. Reading a balance only proves the key can authenticate.
+   */
+  canSignOrders?: boolean;
+  /** The address that actually controls the funder wallet, read from the proxy on-chain. */
+  walletOwner?: string;
   /** Plain-language explanation when something is off, rather than a silent zero. */
   diagnosis?: string;
   error?: string;
@@ -86,6 +93,37 @@ async function erc20Balance(token: string, address: string): Promise<number | un
       const j = await res.json() as { result?: string; error?: unknown };
       if (j.error || !j.result || j.result === '0x') continue;
       return Number(BigInt(j.result)) / 1e6;   // PUSD and USDC.e are both 6-decimal
+    } catch { /* try the next endpoint */ }
+  }
+  return undefined;
+}
+
+/**
+ * Who actually controls a Polymarket Deposit Wallet.
+ *
+ * These wallets are EIP-1167 minimal proxies with the controlling address appended to the
+ * runtime bytecode, so ownership can be read straight from the chain without trusting any
+ * API. This matters because a key that is merely a SESSION KEY on the wallet authenticates
+ * fine and reads balances fine — it just cannot sign orders, and the venue only says so at
+ * order time, with "the order signer address has to be the address of the API KEY".
+ */
+async function walletOwnerOnChain(address: string): Promise<string | undefined> {
+  if (!/^0x[0-9a-fA-F]{40}$/.test(address)) return undefined;
+  for (const url of POLYGON_RPCS) {
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getCode', params: [address, 'latest'] }),
+      });
+      if (!res.ok) continue;
+      const j = await res.json() as { result?: string };
+      const code = j.result;
+      if (!code || code === '0x') return undefined;      // an EOA controls itself
+      const tail = code.slice(-64);
+      if (!/^0{24}[0-9a-fA-F]{40}$/.test(tail)) return undefined;
+      const owner = '0x' + tail.slice(24);
+      return /^0x0+$/.test(owner) ? undefined : owner;
     } catch { /* try the next endpoint */ }
   }
   return undefined;
@@ -161,9 +199,27 @@ function describeError(err: unknown): string {
   catch { return String(err); }
 }
 
+/**
+ * The venue reports a signer/API-key mismatch as free text, and the wording gives no hint
+ * what to do about it. It means the signing key is not the wallet's owner — typically a
+ * session key, which authenticates and reads balances but cannot sign orders.
+ */
+function explainSignerMismatch(raw: string): string | undefined {
+  if (!/signer address has to be the address of the api key/i.test(raw)) return undefined;
+  return `${raw}
+
+This key is not the owner of POLYMARKET_FUNDER_ADDRESS — it is only a ` +
+    `session key on that wallet, which is why it can read the balance but cannot sign orders. ` +
+    `Run "npm run check:wallet": it prints which address the key controls, which address owns ` +
+    `the wallet, and whether they match. Fix it by exporting the private key for the owning ` +
+    `address from Polymarket (Settings → Export Private Key).`;
+}
+
 // The venue rejects with a machine-readable code; turn the ones a trader can act on into
 // instructions rather than passing the bare enum through to the UI.
 function mapOrderError(code: string, message: string): string {
+  const mismatch = explainSignerMismatch(message);
+  if (mismatch) return mismatch;
   switch (code) {
     case 'insufficient_balance_or_allowance':
       return `${message} — either the wallet is short of collateral, or it has not granted the ` +
@@ -217,9 +273,30 @@ export async function testPolymarketAuth(): Promise<PolymarketAuthTest> {
       approvalsReady = state?.isFullyApproved === true;
     } catch { approvalsReady = undefined; }
 
+    // Can this key actually sign orders, or does it merely authenticate?
+    //
+    // A key that is only a SESSION KEY on the wallet passes every check above: it builds a
+    // client, reads the balance, and reports a healthy account — then every order is
+    // rejected with "the order signer address has to be the address of the API KEY". That
+    // is the venue saying the signer is not the wallet's owner, and it only says it at
+    // order time. Comparing the signer against the proxy's on-chain controller catches it
+    // here, before a trade is attempted.
+    const walletOwner = await walletOwnerOnChain(init.wallet);
+    const canSignOrders = walletOwner === undefined
+      ? undefined                                     // not a proxy, or the chain read failed
+      : walletOwner.toLowerCase() === init.address.toLowerCase();
+
     const balance = onChainUsdc ?? 0;
     let diagnosis: string | undefined;
-    if (balance === 0) {
+    if (canSignOrders === false) {
+      diagnosis =
+        `POLYMARKET_PRIVATE_KEY belongs to ${init.address}, but ${init.wallet} is controlled by ` +
+        `${walletOwner}. The key can authenticate and read the $${balance.toFixed(2)} balance, yet ` +
+        `every order will be rejected ("the order signer address has to be the address of the API ` +
+        `KEY") because it is only a session key on this wallet. Export the private key for ` +
+        `${walletOwner} from Polymarket (Settings → Export Private Key) and set it as ` +
+        `POLYMARKET_PRIVATE_KEY. Verify with "npm run check:wallet" before trading.`;
+    } else if (balance === 0) {
       diagnosis =
         `No collateral at ${init.wallet}. Polymarket settles in PUSD (0xC011a7E1…) — check that ` +
         `POLYMARKET_FUNDER_ADDRESS is the wallet Polymarket shows for your account, and that the ` +
@@ -227,13 +304,18 @@ export async function testPolymarketAuth(): Promise<PolymarketAuthTest> {
     }
 
     return {
-      ok: true,
+      // A key that cannot sign orders is not a working connection, however much it can read.
+      // Reporting ok here is what let a broken setup look green right up to the first trade.
+      ok: canSignOrders !== false,
       address: init.address,
       funderAddress: init.wallet,
       usdcBalance: balance,
       onChainUsdc,
       approvalsReady,
+      canSignOrders,
+      walletOwner,
       diagnosis,
+      error: canSignOrders === false ? 'Signing key is not this wallet\'s owner — orders will be rejected' : undefined,
     };
   } catch (err) {
     return { ok: false, error: describeError(err) };
@@ -273,7 +355,8 @@ export async function placePolymarketOrder(req: PolymarketOrderRequest): Promise
       filledCount: Number.isFinite(filled) ? filled : undefined,
     };
   } catch (err) {
-    return { ok: false, error: describeError(err) };
+    const raw = describeError(err);
+    return { ok: false, error: explainSignerMismatch(raw) ?? raw };
   }
 }
 

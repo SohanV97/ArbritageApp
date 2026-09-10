@@ -1457,7 +1457,12 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
             // Name the wallet the balance was read FROM. A bare "$0.00" gave no way to tell
             // an unfunded account apart from one pointed at the wrong address — which is
             // exactly what happened when a real deposit landed in a different wallet.
-            { label: 'Polymarket', r: connTest.result.polymarket, detail: connTest.result.polymarket.ok ? `PUSD ${connTest.result.polymarket.usdcBalance?.toFixed(2) ?? '?'} · approvals ${connTest.result.polymarket.approvalsReady === undefined ? 'unknown' : connTest.result.polymarket.approvalsReady ? 'ready' : 'n/a (deposit wallet)'} · wallet ${connTest.result.polymarket.funderAddress ?? connTest.result.polymarket.address ?? '?'}` : connTest.result.polymarket.error },
+            // Keep the balance and wallet on screen even when the check fails: a key that
+            // cannot sign orders still reports a real balance, and hiding it makes a signing
+            // problem look like a funding problem.
+            { label: 'Polymarket', r: connTest.result.polymarket, detail: connTest.result.polymarket.usdcBalance !== undefined
+              ? `PUSD $${connTest.result.polymarket.usdcBalance.toFixed(2)} · wallet ${connTest.result.polymarket.funderAddress ?? connTest.result.polymarket.address ?? '?'}${connTest.result.polymarket.canSignOrders === false ? ' · CANNOT SIGN ORDERS' : ''}`
+              : connTest.result.polymarket.error },
           ] as const).map(({ label, r, detail }) => (
             <div key={label} className="flex items-start gap-2 text-xs font-mono">
               <span style={{ color: r.ok ? '#4ade80' : '#f87171' }} className="flex-shrink-0 font-bold">

@@ -43,11 +43,31 @@ const mod = await import(pathToFileURL(path.join(root, 'api', 'polymarket-tradin
 // ── 1. account is reachable and funded ───────────────────────────────────────
 const auth = await mod.testPolymarketAuth();
 if (!auth.ok) {
-  console.error(`\nCannot reach the account: ${auth.error}\n`);
+  // A failure with a diagnosis has already worked out what is wrong and how to fix it;
+  // printing only the one-line error throws that away and leaves nothing to act on.
+  console.error(`\n${auth.error ?? 'Cannot reach the account.'}`);
+  if (auth.address) console.error(`\n  key controls   ${auth.address}`);
+  if (auth.funderAddress) console.error(`  funder wallet  ${auth.funderAddress}`);
+  if (auth.walletOwner) console.error(`  owned by       ${auth.walletOwner}`);
+  if (auth.diagnosis) console.error(`\n${auth.diagnosis}`);
+  console.error('');
   process.exit(2);
 }
-console.log(`\nwallet   ${auth.funderAddress}`);
+console.log(`\nsigner   ${auth.address}`);
+console.log(`wallet   ${auth.funderAddress}${auth.walletOwner ? `  (owned by ${auth.walletOwner})` : ''}`);
 console.log(`balance  $${(auth.usdcBalance ?? 0).toFixed(2)}`);
+
+// Check this before touching a market. A key that only authenticates gets all the way to
+// the order and is rejected there, which reads as a broken order path rather than a wrong
+// key — the venue's wording ("the order signer address has to be the address of the API
+// KEY") does not say which key it means, or that a session key is the problem.
+if (auth.canSignOrders === false) {
+  console.error(`\nThis key cannot sign orders for that wallet.\n\n${auth.diagnosis}\n`);
+  process.exit(2);
+}
+if (auth.canSignOrders === undefined) {
+  console.log('owner    (could not read the wallet owner on-chain — proceeding)');
+}
 if ((auth.usdcBalance ?? 0) < 1) {
   console.error('\nNeeds at least $1 to place even a probe order.\n');
   process.exit(2);
