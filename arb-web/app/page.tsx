@@ -993,7 +993,7 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
     // the edge often returns within seconds.
     if (result.hedged) {
       setTimeout(() => executedPairs.current.delete(key), 5 * 60_000);
-    } else if (result.abortedOnPriceMove) {
+    } else if (result.noOrdersSent) {
       setTimeout(() => executedPairs.current.delete(key), 10_000);
     }
   }, []);
@@ -1138,7 +1138,7 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
     // A price-move abort sent no orders, so it clears quickly.
     const key = `${opp.pair.polymarket.id}|${opp.pair.kalshi.id}`;
     if (result.hedged) setTimeout(() => executedPairs.current.delete(key), 5 * 60_000);
-    else if (result.abortedOnPriceMove) setTimeout(() => executedPairs.current.delete(key), 10_000);
+    else if (result.noOrdersSent) setTimeout(() => executedPairs.current.delete(key), 10_000);
   }, []);
 
   // Derived values — MUST be computed before any early return below, or the hook

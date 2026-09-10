@@ -28,6 +28,13 @@ export interface ExecuteResponse {
   hedgeNote?: string;   // explanation whenever the position is not a clean hedge (naked-leg warning)
   /** true when the pre-order price re-check refused to trade (nothing was sent). */
   abortedOnPriceMove?: boolean;
+  /**
+   * true when the request was refused before either order was sent, for any reason.
+   * The client uses this to re-arm the pair: nothing is at risk, so blocking it would
+   * discard edges that are still there — an underfunded venue, for instance, becomes
+   * tradeable the moment it is topped up.
+   */
+  noOrdersSent?: boolean;
   /** ms spent re-quoting both venues immediately before ordering. */
   revalidateMs?: number;
   /** edge the client was showing vs. the edge at the moment of execution. */
@@ -222,6 +229,7 @@ export async function POST(request: Request): Promise<Response> {
       bothOk: false,
       hedged: false,
       abortedOnPriceMove: true,
+      noOrdersSent: true,
       revalidateMs,
       quotedEdgePercent,
       freshEdgePercent,
@@ -253,6 +261,7 @@ export async function POST(request: Request): Promise<Response> {
       bothOk: false,
       hedged: false,
       abortedOnPriceMove: true,
+      noOrdersSent: true,
       revalidateMs,
       quotedEdgePercent,
       freshEdgePercent,
@@ -290,6 +299,7 @@ export async function POST(request: Request): Promise<Response> {
       executedAt: new Date().toISOString(),
       bothOk: false,
       hedged: false,
+      noOrdersSent: true,
       revalidateMs,
       quotedEdgePercent,
       freshEdgePercent,
