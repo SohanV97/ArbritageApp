@@ -204,9 +204,13 @@ export async function testPolymarketAuth(): Promise<PolymarketAuthTest> {
   try {
     const onChainUsdc = await onChainCollateral(init.wallet);
 
-    // The exchange cannot move collateral until the wallet grants it permission. This is a
-    // one-time on-chain setup that the website does for you; without it a funded account
-    // still cannot trade, and the order rejection alone does not say so.
+    // Reports whether the wallet has granted the exchange ERC-20/ERC-1155 permissions.
+    //
+    // Do NOT treat false as "cannot trade". This was verified against a live account: a
+    // Polymarket Deposit Wallet traded successfully with every one of these approvals reading
+    // zero on-chain. Deposit wallets are proxy contracts the exchange moves funds through
+    // directly, authorized by the signer — the allowance model applies to plain EOA accounts.
+    // Reported for diagnostics only; nothing gates on it.
     let approvalsReady: boolean | undefined;
     try {
       const state = await init.client.fetchTradingApprovalsState();
@@ -220,14 +224,6 @@ export async function testPolymarketAuth(): Promise<PolymarketAuthTest> {
         `No collateral at ${init.wallet}. Polymarket settles in PUSD (0xC011a7E1…) — check that ` +
         `POLYMARKET_FUNDER_ADDRESS is the wallet Polymarket shows for your account, and that the ` +
         `deposit has landed there.`;
-    } else if (approvalsReady === false) {
-      diagnosis =
-        `$${balance.toFixed(2)} is available at ${init.wallet}, but the wallet has not granted the ` +
-        `exchange permission to move it, so every order will be rejected. Granting it is an ` +
-        `on-chain transaction, and this wallet has no MATIC to pay for one — so the simplest fix ` +
-        `is to place one small trade on polymarket.com, which sets exactly these approvals ` +
-        `through their own relayer. This app picks them up automatically afterwards. ` +
-        `("npm run setup:approvals" does the same thing, but only if you hold a Relayer API key.)`;
     }
 
     return {

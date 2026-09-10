@@ -267,6 +267,39 @@ export async function POST(request: Request): Promise<Response> {
   // is what makes the position hedged; sending the full size would fill them unevenly.
   const plannedContracts = Math.min(contracts, fill.contracts);
 
+  // Both legs must be affordable BEFORE either is sent. The legs fire in parallel, so an
+  // underfunded venue does not fail cleanly: its leg is rejected while the other one fills,
+  // leaving exactly the naked, unhedged position this app exists to avoid. Checking after
+  // the fact is too late — the money is already committed.
+  const kalCostCents = freshKalPrice * plannedContracts;
+  const pmCostCents = freshPmPrice * plannedContracts;
+  const [kalAuth, pmAuth] = await Promise.all([testKalshiAuth(), testPolymarketAuth()]);
+  const kalFunds = (kalAuth.balanceDollars ?? 0) * 100;
+  const pmFunds = (pmAuth.usdcBalance ?? 0) * 100;
+  const shortfalls: string[] = [];
+  if (kalFunds < kalCostCents) {
+    shortfalls.push(`Kalshi has $${(kalFunds / 100).toFixed(2)} but this leg costs $${(kalCostCents / 100).toFixed(2)}`);
+  }
+  if (pmFunds < pmCostCents) {
+    shortfalls.push(`Polymarket has $${(pmFunds / 100).toFixed(2)} but this leg costs $${(pmCostCents / 100).toFixed(2)}`);
+  }
+  if (shortfalls.length > 0) {
+    const body: ExecuteResponse = {
+      kalshi: { ok: false, error: 'Not placed — insufficient funds' },
+      polymarket: { ok: false, error: 'Not placed — insufficient funds' },
+      executedAt: new Date().toISOString(),
+      bothOk: false,
+      hedged: false,
+      revalidateMs,
+      quotedEdgePercent,
+      freshEdgePercent,
+      hedgeNote: `No orders were sent. ${shortfalls.join('; ')}. Both venues must cover their own ` +
+        `leg — funding only one would fill that side alone and leave it unhedged.`,
+    };
+    console.log('[execute] aborted on funding', JSON.stringify({ ticker: kalshiTicker, shortfalls }));
+    return NextResponse.json(body, { status: 409 });
+  }
+
   // Place both legs simultaneously — this minimizes price-movement risk between legs.
   // Limits are the FRESH prices, so a market that moved is quoted at what it is now
   // rather than at a stale price that would simply fail to fill.
