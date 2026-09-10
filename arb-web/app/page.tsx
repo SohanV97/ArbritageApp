@@ -1164,6 +1164,7 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
   // an execution screen shows.
   const opportunities = useMemo(() => data?.opportunities ?? [], [data]);
 
+
   // Both opportunity tabs share the same controls and card list; only their scope differs.
   const isOppView = view === 'sports' || view === 'opportunities';
 
@@ -1204,6 +1205,14 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
     },
     [catFiltered, edgeFilter]
   );
+
+  // Profitable edges that exist but are not on screen, because of the tab or the
+  // category/edge filters. Drives the empty-state hint below.
+  const hiddenElsewhere = useMemo(
+    () => opportunities.length - filtered.length,
+    [opportunities, filtered],
+  );
+
 
   const arbCount = useMemo(() => catFiltered.filter(o => o.edgePercent >= 2).length, [catFiltered]);
   const strongCount = useMemo(() => catFiltered.filter(o => o.edgePercent >= 1).length, [catFiltered]);
@@ -1591,6 +1600,16 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
                   ? 'No profitable edge right now.'
                   : `Nothing at ${edgeFilter === 'arb' ? '≥2%' : '≥1%'} right now — ${catFiltered.length} profitable market${catFiltered.length === 1 ? '' : 's'} listed.`}
               </p>
+              {/* An empty list is ambiguous: it looks identical whether nothing exists or
+                  the current tab simply hides what does. Sports is the default tab and
+                  excludes politics, so a session can show nothing for half an hour while
+                  live edges sit one tab away. Say where they are. */}
+              {hiddenElsewhere > 0 && (
+                <p className="text-xs mt-2 font-medium" style={{ color: '#fbbf24' }}>
+                  {hiddenElsewhere} profitable edge{hiddenElsewhere === 1 ? '' : 's'} {hiddenElsewhere === 1 ? 'is' : 'are'} hidden by the current tab or filter
+                  {view === 'sports' && ' — politics is excluded from Sports; check the All tab'}.
+                </p>
+              )}
               {edgeFilter === 'all' && (
                 <p className="text-xs mt-2" style={{ color: 'var(--text-muted)' }}>
                   {data.stats.matchedPairs} markets are being tracked and re-priced about once a second.
