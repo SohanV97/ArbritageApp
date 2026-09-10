@@ -327,3 +327,18 @@ export async function setupPolymarketApprovals(): Promise<{ ok: boolean; already
     return { ok: false, error: msg };
   }
 }
+
+/**
+ * Cancels a resting order. Needed whenever an order is placed that must not be left on the
+ * book — a hedge whose other leg failed, or a deliberately unfillable probe order.
+ */
+export async function cancelPolymarketOrder(orderId: string): Promise<{ ok: boolean; error?: string }> {
+  const init = await getSecureClient();
+  if ('error' in init) return { ok: false, error: init.error };
+  try {
+    await init.client.cancelOrder({ orderId });
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: describeError(err) };
+  }
+}
