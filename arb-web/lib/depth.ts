@@ -180,3 +180,40 @@ export function polymarketAskLadder(
   }
   return out.sort((x, y) => x.priceCents - y.priceCents);
 }
+
+/**
+ * Is a quoted price backed by enough size to actually trade?
+ *
+ * Kalshi's top-of-book ask can be set by a resting order of 0.01 contracts, and its
+ * `/markets` quote reports that dust price as the ask. Observed live on NYM/NYY: the YES
+ * bid was $0.40 for 0.01 contracts, so NO was quoted at 60c, while the best bid carrying
+ * real size was $0.32 — eight cents worse. Costing a trade off the dust price manufactures
+ * an edge that vanishes the moment anyone tries to take it, which is exactly what produced
+ * repeated "backed out — 0 contracts fillable" aborts on markets that looked profitable.
+ *
+ * Undefined depth means the venue did not report a size, which is not the same as reporting
+ * a small one — treat it as usable rather than silently dropping every such market.
+ */
+export function quoteIsTradeable(depthContracts: number | undefined, minContracts: number): boolean {
+  if (depthContracts === undefined || !Number.isFinite(depthContracts)) return true;
+  return depthContracts >= minContracts;
+}
+
+/**
+ * The limit price that fills `contracts` by walking a ladder — the price of the deepest
+ * level the order reaches, so a marketable limit set here crosses every level it needs.
+ *
+ * Returns null when the ladder cannot supply that many contracts, which must abort the
+ * trade rather than quietly send a smaller or unfillable order.
+ */
+export function priceForSize(ladder: AskLevel[], contracts: number): number | null {
+  if (!Array.isArray(ladder) || ladder.length === 0) return null;
+  if (!Number.isFinite(contracts) || contracts <= 0) return null;
+  const sorted = [...ladder].sort((a, b) => a.priceCents - b.priceCents);
+  let remaining = contracts;
+  for (const level of sorted) {
+    remaining -= level.size;
+    if (remaining <= 0) return level.priceCents;
+  }
+  return null;
+}

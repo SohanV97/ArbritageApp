@@ -245,7 +245,12 @@ function applyDepth(opps: ArbitrageOpportunity[]): void {
   for (const o of opps) {
     const kalLeg = o.legA.venue === 'kalshi' ? o.legA : o.legB;
     const measured = _depthByKey.get(depthKey(o.pair.kalshi.symbol ?? '', kalLeg.side));
-    o.maxContracts = measured;
+    // Only overwrite once a real measurement exists. Assigning `measured` unconditionally
+    // replaced Kalshi's own reported size with undefined for every not-yet-measured pair,
+    // and undefined passes the tradeable filter below — so a quote resting on 0.01
+    // contracts was published as an opportunity with no depth limit at all, right up until
+    // the execute path measured the books and refused it.
+    if (measured !== undefined) o.maxContracts = measured;
   }
 }
 

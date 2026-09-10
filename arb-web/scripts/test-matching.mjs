@@ -560,6 +560,36 @@ const rNaNDepth = sizeByRisk({ riskDollars: 100, legAPriceCents: 45, legBPriceCe
 check('[size] a NaN depth does not shrink the size', rNaNDepth.contracts === 103, JSON.stringify(rNaNDepth));
 
 
+// ─── dust quotes and ladder limit prices ─────────────────────────────────────
+const { quoteIsTradeable, priceForSize } = await import('../lib/depth.ts');
+
+// Kalshi quotes a top-of-book price backed by as little as 0.01 contracts. Costing a
+// trade off that invents an edge nobody can take.
+check('[dust] 0.01 contracts is not tradeable', quoteIsTradeable(0.01, 5) === false);
+check('[dust] 4 contracts is below a 5-share minimum', quoteIsTradeable(4, 5) === false);
+check('[dust] exactly the minimum is tradeable', quoteIsTradeable(5, 5) === true);
+check('[dust] deep book is tradeable', quoteIsTradeable(2874.47, 5) === true);
+check('[dust] unreported depth is allowed through', quoteIsTradeable(undefined, 5) === true);
+check('[dust] NaN depth is allowed through', quoteIsTradeable(NaN, 5) === true);
+check('[dust] zero is not tradeable', quoteIsTradeable(0, 5) === false);
+
+// A marketable limit must be priced at the deepest level the order reaches, or it rests
+// unfilled — and an unfilled Kalshi leg beside a filled Polymarket leg is a naked position.
+const lad = [{ priceCents: 51, size: 10 }, { priceCents: 53, size: 20 }, { priceCents: 55, size: 5 }];
+check('[limit] within the first level', priceForSize(lad, 10) === 51, String(priceForSize(lad, 10)));
+check('[limit] crossing into the second', priceForSize(lad, 11) === 53, String(priceForSize(lad, 11)));
+check('[limit] exactly two levels', priceForSize(lad, 30) === 53, String(priceForSize(lad, 30)));
+check('[limit] into the third', priceForSize(lad, 31) === 55, String(priceForSize(lad, 31)));
+check('[limit] exactly the whole book', priceForSize(lad, 35) === 55, String(priceForSize(lad, 35)));
+check('[limit] more than the book has returns null', priceForSize(lad, 36) === null);
+check('[limit] empty ladder returns null', priceForSize([], 5) === null);
+check('[limit] unsorted ladder still walks cheapest first',
+  priceForSize([{ priceCents: 55, size: 5 }, { priceCents: 51, size: 10 }], 10) === 51);
+for (const bad of [0, -1, NaN, Infinity]) {
+  check(`[limit] rejects size ${String(bad)}`, priceForSize(lad, bad) === null);
+}
+
+
 console.log(`matching regression: ${pass} passed, ${fail} failed`);
 if (failures.length) {
   console.log('\nFAILURES');

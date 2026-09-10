@@ -5,9 +5,9 @@ import { placeKalshiOrder, testKalshiAuth } from '@/api/kalshi-trading';
 import { placePolymarketOrder, testPolymarketAuth } from '@/api/polymarket-trading';
 import type { KalshiAuthTest } from '@/api/kalshi-trading';
 import type { PolymarketAuthTest } from '@/api/polymarket-trading';
-import { getKalshiQuote, getKalshiOrderbook } from '@/api/kalshi';
-import { getPolymarketQuote, getPolymarketBooks } from '@/api/polymarket';
-import { fillableContracts, kalshiAskLadder, polymarketAskLadder } from '@/lib/depth';
+import { getKalshiOrderbook } from '@/api/kalshi';
+import { getPolymarketBooks } from '@/api/polymarket';
+import { fillableContracts, kalshiAskLadder, polymarketAskLadder, priceForSize } from '@/lib/depth';
 import { estimatePolymarketFeeCents, estimateKalshiFeeCents } from '@/lib/fees';
 
 export interface LegResult {
@@ -189,37 +189,53 @@ export async function POST(request: Request): Promise<Response> {
     return executeError(`Order size ${contracts} is below Polymarket's ${MIN_ORDER_CONTRACTS}-share minimum. A smaller order would fill only the Kalshi leg and leave it unhedged.`);
   }
 
-  // ── pre-order price re-check ────────────────────────────────────────────────
-  // The card the user clicked was priced up to a second ago; an edge can be gone by
-  // then. Re-quote BOTH venues in parallel (two targeted requests, ~100 ms total) and
-  // refuse to trade if the edge no longer exists. Nothing has been sent at this point,
-  // so backing out here costs nothing.
+  // ── pre-order re-check, priced off the books ───────────────────────────────
+  // The card the user clicked was priced up to a second ago; an edge can be gone by then.
+  // Re-read BOTH books in parallel and refuse to trade if the edge no longer exists.
+  // Nothing has been sent at this point, so backing out here costs nothing.
+  //
+  // Price and depth both come from the ORDER BOOKS, not from the venues' quote endpoints.
+  // Kalshi's `/markets` quote is set by whatever rests at the top, including orders of 0.01
+  // contracts, while the ladder walk ignores anything under a whole contract. The two
+  // therefore disagreed on 13 of 24 live MLB markets by up to 8c, which produced exactly
+  // this failure: the quote-based price check passed, then the ladder found zero contracts
+  // fillable at a profit and backed out. Worse, the order limit was taken from the quote,
+  // so a Kalshi leg priced 8c through the real ask would have rested unfilled beside a
+  // filled Polymarket leg — a naked position. One source of truth removes both.
   const quotedEdgePercent = Number.isFinite(opportunity.edgePercent) ? opportunity.edgePercent : undefined;
   const revalStart = Date.now();
-  const [kQuote, pmQuote, kOrderbook, pmBooks] = await Promise.all([
-    getKalshiQuote(kalshiTicker),
-    getPolymarketQuote(pmRich.yesTokenId ?? ''),
-    // Depth is checked in the SAME parallel round trip as the prices, so verifying it
-    // costs no extra wall-clock time before the order goes out.
+  const [kOrderbook, pmBooks] = await Promise.all([
     getKalshiOrderbook(kalshiTicker),
     getPolymarketBooks([pmRich.yesTokenId ?? '']),
   ]);
   const revalidateMs = Date.now() - revalStart;
 
-  if (!kQuote || !pmQuote) {
+  // Derive the fee model server-side rather than trusting the posted market.
+  const feeKind = pair.polymarket.category === 'politics' ? 'fee_free' : 'sports';
+  const kalLadder = kalshiAskLadder(kOrderbook, actualKalshiSide);
+  const pmLadder = polymarketAskLadder(pmBooks.get(pmRich.yesTokenId ?? ''), pmLeg.side);
+
+  // An unreadable book is not an empty one. Both produce a zero-length ladder, and
+  // reporting a failed request as "not enough depth" sent users hunting for liquidity that
+  // was actually there. Say which venue could not be read.
+  if (!kalLadder.length || !pmLadder.length) {
+    const which = !kalLadder.length && !pmLadder.length ? 'neither venue'
+      : !kalLadder.length ? 'Kalshi' : 'Polymarket';
     return executeError(
-      `Could not re-quote ${!kQuote ? 'Kalshi' : 'Polymarket'} before ordering (${revalidateMs}ms) — refusing to trade on unverified prices.`,
+      `Could not read the order book from ${which} before ordering (${revalidateMs}ms) — ` +
+      `refusing to trade on unverified depth. Nothing was sent; try again.`,
       409);
   }
 
-  // Prices live right now, for the exact sides this order would buy.
-  const freshPmPrice = pmLeg.side === 'yes' ? pmQuote.yes : pmQuote.no;
-  const freshKalPrice = actualKalshiSide === 'yes' ? kQuote.yes : kQuote.no;
-  // Derive the fee model server-side rather than trusting the posted market.
-  const feeKind = pair.polymarket.category === 'politics' ? 'fee_free' : 'sports';
-  const freshCost = freshPmPrice + estimatePolymarketFeeCents(feeKind, freshPmPrice, 1)
-                  + freshKalPrice + estimateKalshiFeeCents(freshKalPrice, 1);
-  const freshEdgePercent = 100 - freshCost;
+  const feePerContract = (pmPrice: number, kalPrice: number) =>
+    estimatePolymarketFeeCents(feeKind, pmPrice, 1) + estimateKalshiFeeCents(kalPrice, 1);
+
+  // Best case available anywhere in either book: the top of both ladders. This separates
+  // "the edge is gone" from "the edge exists but is shallow" — without it, a vanished edge
+  // reported as zero fillable contracts, which reads as a liquidity problem and is not.
+  const topCost = pmLadder[0].priceCents + kalLadder[0].priceCents
+                + feePerContract(pmLadder[0].priceCents, kalLadder[0].priceCents);
+  const freshEdgePercent = 100 - topCost;
 
   if (freshEdgePercent <= 0) {
     const body: ExecuteResponse = {
@@ -247,10 +263,6 @@ export async function POST(request: Request): Promise<Response> {
   // while the pair stays profitable. Without this the Kalshi leg fills and the Polymarket
   // leg does not, which is the naked position this app exists to avoid — one live pair
   // advertised 10,000 contracts of depth when Polymarket had 190.
-  const kalLadder = kalshiAskLadder(kOrderbook, actualKalshiSide);
-  const pmLadder = polymarketAskLadder(pmBooks.get(pmRich.yesTokenId ?? ''), pmLeg.side);
-  const feePerContract = (pmPrice: number, kalPrice: number) =>
-    estimatePolymarketFeeCents(feeKind, pmPrice, 1) + estimateKalshiFeeCents(kalPrice, 1);
   const fill = fillableContracts(pmLadder, kalLadder, feePerContract, contracts);
 
   if (fill.contracts < MIN_ORDER_CONTRACTS) {
@@ -265,16 +277,30 @@ export async function POST(request: Request): Promise<Response> {
       revalidateMs,
       quotedEdgePercent,
       freshEdgePercent,
-      hedgeNote: `Backed out in ${revalidateMs}ms: only ${fill.contracts} contract(s) can be filled ` +
-        `profitably across both books, below the ${MIN_ORDER_CONTRACTS}-share minimum. No orders were sent.`,
+      hedgeNote: `Backed out in ${revalidateMs}ms: the edge is ${freshEdgePercent.toFixed(2)}% at the ` +
+        `top of both books, but only ${fill.contracts} contract(s) can be bought there before it ` +
+        `disappears — below the ${MIN_ORDER_CONTRACTS}-share minimum. No orders were sent.`,
     };
-    console.log('[execute] aborted on depth', JSON.stringify({ ticker: kalshiTicker, requested: contracts, fillable: fill.contracts }));
+    console.log('[execute] aborted on depth', JSON.stringify({ ticker: kalshiTicker, requested: contracts, fillable: fill.contracts, freshEdgePercent }));
     return NextResponse.json(body, { status: 409 });
   }
 
   // Never buy more than both books can absorb. Trimming keeps the two legs equal, which
   // is what makes the position hedged; sending the full size would fill them unevenly.
   const plannedContracts = Math.min(contracts, fill.contracts);
+
+  // Limit prices come from the ladders, set at the deepest level this size reaches, so a
+  // marketable order crosses everything it needs and fills in full. Taking them from a
+  // quote endpoint instead priced the Kalshi leg through its real ask on 13 of 24 live
+  // markets, which rests unfilled — and an unfilled Kalshi leg beside a filled Polymarket
+  // leg is precisely the naked position the rest of this route exists to prevent.
+  const freshPmPrice = priceForSize(pmLadder, plannedContracts);
+  const freshKalPrice = priceForSize(kalLadder, plannedContracts);
+  if (freshPmPrice === null || freshKalPrice === null) {
+    return executeError(
+      `Book thinned out between measuring depth and pricing the order (${revalidateMs}ms). Nothing was sent; try again.`,
+      409);
+  }
 
   // Both legs must be affordable BEFORE either is sent. The legs fire in parallel, so an
   // underfunded venue does not fail cleanly: its leg is rejected while the other one fills,

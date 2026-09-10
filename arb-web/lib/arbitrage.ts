@@ -1,4 +1,6 @@
 import type { ArbitrageOpportunity, BinarySide, MatchedPair, Venue } from './market-types';
+import { MIN_ORDER_CONTRACTS } from './market-types';
+import { quoteIsTradeable } from './depth';
 import type { PolymarketMarketWithKind } from '@/api/polymarket';
 import { estimatePolymarketFeeCents, estimateKalshiFeeCents } from './fees';
 
@@ -52,11 +54,21 @@ export function findArbitrageOpportunities(
     const cost2 = legPmNo.priceCents + legPmNo.feeCents + legKYes.priceCents + legKYes.feeCents;
     const edge2 = ((100 - cost2) / 100) * 100;
 
-    // Pick the best leg combo; include it if its edge meets the threshold
-    const bestEdge = Math.max(edge1, edge2);
-    if (bestEdge < minEdgePercent) continue;
+    // Kalshi's quoted ask can be backed by a resting order of 0.01 contracts, and that dust
+    // sets the quote. Pricing a leg off it manufactures an edge that disappears the instant
+    // anyone tries to take it: the pre-order depth check then finds zero fillable contracts
+    // and backs out, so the card was never tradeable in the first place. The size at each
+    // ask arrives in the same batched request as the price, so this costs nothing.
+    const noUsable = quoteIsTradeable(k.noDepth, MIN_ORDER_CONTRACTS);
+    const yesUsable = quoteIsTradeable(k.yesDepth, MIN_ORDER_CONTRACTS);
+    const usableEdge1 = noUsable ? edge1 : Number.NEGATIVE_INFINITY;
+    const usableEdge2 = yesUsable ? edge2 : Number.NEGATIVE_INFINITY;
 
-    if (edge1 >= edge2) {
+    // Pick the best leg combo; include it if its edge meets the threshold
+    const bestEdge = Math.max(usableEdge1, usableEdge2);
+    if (!Number.isFinite(bestEdge) || bestEdge < minEdgePercent) continue;
+
+    if (usableEdge1 >= usableEdge2) {
       // Kalshi leg buys NO → fillable size is the NO-side depth
       opportunities.push({ pair: { polymarket: pm, kalshi: k }, legA: { venue: 'polymarket', side: 'yes', ...legPmYes }, legB: { venue: 'kalshi', side: 'no', ...legKNo }, totalCostCents: cost1, maxPayoutCents: 100, edgePercent: edge1, maxContracts: k.noDepth });
     } else {
