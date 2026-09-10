@@ -97,15 +97,19 @@ const expected = controller ?? funder;
 const ok = address.toLowerCase() === expected.toLowerCase();
 console.log(`\n${ok ? 'MATCH — this key can sign for that wallet.' : 'NO MATCH — this key CANNOT sign for that wallet.'}`);
 if (!ok) {
-  // On an email/Magic account the owner is Polymarket's own relayer signer, so "get the
-  // owner's key" is not a route anyone has. Authorizing this address as a session key is.
-  console.log(`
-  ${expected} is the wallet's on-chain owner. On an email/Magic account that is`);
-  console.log("  Polymarket's relayer signer, not a key you can export — so do not go looking for it.");
-  console.log(`
-  Instead authorize ${address} as a session key:`);
-  console.log('    polymarket.com -> Settings -> Session keys -> authorize that address (trading scope)');
-  console.log('  Or create a session key there and put the private key it gives you in .env.local.');
-  console.log('  Session keys carry an expiry, so this can need renewing.');
+  // The deposit wallet's bytecode encodes walletId = owner-address-padded-to-32-bytes, so the
+  // owner below is the signer the wallet was CREATED for — the same address Polymarket shows
+  // as "Signer Address" under Settings -> Relayer API keys. An export that returns a
+  // different address came from a different Magic wallet, not from a wallet you don't own.
+  console.log(`\n  ${expected} is the signer this wallet was created for.`);
+  console.log('  Polymarket shows the same address under Settings -> Relayer API keys ("Signer Address").');
+  console.log('\n  So the export should have produced THIS address. To get it:');
+  console.log('    1. Log out of Polymarket entirely, then log back in with the method that');
+  console.log('       created the account (email vs Google give different Magic wallets).');
+  console.log('    2. Settings -> Private key -> Start Export.');
+  console.log('    3. Check it WITHOUT saving it anywhere:  npm run check:wallet -- 0x<key>');
+  console.log('  When that prints MATCH, put it in .env.local as POLYMARKET_PRIVATE_KEY.');
+  console.log('\n  If the export keeps returning a different address, the login you are using is not');
+  console.log('  the one that owns this wallet — that is a Polymarket account question, not a code one.');
 }
 process.exit(ok ? 0 : 1);
