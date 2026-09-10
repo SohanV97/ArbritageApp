@@ -201,25 +201,43 @@ function describeError(err: unknown): string {
 
 /**
  * The venue reports this as free text that blames the API key, which is misleading: the key
- * is valid, and authenticated reads succeed with it. What is missing is authorization of the
- * SIGNING address as a session key on the wallet.
+ * is valid, and authenticated reads succeed with it. The signing key is simply not the one
+ * that owns the wallet.
+ *
+ * On an email/Magic account this is easy to hit, because Magic holds more than one wallet
+ * per login and the export screen names whichever is currently active. Logging out of Magic
+ * and back in can surface a different one — that is how the owning key was eventually found
+ * here, after the first export had returned a non-owning address.
  */
 function explainSignerMismatch(raw: string): string | undefined {
   if (!/signer address has to be the address of the api key/i.test(raw)) return undefined;
   return `${raw}\n\n` +
-    `The API key is fine — authenticated reads work with it. What is missing is that this ` +
-    `signing address has not been authorized as a session key on the wallet. On an ` +
-    `email/Magic account the wallet's on-chain owner is Polymarket's relayer signer, not a ` +
-    `key you can export, so authorizing a session key is the supported route. ` +
-    `Go to polymarket.com → Settings → Session keys and authorize the address that ` +
-    `POLYMARKET_PRIVATE_KEY controls (run "npm run check:wallet" to print it), or create a ` +
-    `session key there and use the private key it gives you.`;
+    `The API key is fine — authenticated reads work with it. POLYMARKET_PRIVATE_KEY is simply ` +
+    `not the key that owns POLYMARKET_FUNDER_ADDRESS. Run "npm run check:wallet" to see which ` +
+    `address it controls and which one owns the wallet. On an email/Magic account, log out of ` +
+    `the Magic export screen and log back in: it can reveal a different wallet, and the export ` +
+    `header names the address before it shows the key.`;
+}
+
+/**
+ * Polymarket blocks trading from restricted regions at the venue, after the order is signed
+ * and sent. Nothing local can satisfy it, so say plainly that this is not a configuration
+ * problem — otherwise it reads like one more thing to fix in .env.local.
+ */
+function explainGeoblock(raw: string): string | undefined {
+  if (!/restricted in your region|geoblock/i.test(raw)) return undefined;
+  return `${raw}\n\n` +
+    `This is a venue-side regional restriction, not a problem with your keys or this app: ` +
+    `the account, the signing key and the order were all accepted, and the block is applied ` +
+    `to where the request came from. polymarket.com does not serve US traders; ` +
+    `polymarket.us is the separate US venue, and it is a different API this app does not ` +
+    `implement. Kalshi is already US-regulated, so the Kalshi leg is unaffected.`;
 }
 
 // The venue rejects with a machine-readable code; turn the ones a trader can act on into
 // instructions rather than passing the bare enum through to the UI.
 function mapOrderError(code: string, message: string): string {
-  const mismatch = explainSignerMismatch(message);
+  const mismatch = explainSignerMismatch(message) ?? explainGeoblock(message);
   if (mismatch) return mismatch;
   switch (code) {
     case 'insufficient_balance_or_allowance':
@@ -298,14 +316,12 @@ export async function testPolymarketAuth(): Promise<PolymarketAuthTest> {
       diagnosis =
         `POLYMARKET_PRIVATE_KEY controls ${init.address}, but ${init.wallet} was created for ` +
         `signer ${walletOwner} — the address Polymarket shows under Settings → Relayer API keys. ` +
-        `That is an EOA Polymarket manages, and re-exporting will not produce it: Magic's own ` +
-        `consent screen names ${init.address} as the only wallet it holds for this login. ` +
-        `So reads work and the $${balance.toFixed(2)} balance is real, but orders are rejected ` +
-        `("the order signer address has to be the address of the API KEY"). The documented route ` +
-        `is a SESSION KEY, which the wallet's owner must authorize — see ` +
-        `docs.polymarket.com/trading/session-keys. Authorizing needs a Builder API key, so create ` +
-        `a Builder profile (Settings → Builders) and then look for an authorize option under ` +
-        `Settings → Session keys.`;
+        `Reads work and the $${balance.toFixed(2)} balance is real, but orders are rejected ` +
+        `("the order signer address has to be the address of the API KEY"). ` +
+        `Magic holds more than one wallet per login and its export screen shows whichever is ` +
+        `active, so the first export can hand you a non-owning address: log out on the Magic ` +
+        `export screen and back in until its header names ${walletOwner}, then check the key ` +
+        `with "npm run check:wallet -- 0x<key>" before saving it.`;
     } else if (balance === 0) {
       diagnosis =
         `No collateral at ${init.wallet}. Polymarket settles in PUSD (0xC011a7E1…) — check that ` +
@@ -366,7 +382,7 @@ export async function placePolymarketOrder(req: PolymarketOrderRequest): Promise
     };
   } catch (err) {
     const raw = describeError(err);
-    return { ok: false, error: explainSignerMismatch(raw) ?? raw };
+    return { ok: false, error: explainSignerMismatch(raw) ?? explainGeoblock(raw) ?? raw };
   }
 }
 

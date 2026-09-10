@@ -103,16 +103,13 @@ if (!ok) {
   // different address came from a different Magic wallet, not from a wallet you don't own.
   console.log(`\n  ${expected} is the signer this wallet was created for.`);
   console.log('  Polymarket shows the same address under Settings -> Relayer API keys ("Signer Address").');
-  console.log('  It is an EOA Polymarket manages, and re-exporting will not produce it: Magic names');
-  console.log(`  ${address} as the only wallet it holds for this login.`);
-  console.log('\n  So this is not a key you can obtain. The documented route is a SESSION KEY, which');
-  console.log('  the wallet owner authorizes:  https://docs.polymarket.com/trading/session-keys');
-  console.log('  Authorization needs a Builder API key, so:');
-  console.log('    1. polymarket.com -> Settings -> Builders -> Create Builder Profile');
-  console.log('    2. Then check Settings -> Session keys for an authorize/create option');
-  console.log('    3. Whatever private key that yields, verify it here first:');
-  console.log('         npm run check:wallet -- 0x<key>');
-  console.log('\n  If no authorize option appears, ask Polymarket support how to authorize a session');
-  console.log('  signer for a deposit wallet whose owner is a Polymarket-managed signer.');
+  console.log('\n  Magic holds more than one wallet per login, and its export screen reveals whichever');
+  console.log('  one is currently active — so a first export can hand you a non-owning address.');
+  console.log('  On the Magic export screen press Log Out, sign back in, and read the header: it');
+  console.log('  names the address BEFORE revealing the key. Repeat until the header shows');
+  console.log(`    ${expected}`);
+  console.log('  then check that key without saving it anywhere:');
+  console.log('    npm run check:wallet -- 0x<key>');
+  console.log('  When it prints MATCH, put it in .env.local as POLYMARKET_PRIVATE_KEY.');
 }
 process.exit(ok ? 0 : 1);
