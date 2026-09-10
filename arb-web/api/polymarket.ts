@@ -3,7 +3,8 @@ import type { PolymarketMarketKind } from '@/lib/fees';
 import { isPoliticsMarket } from '@/lib/politicsFilter';
 import { isSportMoneyline } from '@/lib/moneylineFilter';
 import { easternDateOf } from '@/lib/gameDate';
-import { askCents, noAskCents, clampCents } from '@/lib/depth';
+import { askCents, noAskCents, clampCents, polymarketAskLadder, priceForSize } from '@/lib/depth';
+import { MIN_ORDER_CONTRACTS } from '@/lib/market-types';
 import {
   POLYMARKET_SPORT_KEYWORDS,
   POLYMARKET_POLITICS_TAG_SLUGS,
@@ -184,6 +185,23 @@ const bestPrice = (side: 'ask' | 'bid', levels: { price?: string }[] | undefined
   return side === 'ask' ? Math.min(...prices) : Math.max(...prices);
 };
 
+/**
+ * Price a book at the level where a tradeable order can actually be filled.
+ *
+ * Taking the raw best price ignores how much is resting there. A top-of-book level holding
+ * fewer contracts than the venue minimum is not a price anyone can trade at, and quoting it
+ * manufactures an edge that vanishes at execution — the same failure Kalshi's 0.01-contract
+ * dust caused, and present on about 1% of Polymarket sports books. Walking to where
+ * MIN_ORDER_CONTRACTS is cumulatively available gives a price that can be filled, and
+ * matches how the execute path sizes and prices the order.
+ */
+function tradeableBookPrices(b: ClobBook): { yes: number; no: number } | null {
+  const yes = priceForSize(polymarketAskLadder(b, 'yes'), MIN_ORDER_CONTRACTS);
+  const no = priceForSize(polymarketAskLadder(b, 'no'), MIN_ORDER_CONTRACTS);
+  if (yes === null || no === null) return null;
+  return { yes: clampCents(yes), no: clampCents(no) };
+}
+
 // Single-market live quote for the pre-order price re-check. Always pass the YES token
 // (outcome[0]) — both sides are derived from that one book, exactly as the pipeline does.
 export async function getPolymarketQuote(yesTokenId: string): Promise<{ yes: number; no: number } | null> {
@@ -202,10 +220,7 @@ export async function getPolymarketQuote(yesTokenId: string): Promise<{ yes: num
     const bid = bestPrice('bid', b.bids);
     if (ask === null || bid === null) return null;
     if (bid <= 0 || ask <= 0 || bid >= 1 || ask >= 1 || ask < bid) return null;
-    return {
-      yes: clampCents(askCents(ask)),
-      no: clampCents(noAskCents(bid)),
-    };
+    return tradeableBookPrices(b);
   } catch {
     return null;
   }
@@ -270,9 +285,9 @@ export async function refreshPolymarketPrices(markets: PolymarketMarketWithKind[
         const bid = bestPrice('bid', b.bids);
         if (ask === null || bid === null) continue;
         if (bid <= 0 || ask <= 0 || bid >= 1 || ask >= 1 || ask < bid) continue;
-        const yes = clampCents(askCents(ask));
-        const no = clampCents(noAskCents(bid));
-        for (const t of targets) { t.yesPriceCents = yes; t.noPriceCents = no; }
+        const priced = tradeableBookPrices(b);
+        if (!priced) continue;   // nothing fillable at the minimum size — keep last good prices
+        for (const t of targets) { t.yesPriceCents = priced.yes; t.noPriceCents = priced.no; }
         updated++;
       }
     } catch { /* keep last good prices */ }
