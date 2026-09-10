@@ -97,7 +97,15 @@ const expected = controller ?? funder;
 const ok = address.toLowerCase() === expected.toLowerCase();
 console.log(`\n${ok ? 'MATCH — this key can sign for that wallet.' : 'NO MATCH — this key CANNOT sign for that wallet.'}`);
 if (!ok) {
-  console.log(`  need the private key for ${expected}`);
-  console.log('  Polymarket: profile -> Settings -> Export Private Key');
+  // On an email/Magic account the owner is Polymarket's own relayer signer, so "get the
+  // owner's key" is not a route anyone has. Authorizing this address as a session key is.
+  console.log(`
+  ${expected} is the wallet's on-chain owner. On an email/Magic account that is`);
+  console.log("  Polymarket's relayer signer, not a key you can export — so do not go looking for it.");
+  console.log(`
+  Instead authorize ${address} as a session key:`);
+  console.log('    polymarket.com -> Settings -> Session keys -> authorize that address (trading scope)');
+  console.log('  Or create a session key there and put the private key it gives you in .env.local.');
+  console.log('  Session keys carry an expiry, so this can need renewing.');
 }
 process.exit(ok ? 0 : 1);

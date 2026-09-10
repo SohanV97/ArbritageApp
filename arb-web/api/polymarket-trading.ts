@@ -200,19 +200,20 @@ function describeError(err: unknown): string {
 }
 
 /**
- * The venue reports a signer/API-key mismatch as free text, and the wording gives no hint
- * what to do about it. It means the signing key is not the wallet's owner — typically a
- * session key, which authenticates and reads balances but cannot sign orders.
+ * The venue reports this as free text that blames the API key, which is misleading: the key
+ * is valid, and authenticated reads succeed with it. What is missing is authorization of the
+ * SIGNING address as a session key on the wallet.
  */
 function explainSignerMismatch(raw: string): string | undefined {
   if (!/signer address has to be the address of the api key/i.test(raw)) return undefined;
-  return `${raw}
-
-This key is not the owner of POLYMARKET_FUNDER_ADDRESS — it is only a ` +
-    `session key on that wallet, which is why it can read the balance but cannot sign orders. ` +
-    `Run "npm run check:wallet": it prints which address the key controls, which address owns ` +
-    `the wallet, and whether they match. Fix it by exporting the private key for the owning ` +
-    `address from Polymarket (Settings → Export Private Key).`;
+  return `${raw}\n\n` +
+    `The API key is fine — authenticated reads work with it. What is missing is that this ` +
+    `signing address has not been authorized as a session key on the wallet. On an ` +
+    `email/Magic account the wallet's on-chain owner is Polymarket's relayer signer, not a ` +
+    `key you can export, so authorizing a session key is the supported route. ` +
+    `Go to polymarket.com → Settings → Session keys and authorize the address that ` +
+    `POLYMARKET_PRIVATE_KEY controls (run "npm run check:wallet" to print it), or create a ` +
+    `session key there and use the private key it gives you.`;
 }
 
 // The venue rejects with a machine-readable code; turn the ones a trader can act on into
@@ -275,12 +276,17 @@ export async function testPolymarketAuth(): Promise<PolymarketAuthTest> {
 
     // Can this key actually sign orders, or does it merely authenticate?
     //
-    // A key that is only a SESSION KEY on the wallet passes every check above: it builds a
-    // client, reads the balance, and reports a healthy account — then every order is
-    // rejected with "the order signer address has to be the address of the API KEY". That
-    // is the venue saying the signer is not the wallet's owner, and it only says it at
-    // order time. Comparing the signer against the proxy's on-chain controller catches it
-    // here, before a trade is attempted.
+    // On an email/Magic account the wallet's on-chain controller is Polymarket's own relayer
+    // signer, not anything the user holds — so the exported Magic key is never the owner, and
+    // "export the owner's key" is not a fix available to anyone. Such a key is a SESSION KEY:
+    // an externally managed signer that works only once its ADDRESS has been authorized on
+    // the wallet, with scopes and an expiry.
+    //
+    // Unauthorized, it still passes every check above. It builds a client, reads the balance,
+    // and even satisfies authenticated reads (listOpenOrders, listPositions and
+    // fetchPortfolioValue all succeed) — then every order is rejected with "the order signer
+    // address has to be the address of the API KEY". Comparing the signer against the proxy's
+    // on-chain controller catches it here, before a trade is attempted.
     const walletOwner = await walletOwnerOnChain(init.wallet);
     const canSignOrders = walletOwner === undefined
       ? undefined                                     // not a proxy, or the chain read failed
@@ -290,12 +296,14 @@ export async function testPolymarketAuth(): Promise<PolymarketAuthTest> {
     let diagnosis: string | undefined;
     if (canSignOrders === false) {
       diagnosis =
-        `POLYMARKET_PRIVATE_KEY belongs to ${init.address}, but ${init.wallet} is controlled by ` +
-        `${walletOwner}. The key can authenticate and read the $${balance.toFixed(2)} balance, yet ` +
-        `every order will be rejected ("the order signer address has to be the address of the API ` +
-        `KEY") because it is only a session key on this wallet. Export the private key for ` +
-        `${walletOwner} from Polymarket (Settings → Export Private Key) and set it as ` +
-        `POLYMARKET_PRIVATE_KEY. Verify with "npm run check:wallet" before trading.`;
+        `POLYMARKET_PRIVATE_KEY controls ${init.address}, which is not the owner of ${init.wallet} ` +
+        `— that is ${walletOwner}, Polymarket's own relayer signer, whose key nobody can export. ` +
+        `Your key is a SESSION KEY on this wallet: it authenticates and reads the ` +
+        `$${balance.toFixed(2)} balance fine, but orders are rejected ("the order signer address ` +
+        `has to be the address of the API KEY") until the address is authorized. ` +
+        `Fix it at polymarket.com → Settings → Session keys: authorize ${init.address} with ` +
+        `trading scope (or create a session key there and use the private key it gives you). ` +
+        `Session keys carry an expiry, so this can need renewing.`;
     } else if (balance === 0) {
       diagnosis =
         `No collateral at ${init.wallet}. Polymarket settles in PUSD (0xC011a7E1…) — check that ` +
