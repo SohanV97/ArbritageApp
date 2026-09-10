@@ -103,13 +103,16 @@ if (!ok) {
   // different address came from a different Magic wallet, not from a wallet you don't own.
   console.log(`\n  ${expected} is the signer this wallet was created for.`);
   console.log('  Polymarket shows the same address under Settings -> Relayer API keys ("Signer Address").');
-  console.log('\n  So the export should have produced THIS address. To get it:');
-  console.log('    1. Log out of Polymarket entirely, then log back in with the method that');
-  console.log('       created the account (email vs Google give different Magic wallets).');
-  console.log('    2. Settings -> Private key -> Start Export.');
-  console.log('    3. Check it WITHOUT saving it anywhere:  npm run check:wallet -- 0x<key>');
-  console.log('  When that prints MATCH, put it in .env.local as POLYMARKET_PRIVATE_KEY.');
-  console.log('\n  If the export keeps returning a different address, the login you are using is not');
-  console.log('  the one that owns this wallet — that is a Polymarket account question, not a code one.');
+  console.log('  It is an EOA Polymarket manages, and re-exporting will not produce it: Magic names');
+  console.log(`  ${address} as the only wallet it holds for this login.`);
+  console.log('\n  So this is not a key you can obtain. The documented route is a SESSION KEY, which');
+  console.log('  the wallet owner authorizes:  https://docs.polymarket.com/trading/session-keys');
+  console.log('  Authorization needs a Builder API key, so:');
+  console.log('    1. polymarket.com -> Settings -> Builders -> Create Builder Profile');
+  console.log('    2. Then check Settings -> Session keys for an authorize/create option');
+  console.log('    3. Whatever private key that yields, verify it here first:');
+  console.log('         npm run check:wallet -- 0x<key>');
+  console.log('\n  If no authorize option appears, ask Polymarket support how to authorize a session');
+  console.log('  signer for a deposit wallet whose owner is a Polymarket-managed signer.');
 }
 process.exit(ok ? 0 : 1);

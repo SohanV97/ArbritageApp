@@ -297,12 +297,15 @@ export async function testPolymarketAuth(): Promise<PolymarketAuthTest> {
     if (canSignOrders === false) {
       diagnosis =
         `POLYMARKET_PRIVATE_KEY controls ${init.address}, but ${init.wallet} was created for ` +
-        `signer ${walletOwner} — the address Polymarket lists under Settings → Relayer API keys. ` +
-        `The key authenticates and reads the $${balance.toFixed(2)} balance, but every order is ` +
-        `rejected ("the order signer address has to be the address of the API KEY"). Export the ` +
-        `key again after logging out and back in with the method that created the account — email ` +
-        `and Google logins produce different Magic wallets — and check it with ` +
-        `"npm run check:wallet -- 0x<key>" before saving it.`;
+        `signer ${walletOwner} — the address Polymarket shows under Settings → Relayer API keys. ` +
+        `That is an EOA Polymarket manages, and re-exporting will not produce it: Magic's own ` +
+        `consent screen names ${init.address} as the only wallet it holds for this login. ` +
+        `So reads work and the $${balance.toFixed(2)} balance is real, but orders are rejected ` +
+        `("the order signer address has to be the address of the API KEY"). The documented route ` +
+        `is a SESSION KEY, which the wallet's owner must authorize — see ` +
+        `docs.polymarket.com/trading/session-keys. Authorizing needs a Builder API key, so create ` +
+        `a Builder profile (Settings → Builders) and then look for an authorize option under ` +
+        `Settings → Session keys.`;
     } else if (balance === 0) {
       diagnosis =
         `No collateral at ${init.wallet}. Polymarket settles in PUSD (0xC011a7E1…) — check that ` +
