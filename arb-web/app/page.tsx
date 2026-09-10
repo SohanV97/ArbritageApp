@@ -585,22 +585,11 @@ const OpportunityCard = memo(function OpportunityCard({ opp, amount, bankroll, f
 
 // ─── ExecutionPendingScreen ──────────────────────────────────────────────────
 
-type PendingPhase = { phase: 'pending'; opp: ArbitrageOpportunity; amount: number; countdown: number; key: string };
 type ExecutingPhase = { phase: 'executing'; opp: ArbitrageOpportunity; amount: number; key: string };
 
-function ExecutionPendingScreen({
-  execPhase,
-  onCancel,
-  onExecuteNow,
-}: {
-  execPhase: PendingPhase | ExecutingPhase;
-  onCancel: () => void;
-  onExecuteNow: () => void;
-}) {
+function ExecutionPendingScreen({ execPhase }: { execPhase: ExecutingPhase }) {
   const { opp, amount } = execPhase;
   const { pair, legA, legB, totalCostCents, edgePercent } = opp;
-  const isPending = execPhase.phase === 'pending';
-  const countdown = isPending ? execPhase.countdown : 0;
 
   const legs = [
     { leg: legA, market: legA.venue === 'polymarket' ? pair.polymarket : pair.kalshi },
@@ -690,57 +679,13 @@ function ExecutionPendingScreen({
             </div>
           </div>
 
-          {/* Countdown or spinner */}
-          {isPending ? (
-            <>
-              <div className="mb-5">
-                <div className="flex justify-between items-center mb-2">
-                  <span className="text-sm" style={{ color: 'var(--text-muted)' }}>Auto-executing in</span>
-                  <span className="text-lg font-bold font-mono" style={{ color: '#fbbf24' }}>{countdown}s</span>
-                </div>
-                <div style={{ background: '#fbbf2420', height: 8, borderRadius: 4 }}>
-                  <div
-                    style={{
-                      background: '#fbbf24',
-                      width: `${(countdown / 10) * 100}%`,
-                      height: '100%',
-                      borderRadius: 4,
-                      transition: 'width 1s linear',
-                    }}
-                  />
-                </div>
-              </div>
-
-              <div className="flex gap-3">
-                <button
-                  onClick={onCancel}
-                  style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}
-                  className="flex-1 py-3 rounded-xl text-sm font-medium hover:border-[#8b949e] transition-colors"
-                >
-                  Cancel
-                </button>
-                <button
-                  onClick={onExecuteNow}
-                  style={{ background: '#16a34a', color: 'white' }}
-                  className="flex-1 py-3 rounded-xl text-sm font-bold hover:opacity-90 transition-opacity"
-                >
-                  Execute Now
-                </button>
-              </div>
-            </>
-          ) : (
-            <div className="flex items-center justify-center gap-3 py-5">
-              <div className="w-5 h-5 border-2 border-[--border] border-t-[#fbbf24] rounded-full animate-spin" />
-              <span className="text-sm" style={{ color: 'var(--text-muted)' }}>Placing orders on both platforms…</span>
-            </div>
-          )}
+          {/* Orders are already in flight by the time this renders — there is nothing to
+              confirm or cancel, so this reports rather than asks. */}
+          <div className="flex items-center justify-center gap-3 py-5">
+            <div className="w-5 h-5 border-2 border-[--border] border-t-[#fbbf24] rounded-full animate-spin" />
+            <span className="text-sm" style={{ color: 'var(--text-muted)' }}>Placing orders on both platforms…</span>
+          </div>
         </div>
-
-        {isPending && (
-          <p className="text-xs text-center mt-4" style={{ color: 'var(--text-muted)' }}>
-            Market scanning continues in background · prices refresh every ~1.5s
-          </p>
-        )}
       </div>
     </div>
   );
@@ -926,14 +871,12 @@ const makeExecId = (): string =>
 // ─── exec phase type ────────────────────────────────────────────────────────
 
 type ExecPhase =
-  | PendingPhase
   | ExecutingPhase
   | { phase: 'result'; opp: ArbitrageOpportunity; amount: number; result: ExecuteResponse };
 
 // ─── main page ───────────────────────────────────────────────────────────────
 
 const ALL_CATEGORIES: Category[] = ['mlb', 'nfl', 'cfb', 'soccer', 'politics'];
-const COUNTDOWN_START = 10;
 // Responses come from a warm in-memory cache (~13 ms, ~36 KB gzipped), so polling is
 // bounded by how fast the server re-quotes rather than by request cost.
 //
@@ -1152,41 +1095,17 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
       // minimum the PM leg is rejected while Kalshi fills, leaving a naked position.
       if (betAmount < MIN_ORDER_CONTRACTS) continue;
       executedPairs.current.add(key);
-      setExecPhase({ phase: 'pending', opp, amount: betAmount, countdown: COUNTDOWN_START, key });
-      break; // one at a time
-    }
-  }, [data, autoExec, autoExecScope, execThreshold, bankroll, execPhase]);
-
-  // Countdown: decrement every second, fire when it hits 0
-  useEffect(() => {
-    if (!execPhase || execPhase.phase !== 'pending') return;
-    if (execPhase.countdown <= 0) {
-      const { opp, amount: betAmount, key } = execPhase;
+      // Fire immediately. This used to open a 10-second confirmation countdown, which
+      // defeated the point: an arb edge is usually gone within a second or two, so by the
+      // time the prompt was answered the trade no longer existed. Auto-execute means
+      // auto-execute — the toggle itself is the consent, and the safety checks that matter
+      // (depth, funding, and a price re-check) all run server-side inside /api/execute,
+      // which backs out and sends nothing if the edge has moved.
       setExecPhase({ phase: 'executing', opp, amount: betAmount, key });
       executeOpportunity(opp, betAmount, key);
-      return;
+      break; // one at a time
     }
-    const id = setTimeout(() => {
-      setExecPhase(prev =>
-        prev?.phase === 'pending' ? { ...prev, countdown: prev.countdown - 1 } : prev
-      );
-    }, 1000);
-    return () => clearTimeout(id);
-  }, [execPhase, executeOpportunity]);
-
-  function handleCancel() {
-    if (execPhase?.phase === 'pending') {
-      executedPairs.current.delete(execPhase.key);
-    }
-    setExecPhase(null);
-  }
-
-  function handleExecuteNow() {
-    if (execPhase?.phase !== 'pending') return;
-    const { opp, amount: betAmount, key } = execPhase;
-    setExecPhase({ phase: 'executing', opp, amount: betAmount, key });
-    executeOpportunity(opp, betAmount, key);
-  }
+  }, [data, autoExec, autoExecScope, execThreshold, bankroll, execPhase, executeOpportunity]);
 
   function handleDismiss() {
     setExecPhase(null);
@@ -1281,12 +1200,10 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
   const quotesStale = quoteAgeMs > 8_000;
 
   // ── two-screen auto-exec views ─────────────────────────────────────────────
-  if (execPhase?.phase === 'pending' || execPhase?.phase === 'executing') {
+  if (execPhase?.phase === 'executing') {
     return (
       <ExecutionPendingScreen
-        execPhase={execPhase as PendingPhase | ExecutingPhase}
-        onCancel={handleCancel}
-        onExecuteNow={handleExecuteNow}
+        execPhase={execPhase}
       />
     );
   }
