@@ -451,3 +451,33 @@ export async function cancelPolymarketOrder(orderId: string): Promise<{ ok: bool
     return { ok: false, error: describeError(err) };
   }
 }
+
+// ─── funding snapshot ────────────────────────────────────────────────────────
+// testPolymarketAuth is a diagnostic: it reads the collateral balance, the wallet's owner
+// and the trading approvals, which measured a median of 309ms and a worst case of 2.7s. It
+// was being called on the pre-order path to check funding, so every trade waited on all
+// three — more than the entire order-book re-check (~162ms), and invisible because it is not
+// counted in revalidateMs.
+//
+// The order path only needs the balance. Ownership cannot change between two orders, and
+// approvals are not consulted. The balance is cached briefly because it moves only when a
+// trade settles, and staleness here is harmless in a way stale PRICES are not: this check is
+// belt-and-braces, and the venue itself rejects an underfunded order. Getting it slightly
+// wrong costs a rejection; being slow costs the edge.
+let _fundingCache: { at: number; dollars: number } | null = null;
+const FUNDING_TTL_MS = 5_000;
+
+export async function polymarketFundingDollars(): Promise<number | undefined> {
+  if (_fundingCache && Date.now() - _fundingCache.at < FUNDING_TTL_MS) return _fundingCache.dollars;
+  const init = await getSecureClient();
+  if ('error' in init) return undefined;
+  const dollars = await onChainCollateral(init.wallet);
+  if (dollars === undefined) return _fundingCache?.dollars;   // keep the last good reading
+  _fundingCache = { at: Date.now(), dollars };
+  return dollars;
+}
+
+/** Drop the cached balance so the next check re-reads it — call after a fill changes it. */
+export function invalidatePolymarketFunding(): void {
+  _fundingCache = null;
+}

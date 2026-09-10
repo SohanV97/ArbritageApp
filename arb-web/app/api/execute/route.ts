@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import type { ArbitrageOpportunity } from '@/lib/market-types';
 import { MIN_ORDER_CONTRACTS } from '@/lib/market-types';
 import { placeKalshiOrder, testKalshiAuth } from '@/api/kalshi-trading';
-import { placePolymarketOrder, testPolymarketAuth } from '@/api/polymarket-trading';
+import { placePolymarketOrder, testPolymarketAuth, polymarketFundingDollars, invalidatePolymarketFunding } from '@/api/polymarket-trading';
 import type { KalshiAuthTest } from '@/api/kalshi-trading';
 import type { PolymarketAuthTest } from '@/api/polymarket-trading';
 import { getKalshiOrderbook } from '@/api/kalshi';
@@ -45,6 +45,8 @@ export interface ExecuteResponse {
 interface ExecuteRequest {
   opportunity: ArbitrageOpportunity;
   amount: number; // payout = number of contracts on each leg
+  /** Run every pre-order check against live books, report the result, send nothing. */
+  dryRun?: boolean;
 }
 
 // Polymarket markets at runtime carry yesTokenId/noTokenId even though
@@ -204,16 +206,26 @@ export async function POST(request: Request): Promise<Response> {
   // filled Polymarket leg — a naked position. One source of truth removes both.
   const quotedEdgePercent = Number.isFinite(opportunity.edgePercent) ? opportunity.edgePercent : undefined;
   const revalStart = Date.now();
-  const [kOrderbook, pmBooks] = await Promise.all([
+  // Both ladders derive from the YES token's book, whichever side is being bought.
+  const pmYesToken = pmRich.yesTokenId ?? '';
+
+  // Both books are fetched fresh, deliberately, even though the refresh loop holds recent
+  // copies. Serving the Polymarket book from that cache would save its ~162ms round trip,
+  // but the limit prices are derived from this ladder: a stale Polymarket ladder prices that
+  // leg too low while the Kalshi leg is priced off a fresh book, so Kalshi fills and
+  // Polymarket does not. That is a naked position — the exact failure this route exists to
+  // prevent — traded for latency. A stale-price abort costs nothing; a naked leg costs money.
+  const [kOrderbook, fetchedPmBooks] = await Promise.all([
     getKalshiOrderbook(kalshiTicker),
-    getPolymarketBooks([pmRich.yesTokenId ?? '']),
+    getPolymarketBooks([pmYesToken]),
   ]);
   const revalidateMs = Date.now() - revalStart;
 
   // Derive the fee model server-side rather than trusting the posted market.
   const feeKind = pair.polymarket.category === 'politics' ? 'fee_free' : 'sports';
   const kalLadder = kalshiAskLadder(kOrderbook, actualKalshiSide);
-  const pmLadder = polymarketAskLadder(pmBooks.get(pmRich.yesTokenId ?? ''), pmLeg.side);
+  const pmBook = fetchedPmBooks.get(pmYesToken);
+  const pmLadder = polymarketAskLadder(pmBook, pmLeg.side);
 
   // An unreadable book is not an empty one. Both produce a zero-length ladder, and
   // reporting a failed request as "not enough depth" sent users hunting for liquidity that
@@ -308,9 +320,13 @@ export async function POST(request: Request): Promise<Response> {
   // the fact is too late — the money is already committed.
   const kalCostCents = freshKalPrice * plannedContracts;
   const pmCostCents = freshPmPrice * plannedContracts;
-  const [kalAuth, pmAuth] = await Promise.all([testKalshiAuth(), testPolymarketAuth()]);
+  // Kalshi's check is free (measured 0ms, it is already cached). Polymarket's full auth test
+  // is not: 309ms median, 2.7s worst, because it also reads wallet ownership and trading
+  // approvals from the chain. Neither is needed to decide whether a leg is affordable, and
+  // both sat on the critical path ahead of every order.
+  const [kalAuth, pmDollars] = await Promise.all([testKalshiAuth(), polymarketFundingDollars()]);
   const kalFunds = (kalAuth.balanceDollars ?? 0) * 100;
-  const pmFunds = (pmAuth.usdcBalance ?? 0) * 100;
+  const pmFunds = (pmDollars ?? 0) * 100;
   const shortfalls: string[] = [];
   if (kalFunds < kalCostCents) {
     shortfalls.push(`Kalshi has $${(kalFunds / 100).toFixed(2)} but this leg costs $${(kalCostCents / 100).toFixed(2)}`);
@@ -336,6 +352,28 @@ export async function POST(request: Request): Promise<Response> {
     return NextResponse.json(body, { status: 409 });
   }
 
+  // dryRun stops here: every check above has run against live books, so this reports what
+  // WOULD be sent, and how long confirming it took, without sending it. That makes the
+  // pre-order path measurable and testable at any time — otherwise the only way to time it
+  // is to spend money, and the only way to prove it works is to place a real trade.
+  if (body.dryRun === true) {
+    const dry: ExecuteResponse = {
+      kalshi: { ok: false, error: `Dry run — would buy ${plannedContracts} @ ${freshKalPrice}¢` },
+      polymarket: { ok: false, error: `Dry run — would buy ${plannedContracts} @ ${freshPmPrice}¢` },
+      executedAt: new Date().toISOString(),
+      bothOk: false,
+      hedged: false,
+      noOrdersSent: true,
+      revalidateMs,
+      quotedEdgePercent,
+      freshEdgePercent,
+      hedgeNote: `Dry run: ${plannedContracts} contracts at ${freshKalPrice}¢ (Kalshi) + ` +
+        `${freshPmPrice}¢ (Polymarket), edge ${freshEdgePercent.toFixed(2)}%, confirmed in ` +
+        `${revalidateMs}ms. No orders were sent.`,
+    };
+    return NextResponse.json(dry);
+  }
+
   // Place both legs simultaneously — this minimizes price-movement risk between legs.
   // Limits are the FRESH prices, so a market that moved is quoted at what it is now
   // rather than at a stale price that would simply fail to fill.
@@ -352,6 +390,10 @@ export async function POST(request: Request): Promise<Response> {
       priceCents: freshPmPrice,
     }),
   ]);
+
+  // A fill changes the balance, so drop the cached reading rather than let the next order
+  // size itself against money that has already been spent.
+  invalidatePolymarketFunding();
 
   // Scrub any secret material from error strings before they reach the client/logs.
   const kalshiResult: LegResult = { ...kalshiRaw, error: scrubSecrets(kalshiRaw.error) };

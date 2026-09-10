@@ -896,7 +896,10 @@ const ALL_CATEGORIES: Category[] = ['mlb', 'nfl', 'cfb', 'soccer', 'politics'];
 // though the server had fresher data sitting in memory. During a live game that gap is
 // exactly what makes a click arrive after the edge has gone, and the execution abort
 // (correctly) refuses to trade it. Polling faster costs a memory read per request.
-const POLL_MS = 350;
+// Responses are a memory read (~10ms), so the poll interval is pure added staleness on
+// top of the server's own refresh. At 350ms a price could be a third of a second old before
+// it even reached the screen, which is most of the window an in-play edge lives in.
+const POLL_MS = 150;
 
 export default function Home() {
   const [data, setData] = useState<OpportunitiesResponse | null>(null);

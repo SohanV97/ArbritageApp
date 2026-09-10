@@ -263,7 +263,7 @@ function applyDepth(opps: ArbitrageOpportunity[]): void {
 // Fast tick. Only in-play markets are re-quoted this often, so the added load is one
 // small batch per venue (Kalshi's full 319-ticker batch already measures 24ms, and
 // Polymarket's book call is ~120ms of pure network RTT regardless of size).
-const FAST_REPRICE_MS = 250;
+const FAST_REPRICE_MS = 150;
 // Full set. Pre-game prices drift slowly, so they do not need the fast lane.
 const REPRICE_MS = 700;
 const REDISCOVER_MS = 90_000;
