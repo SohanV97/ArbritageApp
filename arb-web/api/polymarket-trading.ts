@@ -7,6 +7,9 @@
  *                                     SDK derives the signer's deterministic Deposit
  *                                     Wallet, which only works if that wallet is already
  *                                     deployed — pass the address Polymarket shows you.
+ *   POLYMARKET_RELAYER_API_KEY=...    optional, and only needed for on-chain operations
+ *   POLYMARKET_RELAYER_ADDRESS=0x...  (granting trading approvals). Placing orders does not
+ *                                     need it: orders are signed messages, not transactions.
  *
  * ─── why this was rewritten ───────────────────────────────────────────────────
  * This module used @polymarket/clob-client, whose Polygon config hardcodes the collateral
@@ -100,7 +103,7 @@ async function onChainCollateral(address: string): Promise<number | undefined> {
 // ─── client ──────────────────────────────────────────────────────────────────
 // createSecureClient authenticates over the network, so build it once and reuse it. Keyed
 // on the credentials so an env change during dev is picked up rather than cached forever.
-type CachedClient = { key: string; wallet: string; client: SecureClient };
+type CachedClient = { key: string; wallet: string; relayer: string; client: SecureClient };
 let _cached: CachedClient | null = null;
 
 async function getSecureClient(): Promise<{ client: SecureClient; address: string; wallet: string } | { error: string }> {
@@ -117,24 +120,35 @@ async function getSecureClient(): Promise<{ client: SecureClient; address: strin
   }
   const wallet = process.env.POLYMARKET_FUNDER_ADDRESS?.trim() ?? '';
 
+  // A Relayer API key is what lets Polymarket submit transactions on the wallet's behalf.
+  // Trading itself does not need it — orders are signed messages, not transactions — but
+  // anything that touches the chain does: granting trading approvals, deploying a deposit
+  // wallet, returning collateral. Without it the SDK reports supportsGasless === false and
+  // refuses those operations outright.
+  const relayerKey = process.env.POLYMARKET_RELAYER_API_KEY?.trim() ?? '';
+  const relayerAddress = process.env.POLYMARKET_RELAYER_ADDRESS?.trim() ?? '';
+  const relayer = relayerKey && relayerAddress ? `${relayerKey}@${relayerAddress}` : '';
+
   try {
     const { privateKey } = await import('@polymarket/client/viem');
-    const { createSecureClient } = await import('@polymarket/client');
+    const { createSecureClient, relayerApiKey } = await import('@polymarket/client');
     const signer = privateKey(key as `0x${string}`);
     const address = await signer.getAddress();
 
-    if (_cached && _cached.key === key && _cached.wallet === wallet) {
+    if (_cached && _cached.key === key && _cached.wallet === wallet && _cached.relayer === relayer) {
       return { client: _cached.client, address, wallet: wallet || address };
     }
 
     // Passing `wallet` explicitly matters: without it the SDK derives the signer's
-    // deterministic Deposit Wallet and tries to DEPLOY it, which needs a relayer key the
-    // app does not hold. The deposit wallet Polymarket already created is the one to use.
-    const client = wallet
-      ? await createSecureClient({ signer, wallet })
-      : await createSecureClient({ signer });
+    // deterministic Deposit Wallet and tries to DEPLOY it, which needs a relayer key. The
+    // deposit wallet Polymarket already created is the one to use.
+    const client = await createSecureClient({
+      signer,
+      ...(wallet ? { wallet } : {}),
+      ...(relayer ? { apiKey: relayerApiKey({ key: relayerKey, address: relayerAddress }) } : {}),
+    });
 
-    _cached = { key, wallet, client };
+    _cached = { key, wallet, relayer, client };
     return { client, address, wallet: wallet || address };
   } catch (err) {
     return { error: `Failed to initialize Polymarket client: ${describeError(err)}` };
@@ -209,8 +223,11 @@ export async function testPolymarketAuth(): Promise<PolymarketAuthTest> {
     } else if (approvalsReady === false) {
       diagnosis =
         `$${balance.toFixed(2)} is available at ${init.wallet}, but the wallet has not granted the ` +
-        `exchange permission to move it, so every order will be rejected. Granting that is a ` +
-        `one-time step: run "npm run setup:approvals". Polymarket pays the gas, so it costs nothing.`;
+        `exchange permission to move it, so every order will be rejected. Granting it is an ` +
+        `on-chain transaction, and this wallet has no MATIC to pay for one — so the simplest fix ` +
+        `is to place one small trade on polymarket.com, which sets exactly these approvals ` +
+        `through their own relayer. This app picks them up automatically afterwards. ` +
+        `("npm run setup:approvals" does the same thing, but only if you hold a Relayer API key.)`;
     }
 
     return {
@@ -293,6 +310,24 @@ export async function setupPolymarketApprovals(): Promise<{ ok: boolean; already
       ? { ok: true }
       : { ok: false, error: 'Approvals were submitted but the wallet still reads as not fully approved. Re-run to retry the remaining ones.' };
   } catch (err) {
-    return { ok: false, error: describeError(err) };
+    const msg = describeError(err);
+    if (/Relayer API Key|Builder API Key|gasless/i.test(msg)) {
+      return {
+        ok: false,
+        error:
+          'Granting approvals is an on-chain transaction, and this wallet holds no MATIC to pay ' +
+          'for one, so it has to go through the Polymarket relayer — which the SDK will only use ' +
+          'when it is given a Relayer API key.\n\n' +
+          'Two ways forward:\n' +
+          '  1. Place one small trade on polymarket.com. Their own frontend has relayer access ' +
+          'and sets these exact approvals; this app then picks them up automatically, because ' +
+          'approvals live on the wallet rather than in any one app.\n' +
+          '  2. If you hold a Relayer API key, set POLYMARKET_RELAYER_API_KEY and ' +
+          'POLYMARKET_RELAYER_ADDRESS in .env.local and re-run.\n\n' +
+          'Option 1 is the normal path; relayer keys are issued to Polymarket integration ' +
+          'partners, not handed out with a regular account.',
+      };
+    }
+    return { ok: false, error: msg };
   }
 }
