@@ -41,6 +41,14 @@ export function saveDiscovery(d: {
   matchedPm: unknown[];
   matchedKalshi: UnifiedMarket[];
 }): void {
+  // Never overwrite a good cache with an empty scan. The point of this file is to let a
+  // restart serve real pairs immediately instead of waiting ~15s; persisting a failed scan
+  // turns it into the opposite, seeding the next start with nothing. Defense in depth — the
+  // caller already refuses to publish an empty rediscovery.
+  if (d.matchedPm.length === 0 && d.matchedKalshi.length === 0) {
+    console.warn('[discovery-cache] refusing to persist an empty discovery — keeping the previous file');
+    return;
+  }
   try {
     const pairs: PersistedDiscovery['pairs'] = [];
     for (const [category, list] of d.pairsByCategory) {

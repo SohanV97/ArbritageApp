@@ -600,6 +600,25 @@ async function repriceAndAssemble(disc: Discovery): Promise<OpportunitiesRespons
 
 async function buildOpportunities(): Promise<OpportunitiesResponse> {
   const disc = await discover();
+
+  // A rediscovery that found NOTHING on either venue is a network failure, not an empty
+  // market. Both venues going silent at once has been observed — every Kalshi series logging
+  // "fetch failed" while Polymarket returned 0 events — and publishing that result replaced a
+  // working set of hundreds of markets with nothing, then wrote the nothing to disk, so the
+  // next restart began blank as well. One bad minute of connectivity therefore blanked the
+  // app until a later scan happened to succeed.
+  //
+  // Keep what we already have instead. Prices for those markets are re-fetched every tick
+  // regardless, so holding the fixture list across a blip costs nothing and the next
+  // rediscovery replaces it normally.
+  const foundNothing = disc.matchedPm.length === 0 && disc.matchedKalshi.length === 0;
+  const haveWorkingSet = !!_discovery
+    && (_discovery.matchedPm.length > 0 || _discovery.matchedKalshi.length > 0);
+  if (foundNothing && haveWorkingSet) {
+    console.warn('[opportunities] rediscovery found no markets on either venue — keeping the previous set');
+    return repriceAndAssemble(_discovery!);
+  }
+
   _discovery = disc;
   // Persist the fixture list so the next process start does not have to redo the ~15s scan.
   saveDiscovery(disc);

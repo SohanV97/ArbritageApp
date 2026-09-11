@@ -704,16 +704,33 @@ function ExecutionPendingScreen({ execPhase }: { execPhase: ExecutingPhase }) {
 
 // ─── ExecutionResultScreen ───────────────────────────────────────────────────
 
+/**
+ * Whether a result needs a human before trading continues.
+ *
+ * Only an actual position that is not a clean hedge does: a naked or partial fill is money
+ * at risk that someone has to close by hand. Everything else — a clean hedge, or any of the
+ * pre-order aborts, which send no orders at all — is informational, and holding the screen
+ * open for it stops an unattended session dead.
+ */
+function resultNeedsAttention(r: ExecuteResponse): boolean {
+  if (r.noOrdersSent) return false;   // nothing was sent, so nothing is exposed
+  return !r.hedged;
+}
+
+
 function ExecutionResultScreen({
   opp,
   amount,
   result,
   onDismiss,
+  autoDismissSec,
 }: {
   opp: ArbitrageOpportunity;
   amount: number;
   result: ExecuteResponse;
   onDismiss: () => void;
+  /** Seconds until this closes itself and scanning resumes; absent means it waits. */
+  autoDismissSec?: number;
 }) {
   const { pair, totalCostCents, edgePercent } = opp;
   const hedged = result.hedged;
@@ -855,6 +872,12 @@ function ExecutionResultScreen({
           >
             Back to Markets
           </button>
+
+          {autoDismissSec !== undefined && (
+            <p className="text-xs text-center mt-3" style={{ color: 'var(--text-muted)' }}>
+              Auto-execute is on — resuming the scan in {autoDismissSec}s.
+            </p>
+          )}
         </div>
       </div>
     </div>
@@ -900,6 +923,9 @@ const ALL_CATEGORIES: Category[] = ['mlb', 'nfl', 'cfb', 'soccer', 'politics'];
 // top of the server's own refresh. At 350ms a price could be a third of a second old before
 // it even reached the screen, which is most of the window an in-play edge lives in.
 const POLL_MS = 150;
+// How long a harmless result stays on screen while auto-execute is running. Long enough to
+// read in passing, short enough that an unattended session does not sit idle on it.
+const RESULT_AUTODISMISS_MS = 6_000;
 
 export default function Home() {
   const [data, setData] = useState<OpportunitiesResponse | null>(null);
@@ -933,6 +959,7 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
   const [riskDollars, setRiskDollars] = useState(100);
   const [execLog, setExecLog] = useState<ExecLogEntry[]>([]);
   const [execPhase, setExecPhase] = useState<ExecPhase | null>(null);
+  const [resultCountdown, setResultCountdown] = useState<number | null>(null);
   const [connTest, setConnTest] = useState<{ state: 'idle' | 'pending' | 'done'; result?: ConnectionTestResponse }>({ state: 'idle' });
 
   async function handleTestConnection() {
@@ -1091,9 +1118,16 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
     if (view === 'pairs') load();
   }, [view, load]);
 
-  // Auto-exec: queue a pending execution when a new qualifying opportunity appears
+  // Auto-exec: fire on a new qualifying opportunity the moment one appears
   useEffect(() => {
-    if (!autoExec || !data || execPhase !== null) return;
+    // A trade in flight blocks another, and so does a result that needs a human — a naked or
+    // partial fill must not be scrolled past by the next trade. A HARMLESS result does not
+    // block: it closes itself after a few seconds, and refusing to trade for that whole
+    // countdown is a blind window an unattended run cannot afford. The next execution simply
+    // replaces the screen.
+    const busy = execPhase !== null
+      && (execPhase.phase !== 'result' || resultNeedsAttention(execPhase.result));
+    if (!autoExec || !data || busy) return;
     for (const opp of data.opportunities) {
       if (opp.edgePercent < execThreshold) break;
       // Hard floor: never auto-trade a non-profitable edge, whatever the threshold says.
@@ -1127,6 +1161,25 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
       break; // one at a time
     }
   }, [data, autoExec, autoExecScope, execThreshold, riskDollars, execPhase, executeOpportunity]);
+
+  // Close a harmless result by itself while auto-execute is on.
+  //
+  // The result screen takes over the whole view and the auto-exec effect refuses to fire
+  // while execPhase is set, so an unattended run stopped at the first trade and waited for
+  // a click that might not come for hours. Every result is already recorded in the execution
+  // log, so closing it loses nothing. A naked or partial fill is the exception and stays up:
+  // that is money at risk, and it should not scroll past while nobody is watching.
+  useEffect(() => {
+    if (!autoExec || execPhase?.phase !== 'result') { setResultCountdown(null); return; }
+    if (resultNeedsAttention(execPhase.result)) { setResultCountdown(null); return; }
+
+    setResultCountdown(Math.ceil(RESULT_AUTODISMISS_MS / 1000));
+    const tick = setInterval(() => {
+      setResultCountdown(prev => (prev === null ? null : Math.max(0, prev - 1)));
+    }, 1000);
+    const close = setTimeout(() => setExecPhase(null), RESULT_AUTODISMISS_MS);
+    return () => { clearInterval(tick); clearTimeout(close); };
+  }, [autoExec, execPhase]);
 
   function handleDismiss() {
     setExecPhase(null);
@@ -1245,6 +1298,7 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
         amount={execPhase.amount}
         result={execPhase.result}
         onDismiss={handleDismiss}
+        autoDismissSec={resultCountdown ?? undefined}
       />
     );
   }
