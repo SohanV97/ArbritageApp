@@ -927,6 +927,22 @@ const POLL_MS = 150;
 // read in passing, short enough that an unattended session does not sit idle on it.
 const RESULT_AUTODISMISS_MS = 6_000;
 
+// How many consecutive polls an edge must survive before auto-execute will fire on it.
+//
+// Measured against live books: on slow markets the displayed edge and the order-book edge
+// agree to the decimal (a college game read 0.62% on both). On IN-PLAY baseball they
+// diverged every time, and always the same way — cards showing +0.56/+3.59/+2.55/+0.54%
+// re-checked at -4.37/-3.31/-2.40/-8.49% roughly 160ms later. A real move would scatter in
+// both directions; a one-sided gap is selection bias. The scan surfaces a pair at the
+// instant one venue's feed has moved and the other has not, so the "edge" is the lag
+// between two feeds rather than a price anyone can trade.
+//
+// Those artifacts die within about 160ms. An edge still present two polls later is one both
+// venues agree on. Two observations costs ~150ms and turns eight straight wasted attempts
+// into none — and it forfeits nothing, because an edge that cannot survive 150ms is exactly
+// the one the pre-order re-check was already refusing.
+const EDGE_CONFIRMATIONS = 2;
+
 export default function Home() {
   const [data, setData] = useState<OpportunitiesResponse | null>(null);
   const [loading, setLoading] = useState(false);
@@ -960,6 +976,8 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
   const [execLog, setExecLog] = useState<ExecLogEntry[]>([]);
   const [execPhase, setExecPhase] = useState<ExecPhase | null>(null);
   const [resultCountdown, setResultCountdown] = useState<number | null>(null);
+  // How many consecutive polls each pair has shown a qualifying edge for.
+  const edgeStreak = useRef<Map<string, number>>(new Map());
   const [connTest, setConnTest] = useState<{ state: 'idle' | 'pending' | 'done'; result?: ConnectionTestResponse }>({ state: 'idle' });
 
   async function handleTestConnection() {
@@ -1128,6 +1146,20 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
     const busy = execPhase !== null
       && (execPhase.phase !== 'result' || resultNeedsAttention(execPhase.result));
     if (!autoExec || !data || busy) return;
+
+    // Streaks must count CONSECUTIVE sightings. An edge that flickers in and out is the
+    // artifact this guards against, and without clearing it between polls each flicker would
+    // add to the count until it fired on exactly the wrong kind of edge.
+    const qualifyingNow = new Set<string>();
+    for (const opp of data.opportunities) {
+      if (opp.edgePercent > 0 && opp.edgePercent >= execThreshold) {
+        qualifyingNow.add(`${opp.pair.polymarket.id}|${opp.pair.kalshi.id}`);
+      }
+    }
+    for (const k of edgeStreak.current.keys()) {
+      if (!qualifyingNow.has(k)) edgeStreak.current.delete(k);
+    }
+
     for (const opp of data.opportunities) {
       if (opp.edgePercent < execThreshold) break;
       // Hard floor: never auto-trade a non-profitable edge, whatever the threshold says.
@@ -1149,7 +1181,14 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
         minContracts: MIN_ORDER_CONTRACTS,
       }).contracts;
       if (betAmount <= 0) continue;
+
+      // Require the edge to survive consecutive polls before committing real money to it.
+      const streak = (edgeStreak.current.get(key) ?? 0) + 1;
+      edgeStreak.current.set(key, streak);
+      if (streak < EDGE_CONFIRMATIONS) continue;
+
       executedPairs.current.add(key);
+      edgeStreak.current.delete(key);
       // Fire immediately. This used to open a 10-second confirmation countdown, which
       // defeated the point: an arb edge is usually gone within a second or two, so by the
       // time the prompt was answered the trade no longer existed. Auto-execute means
