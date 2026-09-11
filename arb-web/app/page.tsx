@@ -941,7 +941,13 @@ const RESULT_AUTODISMISS_MS = 6_000;
 // venues agree on. Two observations costs ~150ms and turns eight straight wasted attempts
 // into none — and it forfeits nothing, because an edge that cannot survive 150ms is exactly
 // the one the pre-order re-check was already refusing.
-const EDGE_CONFIRMATIONS = 2;
+// Set to 1 — OFF by default. Two confirmations reliably filtered the artifacts, but it buys
+// that by never attempting a fleeting edge at all, and a fleeting edge is the only kind a
+// lagging feed ever offers. A wasted attempt costs nothing: no orders are sent, and the
+// pre-order re-check is what refuses them. Trading away capture to reduce log noise is the
+// wrong side of that trade while catching these is the goal. Raise to 2 to suppress the
+// failed attempts once the latency work below makes real captures the common case.
+const EDGE_CONFIRMATIONS = 1;
 
 export default function Home() {
   const [data, setData] = useState<OpportunitiesResponse | null>(null);
