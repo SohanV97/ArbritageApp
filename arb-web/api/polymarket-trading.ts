@@ -41,8 +41,10 @@ export interface PolymarketOrderRequest {
 export interface PolymarketOrderResult {
   ok: boolean;          // order accepted by the CLOB without error
   orderId?: string;
-  status?: string;      // e.g. "matched", "live", "unmatched"
+  status?: string;      // e.g. "matched", "live", "delayed", "unmatched"
   filledCount?: number; // shares actually filled (takingAmount on a BUY)
+  /** Average price actually paid, in cents. Absent when the venue reported no amounts. */
+  avgPriceCents?: number;
   error?: string;
 }
 
@@ -470,8 +472,19 @@ export async function placePolymarketOrder(req: PolymarketOrderRequest): Promise
       if (matched > filled) filled = matched;
     }
 
+    // What the fill actually cost, rather than the limit we were willing to pay. On a BUY
+    // the maker amount is collateral out and the taker amount is shares in; a SELL is the
+    // mirror. Only meaningful when the venue reported both.
+    const making = Number(result.makingAmount);
+    const taking = Number(result.takingAmount);
+    let avgPriceCents: number | undefined;
+    if (Number.isFinite(making) && Number.isFinite(taking) && making > 0 && taking > 0) {
+      const ratio = req.action === 'sell' ? taking / making : making / taking;
+      if (Number.isFinite(ratio) && ratio > 0) avgPriceCents = Math.round(ratio * 100);
+    }
     return {
       ok: true,
+      avgPriceCents,
       orderId: result.orderId,
       status: result.status,
       filledCount: filled,

@@ -32,6 +32,35 @@ export interface LegResult {
   error?: string;
 }
 
+/** One side of a trade, as it actually executed. */
+export interface TradeLegSummary {
+  venue: 'kalshi' | 'polymarket';
+  /** Ticker or question, whichever identifies the market on that venue. */
+  market: string;
+  side: 'yes' | 'no';
+  /** Who this leg pays on, in words — the thing "yes"/"no" alone never makes clear. */
+  outcome: string;
+  contracts: number;
+  priceCents: number;
+  costDollars: number;
+}
+
+/** What a trade cost and what it is worth, for the trades screen. */
+export interface TradeSummary {
+  legs: TradeLegSummary[];
+  /** Size that is actually hedged — the smaller of the two fills. */
+  hedgedContracts: number;
+  costDollars: number;
+  /** Fees estimated for the filled size, both venues. */
+  feesDollars: number;
+  /** Paid out when the position settles, if it is a true hedge: $1 per hedged contract. */
+  payoutDollars: number;
+  /** payout - cost - fees. Only a guarantee when status is 'hedged'. */
+  profitDollars: number;
+  profitPercent: number;
+  status: 'hedged' | 'partial' | 'naked' | 'none';
+}
+
 export interface ExecuteResponse {
   kalshi: LegResult;
   polymarket: LegResult;
@@ -53,6 +82,8 @@ export interface ExecuteResponse {
   /** edge the client was showing vs. the edge at the moment of execution. */
   quotedEdgePercent?: number;
   freshEdgePercent?: number;
+  /** What actually executed, priced from the fills. Absent when nothing was sent. */
+  trade?: TradeSummary;
 }
 
 export interface ExecuteRequest {
@@ -682,6 +713,57 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
     }));
   }
 
+  // ── what actually executed ────────────────────────────────────────────────
+  // Built from the FILLS, not from the plan. "Both legs green" was never the same thing as
+  // "hedged", and reading the log could not tell you which side you were on or what you
+  // paid — so this states both, per leg, in words.
+  const kalContracts = kalshiResult.ok ? (kalshiResult.filledCount ?? 0) : 0;
+  const pmContracts = pmResult.ok ? (pmResult.filledCount ?? 0) : 0;
+  const kalPrice = kalshiResult.avgPriceCents ?? freshKalPrice;
+  const pmPrice = pmResult.avgPriceCents ?? freshPmPrice;
+
+  const kalYesTeam = pair.kalshi.yesTeam;
+  const kalshiOutcome = actualKalshiSide === 'yes'
+    ? (kalYesTeam ?? 'YES')
+    // Kalshi names only its YES team, so the NO side is stated as its negation rather than
+    // guessed at from the opponent's name, which is spelled differently on each venue.
+    : (kalYesTeam ? `NOT ${kalYesTeam}` : 'NO');
+  const pmOutcome = pmLeg.side === 'yes'
+    ? (pair.polymarket.yesTeam ?? 'YES')
+    : (pair.polymarket.noTeam ?? 'NO');
+
+  const hedgedContracts = Math.min(kalContracts, pmContracts);
+  const costDollars = (kalPrice * kalContracts + pmPrice * pmContracts) / 100;
+  const feesDollars = (
+    estimateKalshiFeeCents(kalPrice, kalContracts) +
+    estimatePolymarketFeeCents(feeKind, pmPrice, pmContracts)
+  ) / 100;
+  // Exactly one side of a true hedge pays out $1 per contract; the other expires worthless.
+  const payoutDollars = hedgedContracts;
+  const profitDollars = payoutDollars - costDollars - feesDollars;
+
+  const tradeStatus: TradeSummary['status'] =
+    kalContracts === 0 && pmContracts === 0 ? 'none'
+    : hedgedContracts === 0 ? 'naked'
+    : kalContracts !== pmContracts ? 'partial'
+    : 'hedged';
+
+  const legs: TradeLegSummary[] = [];
+  if (kalContracts > 0) legs.push({
+    venue: 'kalshi', market: kalshiTicker, side: actualKalshiSide, outcome: kalshiOutcome,
+    contracts: kalContracts, priceCents: kalPrice, costDollars: (kalPrice * kalContracts) / 100,
+  });
+  if (pmContracts > 0) legs.push({
+    venue: 'polymarket', market: pair.polymarket.question, side: pmLeg.side, outcome: pmOutcome,
+    contracts: pmContracts, priceCents: pmPrice, costDollars: (pmPrice * pmContracts) / 100,
+  });
+
+  const trade: TradeSummary = {
+    legs, hedgedContracts, costDollars, feesDollars, payoutDollars, profitDollars,
+    profitPercent: costDollars > 0 ? (profitDollars / costDollars) * 100 : 0,
+    status: tradeStatus,
+  };
+
   const response: ExecuteResponse = {
     kalshi: kalshiResult,
     polymarket: pmResult,
@@ -693,6 +775,7 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
     revalidateMs,
     quotedEdgePercent,
     freshEdgePercent,
+    trade,
   };
 
   // Audit log (server-side only). Order IDs + fill counts, no error bodies with secrets.

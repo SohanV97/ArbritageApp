@@ -913,6 +913,171 @@ interface ExecLogEntry {
   result: ExecuteResponse;
 }
 
+// ─── trades screen ──────────────────────────────────────────────────────────
+
+const STATUS_STYLE: Record<string, { label: string; color: string; bg: string }> = {
+  hedged:  { label: 'HEDGED',    color: '#4ade80', bg: '#16a34a22' },
+  partial: { label: 'PARTIAL',   color: '#fbbf24', bg: '#f59e0b22' },
+  naked:   { label: 'NAKED',     color: '#f87171', bg: '#dc262622' },
+  none:    { label: 'NO ORDERS', color: '#9ca3af', bg: 'transparent' },
+};
+
+/**
+ * Every trade, stated so it needs no interpretation: which side each venue took, what it
+ * paid, and what the pair is worth.
+ *
+ * The old log said "KAL ✓ / PM ✓" and nothing more, which is how a trade that filled on one
+ * venue only could read as a success. Status here is derived from the FILLS, and anything
+ * that is not a hedge is labelled as what it actually is.
+ */
+function TradesScreen({ log }: { log: ExecLogEntry[] }) {
+  const traded = log.filter(e => e.result.trade && e.result.trade.legs.length > 0);
+
+  const totals = traded.reduce(
+    (acc, e) => {
+      const t = e.result.trade!;
+      acc.cost += t.costDollars;
+      acc.profit += t.profitDollars;
+      if (t.status === 'hedged') acc.hedged++;
+      if (t.status === 'naked' || t.status === 'partial') acc.open++;
+      return acc;
+    },
+    { cost: 0, profit: 0, hedged: 0, open: 0 },
+  );
+
+  if (traded.length === 0) {
+    return (
+      <div className="py-16 text-center">
+        <p className="text-[--text-muted]">No trades yet.</p>
+        <p className="text-xs text-[--text-muted] mt-2">
+          Attempts refused before any order went out are not trades, and are not listed here.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div
+        className="rounded-xl px-5 py-4 flex flex-wrap gap-x-10 gap-y-3"
+        style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}
+      >
+        <div>
+          <p className="text-xs text-[--text-muted]">Net profit</p>
+          <p className="text-2xl font-semibold font-mono" style={{ color: totals.profit >= 0 ? '#4ade80' : '#f87171' }}>
+            {totals.profit < 0 ? '−' : ''}{fmtUsd(totals.profit)}
+          </p>
+        </div>
+        <div>
+          <p className="text-xs text-[--text-muted]">Deployed</p>
+          <p className="text-2xl font-semibold font-mono">{fmtUsd(totals.cost)}</p>
+        </div>
+        <div>
+          <p className="text-xs text-[--text-muted]">Hedged</p>
+          <p className="text-2xl font-semibold font-mono">
+            {totals.hedged}<span className="text-sm text-[--text-muted]">/{traded.length}</span>
+          </p>
+        </div>
+        {totals.open > 0 && (
+          <div>
+            <p className="text-xs text-[--text-muted]">Needs attention</p>
+            <p className="text-2xl font-semibold font-mono" style={{ color: '#f87171' }}>{totals.open}</p>
+          </div>
+        )}
+      </div>
+
+      {traded.map((entry, i) => {
+        const t = entry.result.trade!;
+        const style = STATUS_STYLE[t.status] ?? STATUS_STYLE.none;
+        return (
+          <div
+            key={entry.id ?? `${entry.ts}-${i}`}
+            className="rounded-xl overflow-hidden"
+            style={{ background: 'var(--surface)', border: `1px solid ${style.color}44` }}
+          >
+            <div
+              className="px-5 py-3 flex items-center justify-between gap-4 flex-wrap"
+              style={{ borderBottom: '1px solid var(--border)' }}
+            >
+              <div className="min-w-0">
+                <p className="text-sm font-medium truncate">{entry.question}</p>
+                <p className="text-xs text-[--text-muted] font-mono">
+                  {new Date(entry.ts).toLocaleString()} · quoted edge +{entry.edgePercent.toFixed(2)}%
+                </p>
+              </div>
+              <span
+                className="text-xs font-semibold font-mono px-2.5 py-1 rounded-md flex-shrink-0"
+                style={{ color: style.color, background: style.bg }}
+              >
+                {style.label}
+              </span>
+            </div>
+
+            <div className="px-5 py-3 flex flex-col gap-2">
+              {t.legs.map((leg, k) => (
+                <div key={k} className="flex items-center justify-between gap-4 flex-wrap text-sm">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <span
+                      className="text-xs font-semibold font-mono px-2 py-0.5 rounded w-[86px] text-center flex-shrink-0"
+                      style={{
+                        background: leg.venue === 'kalshi' ? '#2563eb22' : '#7c3aed22',
+                        color: leg.venue === 'kalshi' ? '#60a5fa' : '#a78bfa',
+                      }}
+                    >
+                      {leg.venue === 'kalshi' ? 'KALSHI' : 'POLYMKT'}
+                    </span>
+                    <span className="font-medium truncate">
+                      Bought <span className="uppercase font-mono">{leg.side}</span>
+                      <span className="text-[--text-muted]"> · pays on </span>
+                      {leg.outcome}
+                    </span>
+                  </div>
+                  <span className="font-mono text-[--text-muted] flex-shrink-0">
+                    {leg.contracts} × {leg.priceCents}¢ ={' '}
+                    <span style={{ color: 'var(--foreground)' }}>{fmtUsd(leg.costDollars)}</span>
+                  </span>
+                </div>
+              ))}
+            </div>
+
+            <div
+              className="px-5 py-3 flex flex-wrap gap-x-8 gap-y-2 text-xs font-mono"
+              style={{ background: 'var(--card)', borderTop: '1px solid var(--border)' }}
+            >
+              <span className="text-[--text-muted]">
+                Cost <span style={{ color: 'var(--foreground)' }}>{fmtUsd(t.costDollars)}</span>
+              </span>
+              <span className="text-[--text-muted]">
+                Fees <span style={{ color: 'var(--foreground)' }}>{fmtUsd(t.feesDollars)}</span>
+              </span>
+              <span className="text-[--text-muted]">
+                Payout <span style={{ color: 'var(--foreground)' }}>{fmtUsd(t.payoutDollars)}</span>
+                {t.status === 'hedged' ? '' : ' (only if hedged)'}
+              </span>
+              <span className="text-[--text-muted]">
+                {t.status === 'hedged' ? 'Profit' : 'If it were hedged'}{' '}
+                <span style={{ color: t.profitDollars >= 0 ? '#4ade80' : '#f87171' }}>
+                  {t.profitDollars < 0 ? '−' : '+'}{fmtUsd(t.profitDollars)} (
+                  {t.profitPercent >= 0 ? '+' : '−'}{Math.abs(t.profitPercent).toFixed(2)}%)
+                </span>
+              </span>
+            </div>
+
+            {entry.result.hedgeNote && t.status !== 'hedged' && (
+              <div
+                className="px-5 py-2.5 text-xs"
+                style={{ background: '#dc262211', color: '#fca5a5', borderTop: '1px solid var(--border)' }}
+              >
+                {entry.result.hedgeNote}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 const makeExecId = (): string =>
   globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
@@ -948,7 +1113,7 @@ export default function Home() {
   const [lastFetch, setLastFetch] = useState<string | null>(null);
   // 'sports' is the default view: politics settles months out, so those markets dominate
   // the list by count while being the least actionable day to day.
-  const [view, setView] = useState<'sports' | 'opportunities' | 'pairs'>('sports');
+  const [view, setView] = useState<'sports' | 'opportunities' | 'pairs' | 'trades'>('sports');
   // Every listed opportunity is already profitable, so the bands narrow by size only.
   const [edgeFilter, setEdgeFilter] = useState<'all' | 'strong' | 'arb'>('all');
   const [catFilter, setCatFilter] = useState<Category | 'all'>('all');
@@ -1212,6 +1377,8 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
 
   // Both opportunity tabs share the same controls and card list; only their scope differs.
   const isOppView = view === 'sports' || view === 'opportunities';
+  // Only executions that actually placed something are trades; refused attempts are not.
+  const tradeCount = execLog.filter(e => e.result.trade && e.result.trade.legs.length > 0).length;
 
   // Politics can be selected on the All tab; carrying that choice into Sports would show
   // an empty list with no matching chip to clear it, so drop back to "All".
@@ -1319,11 +1486,12 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
 
       {/* View tabs */}
       <div className="flex gap-1 mb-5 p-1 rounded-xl w-fit" style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}>
-        {(['sports', 'opportunities', 'pairs'] as const).map(v => {
+        {(['sports', 'opportunities', 'pairs', 'trades'] as const).map(v => {
           const sportsCount = data ? data.opportunities.filter(o => o.pair.polymarket.category !== 'politics').length : 0;
           const label =
             v === 'sports' ? `Sports${data ? ` (${sportsCount})` : ''}` :
             v === 'opportunities' ? `All${data ? ` (${data.opportunities.length})` : ''}` :
+            v === 'trades' ? `Trades${tradeCount ? ` (${tradeCount})` : ''}` :
             // stats.matchedPairs is always sent; pairsDetail only when this tab is open.
             `Matched Pairs${data ? ` (${data.stats?.matchedPairs ?? 0})` : ''}`;
           return (
@@ -1695,6 +1863,8 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
         </>
       )}
 
+      {view === 'trades' && <TradesScreen log={execLog} />}
+
       {view === 'pairs' && (
         <>
           {/* Category filter for pairs */}
@@ -1731,7 +1901,7 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
       )}
 
       {/* Execution log */}
-      {execLog.length > 0 && (
+      {execLog.length > 0 && view !== 'trades' && (
         <div className="mt-10">
           <h2 className="text-sm font-semibold mb-3">Execution Log</h2>
           <div className="flex flex-col gap-2">
