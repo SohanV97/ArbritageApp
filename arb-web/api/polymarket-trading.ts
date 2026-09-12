@@ -379,6 +379,27 @@ const POLYMARKET_MIN_SHARES = 5;
 const DELAYED_MATCH_WAIT_MS = 2_000;
 const DELAYED_POLL_MS = 120;
 
+/**
+ * How much of an order has matched, asked of the venue right now.
+ *
+ * Used as the last check before unwinding. A Polymarket order can report zero and fill
+ * afterwards — that is what a matching delay means — and selling the Kalshi leg on the
+ * strength of a stale zero breaks a hedge that actually exists and books a real loss. The
+ * question is cheap; being wrong about it is not.
+ */
+export async function polymarketOrderFill(orderId: string): Promise<number | null> {
+  const init = await getSecureClient();
+  if ('error' in init) return null;
+  try {
+    const order = await init.client.fetchOrder({ orderId }) as { sizeMatched?: string };
+    const matched = Number(order?.sizeMatched);
+    return Number.isFinite(matched) ? matched : null;
+  } catch {
+    // Unknown is NOT zero, and must never be treated as "did not fill".
+    return null;
+  }
+}
+
 export async function placePolymarketOrder(req: PolymarketOrderRequest): Promise<PolymarketOrderResult> {
   // Checked before the client is even built: no amount of retrying makes an undersized
   // order acceptable, and the caller needs to hear the real reason.

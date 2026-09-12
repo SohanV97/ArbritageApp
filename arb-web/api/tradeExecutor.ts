@@ -13,7 +13,10 @@
 import type { ArbitrageOpportunity } from '@/lib/market-types';
 import { MIN_ORDER_CONTRACTS } from '@/lib/market-types';
 import { placeKalshiOrder, testKalshiAuth, transferBetweenKalshiShards } from '@/api/kalshi-trading';
-import { placePolymarketOrder, polymarketFundingDollars, invalidatePolymarketFunding } from '@/api/polymarket-trading';
+import {
+  placePolymarketOrder, polymarketFundingDollars, invalidatePolymarketFunding,
+  polymarketOrderFill,
+} from '@/api/polymarket-trading';
 import { getKalshiOrderbook } from '@/api/kalshi';
 import { getPolymarketBooks } from '@/api/polymarket';
 import {
@@ -663,7 +666,30 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
   // So close it here. Selling back immediately costs the spread, which is a known small loss
   // against an unbounded one.
   const kFilled = kalshiResult.ok ? (kalshiResult.filledCount ?? 0) : 0;
-  const pFilled = pmResult.ok ? (pmResult.filledCount ?? 0) : 0;
+  let pFilled = pmResult.ok ? (pmResult.filledCount ?? 0) : 0;
+
+  // Ask Polymarket once more before concluding its leg missed.
+  //
+  // A zero from Polymarket is not evidence of no fill. Its sports markets impose a matching
+  // delay, and an order can report nothing and match afterwards — which is exactly what
+  // happened on the Wake Forest trade: recorded as filled 0, and 5 shares at 91c were sitting
+  // in the account. Had the unwind below worked, it would have sold a Kalshi leg that was
+  // properly hedged and turned a flat trade into a real loss. The read costs one round trip;
+  // being wrong about it costs the position.
+  if (kFilled > 0 && pFilled <= 0 && pmResult.orderId) {
+    const confirmed = await polymarketOrderFill(pmResult.orderId);
+    if (confirmed !== null && confirmed > pFilled) {
+      console.log('[execute] polymarket filled after reporting zero', JSON.stringify({
+        orderId: pmResult.orderId, reported: pFilled, actual: confirmed,
+      }));
+      pFilled = confirmed;
+      pmResult.filledCount = confirmed;
+      const recheck = assessHedge(kalshiResult, pmResult);
+      hedged = recheck.hedged;
+      note = recheck.note;
+    }
+  }
+
   if ((kFilled > 0) !== (pFilled > 0)) {
     const venue = kFilled > 0 ? 'Kalshi' : 'Polymarket';
     const qty = kFilled > 0 ? kFilled : pFilled;
