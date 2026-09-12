@@ -16,7 +16,10 @@ import { placeKalshiOrder, testKalshiAuth, transferBetweenKalshiShards } from '@
 import { placePolymarketOrder, polymarketFundingDollars, invalidatePolymarketFunding } from '@/api/polymarket-trading';
 import { getKalshiOrderbook } from '@/api/kalshi';
 import { getPolymarketBooks } from '@/api/polymarket';
-import { fillableContracts, kalshiAskLadder, polymarketAskLadder, priceForSize } from '@/lib/depth';
+import {
+  fillableContracts, kalshiAskLadder, polymarketAskLadder, priceForSize,
+  kalshiBidLadder, polymarketBidLadder, bidSweep,
+} from '@/lib/depth';
 import { getLiveKalshiBook, getLivePolymarketBook } from '@/lib/liveBooks';
 import { estimatePolymarketFeeCents, estimateKalshiFeeCents } from '@/lib/fees';
 
@@ -84,6 +87,11 @@ export interface ExecuteOutcome { body: ExecuteResponse; status: number }
  * So redact what is actually secret: the values this process holds. Any other hex string is
  * an order or transaction id, which is exactly what you need to look a failure up.
  */
+// How many times to try closing a leg that ended up alone. Three passes with a fresh book
+// each time covers liquidity that moved between the read and the order; past that, the
+// book genuinely cannot absorb it and a human needs to know.
+const UNWIND_ATTEMPTS = 3;
+
 function scrubSecrets(s: string | undefined): string | undefined {
   if (!s) return s;
   let out = s;
@@ -608,39 +616,69 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
   if ((kFilled > 0) !== (pFilled > 0)) {
     const venue = kFilled > 0 ? 'Kalshi' : 'Polymarket';
     const qty = kFilled > 0 ? kFilled : pFilled;
-    // Cross by 2c, not 10.
+    // Price the exit off the CURRENT BID, and keep going until the position is flat.
     //
-    // The first version gave away ten cents a contract to guarantee the close, on the theory
-    // that a marketable limit fills at the resting price and the rest is never paid. It was
-    // paid: three unwinds executed at exactly the limit, costing $10.10, $6.30 and $3.60.
-    // Two cents is enough to cross a one-cent spread, and an unwind should now be rare
-    // anyway, because the leg that triggered those had actually filled.
-    const exitLimit = (entryCents: number) => Math.max(1, Math.min(99, Math.round(entryCents) - 2));
-    let unwind: { ok: boolean; filledCount?: number; error?: string };
-    if (kFilled > 0) {
-      unwind = await placeKalshiOrder({
-        ticker: kalshiTicker, side: actualKalshiSide, count: qty,
-        priceCents: exitLimit(freshKalPrice), action: 'sell',
-      });
-    } else {
-      unwind = await placePolymarketOrder({
-        tokenId: pmTokenId, count: qty,
-        priceCents: exitLimit(freshPmPrice), action: 'sell',
-      });
+    // Both earlier versions priced it off our own entry (entry - 10, then entry - 2) and
+    // both were wrong for the same reason: an unwind happens BECAUSE the market moved away
+    // from that entry, so a limit anchored to it can sit above the bid and never fill. The
+    // 10c version filled only because ten cents happened to reach the book — and it cost
+    // the full ten cents every time, $10.10, $6.30 and $3.60. The 2c version simply did not
+    // reach: a 38-contract Kalshi leg was offered at entry-2 and sold ZERO, leaving $29 of a
+    // live baseball game unhedged.
+    //
+    // Selling into the bid costs the spread and nothing more, whatever the price has done.
+    // One attempt is still not enough, because the book that was there when it was read may
+    // be gone a moment later, so this re-reads and retries until flat.
+    const onKalshi = kFilled > 0;
+    let remaining = qty;
+    let closed = 0;
+    let lastError: string | undefined;
+    let noBids = false;
+
+    for (let attempt = 0; attempt < UNWIND_ATTEMPTS && remaining > 0; attempt++) {
+      // Fresh book every pass: liquidity replenishes, and the last one clearly did not hold.
+      const ladder = onKalshi
+        ? kalshiBidLadder(getLiveKalshiBook(kalshiTicker) ?? await getKalshiOrderbook(kalshiTicker), actualKalshiSide)
+        : polymarketBidLadder(getLivePolymarketBook(pmYesToken) ?? (await getPolymarketBooks([pmYesToken])).get(pmYesToken), pmLeg.side);
+
+      const sweep = bidSweep(ladder, remaining);
+      if (!sweep || sweep.available <= 0) { noBids = true; break; }
+
+      // A cent through the sweep price, so one tick of movement while the order is in flight
+      // does not leave it resting. Crossing further buys nothing: the fill happens at the
+      // resting bids either way, and a deeper limit only widens what a fast market can take.
+      const limit = Math.max(1, Math.min(99, sweep.priceCents - 1));
+      const size = Math.min(remaining, sweep.available);
+
+      const attemptResult = onKalshi
+        ? await placeKalshiOrder({ ticker: kalshiTicker, side: actualKalshiSide, count: size, priceCents: limit, action: 'sell' })
+        : await placePolymarketOrder({ tokenId: pmTokenId, count: size, priceCents: limit, action: 'sell' });
+
+      const got = attemptResult.ok ? (attemptResult.filledCount ?? 0) : 0;
+      closed += got;
+      remaining -= got;
+      if (!attemptResult.ok) lastError = scrubSecrets(attemptResult.error);
+      console.log('[execute] unwind attempt', JSON.stringify({
+        venue, attempt: attempt + 1, offered: size, limit, filled: got, remaining,
+        ok: attemptResult.ok, error: scrubSecrets(attemptResult.error),
+      }));
+      // A rejected order will be rejected again on the same terms; only a partial fill is
+      // worth another pass.
+      if (!attemptResult.ok) break;
     }
-    const closed = unwind.ok ? (unwind.filledCount ?? 0) : 0;
+
     invalidatePolymarketFunding();
-    if (closed >= qty) {
+    if (remaining <= 0) {
       hedged = false;
       note = `${venue} filled ${qty} alone and the position was CLOSED automatically ` +
-        `(sold ${closed} back). No exposure remains, minus the spread paid to exit.`;
+        `(sold ${closed} back into the bid). No exposure remains, minus the spread paid to exit.`;
     } else {
-      note = `⚠ NAKED: ${venue} filled ${qty} and the other leg did not. Automatic close ` +
-        `${unwind.ok ? `only sold ${closed} of ${qty}` : `FAILED (${scrubSecrets(unwind.error) ?? 'error'})`}. ` +
-        `Close the remaining ${qty - closed} by hand on ${venue} now.`;
+      note = `⚠ NAKED: ${venue} filled ${qty} and the other leg did not. Automatic close sold ` +
+        `${closed} of ${qty}${noBids ? ' and then found no bids left' : ''}` +
+        `${lastError ? ` (${lastError})` : ''}. Close the remaining ${remaining} by hand on ${venue} now.`;
     }
     console.log('[execute] unwind', JSON.stringify({
-      venue, qty, closed, ok: unwind.ok, error: scrubSecrets(unwind.error),
+      venue, qty, closed, remaining, error: lastError,
     }));
   }
 

@@ -142,6 +142,84 @@ export async function testKalshiAuth(): Promise<KalshiAuthTest> {
   }
 }
 
+/**
+ * The order book, read through this module's signing rather than the discovery module's.
+ *
+ * api/kalshi.ts has the richer reader, but it imports through the "@/" path alias and so
+ * cannot be loaded by a plain Node script. Closing a position from the command line has to
+ * work when the app is not running — that is the situation it exists for — so the few lines
+ * of fetch live here, next to the signing they need.
+ */
+export async function getKalshiBook(ticker: string): Promise<
+  { yes_dollars?: [string, string][]; no_dollars?: [string, string][] } | null
+> {
+  const path = `/trade-api/v2/markets/${encodeURIComponent(ticker)}/orderbook`;
+  const signed = signKalshiRequest('GET', path);
+  if ('error' in signed) return null;
+  try {
+    const res = await fetch(`${KALSHI_API_BASE}/markets/${encodeURIComponent(ticker)}/orderbook`, { headers: signed.headers });
+    if (!res.ok) return null;
+    const data = await res.json() as {
+      orderbook?: { yes_dollars?: [string, string][]; no_dollars?: [string, string][] };
+    };
+    return data?.orderbook ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export interface KalshiPosition {
+  ticker: string;
+  /** Signed contract count on the YES side. Negative is short. */
+  contracts: number;
+  exposureDollars: number;
+  exchangeIndex?: number;
+}
+
+/**
+ * Open positions, so something already on the books can be seen and closed.
+ *
+ * The executor unwinds a leg that fills alone, but only in the moment it trades. Anything
+ * already open when that fails — a missed unwind, a restart, an order placed by hand — was
+ * invisible to this app entirely and could only be found on Kalshi's website.
+ */
+export async function getKalshiPositions(): Promise<
+  { ok: true; positions: KalshiPosition[] } | { ok: false; error: string }
+> {
+  const path = '/trade-api/v2/portfolio/positions';
+  const signed = signKalshiRequest('GET', path);
+  if ('error' in signed) return { ok: false, error: signed.error };
+  try {
+    const res = await fetch(`${KALSHI_API_BASE}/portfolio/positions?limit=200`, { headers: signed.headers });
+    const text = await res.text();
+    if (!res.ok) return { ok: false, error: kalshiErrorText(res.status, text) };
+    const data = JSON.parse(text) as {
+      market_positions?: {
+        ticker?: string;
+        // Fractional, and a STRING: Kalshi trades partial contracts, so parsing this as an
+        // integer silently reads a 0.01 dust position as flat.
+        position_fp?: string;
+        market_exposure_dollars?: string;
+        exchange_index?: number;
+      }[];
+    };
+    const positions: KalshiPosition[] = [];
+    for (const p of data.market_positions ?? []) {
+      const contracts = parseFloat(p?.position_fp ?? '');
+      if (!p?.ticker || !Number.isFinite(contracts)) continue;
+      positions.push({
+        ticker: p.ticker,
+        contracts,
+        exposureDollars: parseFloat(p?.market_exposure_dollars ?? '0') || 0,
+        exchangeIndex: p?.exchange_index,
+      });
+    }
+    return { ok: true, positions };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
 export async function placeKalshiOrder(req: KalshiOrderRequest): Promise<KalshiOrderResult> {
   // Kalshi deprecated POST /portfolio/orders between 18–25 June 2026; it now answers 410
   // "Please switch to the V2 endpoints" and places nothing. The replacement is

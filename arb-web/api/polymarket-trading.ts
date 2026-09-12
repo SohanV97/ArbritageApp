@@ -368,6 +368,15 @@ export async function testPolymarketAuth(): Promise<PolymarketAuthTest> {
  */
 const POLYMARKET_MIN_SHARES = 5;
 
+/**
+ * How long to wait for a queued order once the venue says the market has a matching delay.
+ *
+ * Every sports market reports seconds_delay = 1, so this is that second plus enough margin
+ * for the round trip. Polled rather than slept, so a fill is taken as soon as it lands.
+ */
+const DELAYED_MATCH_WAIT_MS = 2_000;
+const DELAYED_POLL_MS = 120;
+
 export async function placePolymarketOrder(req: PolymarketOrderRequest): Promise<PolymarketOrderResult> {
   // Checked before the client is even built: no amount of retrying makes an undersized
   // order acceptable, and the caller needs to hear the real reason.
@@ -418,14 +427,47 @@ export async function placePolymarketOrder(req: PolymarketOrderRequest): Promise
     let filled = Number(result.takingAmount);
     if (!Number.isFinite(filled)) filled = 0;
 
-    if (result.status !== 'matched' && result.orderId) {
-      try { await init.client.cancelOrder({ orderId: result.orderId }); } catch { /* may already be gone */ }
+    const readMatched = async (): Promise<number> => {
       try {
         const settled = await init.client.fetchOrder({ orderId: result.orderId }) as { sizeMatched?: string };
         const matched = Number(settled?.sizeMatched);
-        // Anything that matched between placing and cancelling belongs in the count.
-        if (Number.isFinite(matched) && matched > filled) filled = matched;
-      } catch { /* order gone once cancelled: the placement figure stands */ }
+        return Number.isFinite(matched) ? matched : 0;
+      } catch {
+        return 0;   // gone once cancelled: whatever we already counted stands
+      }
+    };
+
+    if (result.status === 'delayed' && result.orderId) {
+      // The market imposes a MATCHING DELAY, and the order is queued rather than resting.
+      //
+      // Cancelling this immediately, as the 'live' path below does, guarantees it never
+      // fills: the cancel lands inside the delay window, before matching is even allowed.
+      // Every Polymarket sports market carries seconds_delay = 1, so this was not an edge
+      // case — it was every in-play order. Kalshi fills instantly and this leg was killed
+      // before it could, which is where the naked Kalshi positions came from.
+      //
+      // So wait the delay out, polling rather than sleeping a fixed span, to take the fill
+      // the moment it happens. The Kalshi leg is exposed for that window; there is no way
+      // to hedge a delayed book without it, and a second of exposure beats a guaranteed
+      // one-sided position.
+      const deadline = Date.now() + DELAYED_MATCH_WAIT_MS;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, DELAYED_POLL_MS));
+        const matched = await readMatched();
+        if (matched > filled) filled = matched;
+        if (filled >= req.count) break;      // fully hedged, stop waiting
+      }
+      if (filled < req.count) {
+        // Out of time: take back whatever is still queued so it cannot fill later, unhedged.
+        try { await init.client.cancelOrder({ orderId: result.orderId }); } catch { /* already gone */ }
+        const afterCancel = await readMatched();
+        if (afterCancel > filled) filled = afterCancel;
+      }
+    } else if (result.status !== 'matched' && result.orderId) {
+      try { await init.client.cancelOrder({ orderId: result.orderId }); } catch { /* may already be gone */ }
+      const matched = await readMatched();
+      // Anything that matched between placing and cancelling belongs in the count.
+      if (matched > filled) filled = matched;
     }
 
     return {

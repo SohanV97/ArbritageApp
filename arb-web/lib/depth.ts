@@ -217,3 +217,80 @@ export function priceForSize(ladder: AskLevel[], contracts: number): number | nu
   }
   return null;
 }
+
+// ─── the EXIT side of a book ─────────────────────────────────────────────────
+// Buying reads asks; closing reads bids, and the two are not interchangeable. Pricing an
+// exit off the entry price instead of off the bid is what left a naked position: the exit
+// exists BECAUSE the market moved, so "entry minus a couple of cents" can sit above the bid
+// and never fill. Measured live: a 38-contract Kalshi leg was offered at entry-2 and sold 0.
+
+/** Resting bids for `side` — what a seller receives, best price first. */
+export function kalshiBidLadder(
+  orderbook: { yes_dollars?: [string, string][]; no_dollars?: [string, string][] } | null | undefined,
+  side: 'yes' | 'no',
+): AskLevel[] {
+  // Kalshi publishes resting BIDS per side, so this side's own list is what a sale hits.
+  const resting = side === 'yes' ? orderbook?.yes_dollars : orderbook?.no_dollars;
+  if (!Array.isArray(resting)) return [];
+  const out: AskLevel[] = [];
+  for (const level of resting) {
+    if (!Array.isArray(level) || level.length < 2) continue;
+    const price = parseFloat(level[0]);
+    const size = parseFloat(level[1]);
+    if (!Number.isFinite(price) || !Number.isFinite(size)) continue;
+    // What we RECEIVE rounds down, the mirror of cost rounding up.
+    const priceCents = bidCents(price);
+    const contracts = Math.floor(size);
+    if (priceCents < 1 || priceCents > 99 || contracts < 1) continue;
+    out.push({ priceCents, size: contracts });
+  }
+  return out.sort((x, y) => y.priceCents - x.priceCents);
+}
+
+/**
+ * Resting bids for `side` on Polymarket, best first.
+ *
+ * The book passed in is always the YES token's, as it is for the ask ladder, so the NO side
+ * is derived: selling NO is the mirror of buying YES, and lands on the YES asks at
+ * 100 - ask.
+ */
+export function polymarketBidLadder(
+  book: { bids?: { price?: string; size?: string }[]; asks?: { price?: string; size?: string }[] } | null | undefined,
+  side: 'yes' | 'no',
+): AskLevel[] {
+  const levels = side === 'yes' ? book?.bids : book?.asks;
+  if (!Array.isArray(levels)) return [];
+  const out: AskLevel[] = [];
+  for (const level of levels) {
+    const price = parseFloat(level?.price ?? '');
+    const size = parseFloat(level?.size ?? '');
+    if (!Number.isFinite(price) || !Number.isFinite(size)) continue;
+    const priceCents = side === 'yes' ? bidCents(price) : 100 - askCents(price);
+    const contracts = Math.floor(size);
+    if (priceCents < 1 || priceCents > 99 || contracts < 1) continue;
+    out.push({ priceCents, size: contracts });
+  }
+  return out.sort((x, y) => y.priceCents - x.priceCents);
+}
+
+/**
+ * Sweep a bid ladder to sell `contracts`.
+ *
+ * Returns the WORST price the sweep reaches — a limit there is marketable for the whole
+ * amount — and how many the book can actually absorb. Unlike the ask-side helper this
+ * never returns null for insufficient depth: a partial exit is still worth taking, and the
+ * caller needs to know how much is reachable to report what remains open.
+ */
+export function bidSweep(ladder: AskLevel[], contracts: number): { priceCents: number; available: number } | null {
+  if (!Array.isArray(ladder) || ladder.length === 0) return null;
+  if (!Number.isFinite(contracts) || contracts <= 0) return null;
+  const sorted = [...ladder].sort((a, b) => b.priceCents - a.priceCents);
+  let available = 0;
+  let priceCents = sorted[0].priceCents;
+  for (const level of sorted) {
+    priceCents = level.priceCents;
+    available += level.size;
+    if (available >= contracts) return { priceCents, available: contracts };
+  }
+  return { priceCents, available };
+}
