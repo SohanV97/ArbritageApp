@@ -371,16 +371,35 @@ export async function placePolymarketOrder(req: PolymarketOrderRequest): Promise
       return { ok: false, error: mapOrderError(result.code, result.message) };
     }
 
-    // On a BUY the taker asset is the outcome share, so takingAmount is the number of
-    // contracts filled. It is '0' for an order that rested without matching — the caller
-    // compares this against the other leg to decide whether the position is actually hedged,
-    // so an unfilled order must report 0 rather than the requested size.
-    const filled = Number(result.takingAmount);
+    // takingAmount counts fills AT PLACEMENT ONLY. Polymarket's own note on it: "Later fills
+    // of a resting order create new trades that are not listed here." So an order accepted
+    // as 'live' reports 0 and then fills seconds afterwards.
+    //
+    // Reading that 0 as final was expensive. The caller concluded this leg had missed, sold
+    // the Kalshi leg back at a loss, and Polymarket filled anyway — leaving the unhedged
+    // position it was trying to avoid, plus the cost of the round trip.
+    //
+    // An arb leg must never rest, so anything not already matched is cancelled here, and the
+    // fill is then read from the order itself rather than inferred. Cancelling first is what
+    // makes the number final: it cannot grow after this returns.
+    let filled = Number(result.takingAmount);
+    if (!Number.isFinite(filled)) filled = 0;
+
+    if (result.status !== 'matched' && result.orderId) {
+      try { await init.client.cancelOrder({ orderId: result.orderId }); } catch { /* may already be gone */ }
+      try {
+        const settled = await init.client.fetchOrder({ orderId: result.orderId }) as { sizeMatched?: string };
+        const matched = Number(settled?.sizeMatched);
+        // Anything that matched between placing and cancelling belongs in the count.
+        if (Number.isFinite(matched) && matched > filled) filled = matched;
+      } catch { /* order gone once cancelled: the placement figure stands */ }
+    }
+
     return {
       ok: true,
       orderId: result.orderId,
       status: result.status,
-      filledCount: Number.isFinite(filled) ? filled : undefined,
+      filledCount: filled,
     };
   } catch (err) {
     const raw = describeError(err);

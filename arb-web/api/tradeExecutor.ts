@@ -331,15 +331,33 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
   // case paying a cent or two beats holding one leg of a hedge. It is capped by the edge
   // itself so a filled trade can never be a knowingly losing one.
   const edgeCents = Math.max(0, freshEdgePercent);
-  const totalBuffer = Math.min(4, Math.floor(edgeCents));
-  // Weighted toward KALSHI, because that is the leg that misses and it now goes first.
-  // A Kalshi miss costs nothing — no Polymarket order follows it — so buying certainty
-  // there is close to free, while the same cent spent on Polymarket protects a leg that was
-  // already filling reliably.
-  const kalBuffer = Math.ceil(totalBuffer / 2);
-  const pmBuffer = Math.floor(totalBuffer / 2);
-  const freshPmPrice = Math.min(99, pmAtBook + pmBuffer);
+
+  // The two legs get different buffers because missing them costs different amounts.
+  //
+  // KALSHI goes first, and missing it is free: no Polymarket order follows, nothing is
+  // bought, nothing is unwound. So its buffer stays capped by the edge — there is no reason
+  // to pay for certainty when the downside is simply not trading.
+  const kalBuffer = Math.min(3, Math.floor(edgeCents));
+
+  // POLYMARKET goes second, once Kalshi has already filled. At that point the position
+  // exists, and a miss does not mean "no trade" — it means selling the Kalshi leg back and
+  // eating the spread both ways, which is what has been costing a couple of dollars a go.
+  //
+  // So this leg is priced to FILL rather than to protect the edge — but only up to the point
+  // where filling is still better than not.
+  //
+  // Paying x cents through the book is worth it while x is under the edge plus what an
+  // unwind costs (about 2c of cross plus the spread). Beyond that, a fill is a guaranteed
+  // loss LARGER than the unwind it was meant to avoid, which is the wrong way round: a 5c
+  // buffer on a 1.25c edge prices the pair at 103c, losing 3c to avoid losing 2c.
+  //
+  // The buffer is also only ever paid when the book has actually moved — a marketable limit
+  // fills at the resting price — so in the ordinary case this costs nothing at all.
+  const pmBuffer = Math.min(4, Math.floor(edgeCents) + 2);
   const freshKalPrice = Math.min(99, kalAtBook + kalBuffer);
+  // Applied when the Polymarket order is actually sent, below, so the funding check and the
+  // recorded edge both reflect what will be paid.
+  const freshPmPrice = Math.min(99, pmAtBook + pmBuffer);
 
   // Both legs must be affordable BEFORE either is sent. The legs fire in parallel, so an
   // underfunded venue does not fail cleanly: its leg is rejected while the other one fills,
@@ -548,10 +566,14 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
   if ((kFilled > 0) !== (pFilled > 0)) {
     const venue = kFilled > 0 ? 'Kalshi' : 'Polymarket';
     const qty = kFilled > 0 ? kFilled : pFilled;
-    // Price the exit off the resting BIDS, then cross them. A limit fills at the resting
-    // price rather than the limit, so going through the book buys certainty of closing
-    // rather than paying this number.
-    const exitLimit = (entryCents: number) => Math.max(1, Math.min(99, Math.round(entryCents) - 10));
+    // Cross by 2c, not 10.
+    //
+    // The first version gave away ten cents a contract to guarantee the close, on the theory
+    // that a marketable limit fills at the resting price and the rest is never paid. It was
+    // paid: three unwinds executed at exactly the limit, costing $10.10, $6.30 and $3.60.
+    // Two cents is enough to cross a one-cent spread, and an unwind should now be rare
+    // anyway, because the leg that triggered those had actually filled.
+    const exitLimit = (entryCents: number) => Math.max(1, Math.min(99, Math.round(entryCents) - 2));
     let unwind: { ok: boolean; filledCount?: number; error?: string };
     if (kFilled > 0) {
       unwind = await placeKalshiOrder({
