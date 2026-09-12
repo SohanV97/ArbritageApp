@@ -143,7 +143,9 @@ async function fetchSportsMetadata(): Promise<GammaSportMetadata[]> {
   return _cachedSportsData?.data ?? [];
 }
 
-// Slug -> tag id, resolved and cached one slug at a time (null means "asked, absent").
+// Slug -> tag id. A resolved id is kept FOREVER: tag ids are immutable, so there is nothing
+// to refresh, and re-asking only creates chances to fail. Absence is cached on a TTL, since
+// a tag that does not exist today may exist tomorrow.
 const _tagIdBySlug = new Map<string, { id: string | null; ts: number }>();
 
 /**
@@ -160,20 +162,41 @@ const _tagIdBySlug = new Map<string, { id: string | null; ts: number }>();
 async function fetchTagIdBySlug(slug: string): Promise<string | null> {
   const key = slug.toLowerCase();
   const hit = _tagIdBySlug.get(key);
+  // A known id never expires; only a known ABSENCE does.
+  if (hit?.id) return hit.id;
   if (hit && Date.now() - hit.ts < PM_META_TTL_MS) return hit.id;
-  let id: string | null = null;
+
   try {
     const res = await gammaFetch(`${POLYMARKET_GAMMA_API}/tags/slug/${encodeURIComponent(key)}`, { headers: polymarketHeaders() });
     if (res.ok) {
       const tag = await res.json() as GammaTag;
-      if (tag?.id) id = String(tag.id);
+      if (tag?.id) {
+        const id = String(tag.id);
+        _tagIdBySlug.set(key, { id, ts: Date.now() });
+        return id;
+      }
     }
-  } catch { /* absent or unreachable: treated as "no such tag" */ }
-  // A miss is cached too — most keywords are league names with no tag of their own, and
-  // re-asking for every one of them on each rediscovery is pure latency.
-  _tagIdBySlug.set(key, { id, ts: Date.now() });
-  return id;
+    if (res.status === 404) {
+      // The only answer that means "there is no such tag". Most keywords are league names
+      // with no tag of their own, and re-asking for those every pass is pure latency.
+      _tagIdBySlug.set(key, { id: null, ts: Date.now() });
+      return null;
+    }
+  } catch { /* fall through to the failure path below */ }
+
+  // Anything else is a FAILURE, not an absence, and the two must not be confused.
+  //
+  // Caching a failure as "no such tag" is what broke this: one rate-limited lookup of
+  // /tags/slug/nfl removed tag 450 for the whole TTL, and NFL has no other route — its
+  // series holds no active events — so the category went to 0 events and 0 pairs. Soccer
+  // lost tag 100350 the same way and fell from 502 markets to 102, CFB from 248 to 100.
+  // Total pairs moved between 418 and 192 depending on which lookups happened to fail.
+  //
+  // So never overwrite a good id with a failure, and never remember the failure.
+  console.warn(`[Polymarket] tag lookup for "${key}" failed${hit?.id ? ' (keeping the id already resolved)' : ''}`);
+  return hit?.id ?? null;
 }
+
 
 
 function toNum(v: unknown): number | null {
