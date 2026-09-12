@@ -26,6 +26,7 @@ import {
 import { getLiveKalshiBook, getLivePolymarketBook } from '@/lib/liveBooks';
 import { estimatePolymarketFeeCents, estimateKalshiFeeCents } from '@/lib/fees';
 import { pairLimits } from '@/lib/pricing';
+import { recordAttempt, type TradeAttempt, type LegRecord } from '@/lib/tradeJournal';
 
 export interface LegResult {
   ok: boolean;
@@ -193,7 +194,56 @@ function assessHedge(kalshi: LegResult, polymarket: LegResult): { hedged: boolea
   return { hedged: false, note: `⚠ PARTIAL HEDGE: fills differ (Kalshi ${kF} vs Polymarket ${pF}); net exposure ${diff} contracts — trim the larger leg.` };
 }
 
+/**
+ * Place a trade, and record what happened whatever that turns out to be.
+ *
+ * The journal wraps the whole path rather than sitting inside it, so an attempt refused at
+ * the first validation is recorded as faithfully as one that reaches the venues. Refusals
+ * are the majority and they are not noise: a run of them all naming the same reason is the
+ * clearest signal the app produces about why it is not trading.
+ */
 export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
+  const startedAt = Date.now();
+  const rec: TradeAttempt = {
+    id: `${startedAt}-${Math.random().toString(36).slice(2, 8)}`,
+    ts: new Date(startedAt).toISOString(),
+    outcome: 'no-orders',
+    market: { kalshiTicker: '', question: '', kalshiSide: 'yes', polymarketSide: 'yes' },
+    edge: {},
+    legs: [],
+    totalMs: 0,
+    dryRun: req.dryRun === true,
+  };
+  try {
+    const out = await executeArbInner(req, rec);
+    const b = out.body;
+    rec.edge.quotedPercent = b.quotedEdgePercent;
+    rec.edge.freshPercent = b.freshEdgePercent;
+    rec.edge.revalidateMs = b.revalidateMs;
+    // The outcome is taken from the FILLS, via the same summary the UI renders, so the
+    // journal and the screen can never disagree about whether a trade worked.
+    if (b.noOrdersSent) {
+      rec.outcome = 'no-orders';
+      rec.refusedReason = b.hedgeNote ?? b.kalshi.error ?? b.polymarket.error;
+    } else if (b.trade) {
+      rec.outcome = b.trade.status === 'hedged' ? 'hedged'
+        : b.trade.status === 'partial' ? 'partial'
+        : (rec.unwind?.some(u => u.filled > 0) ? 'unwound' : 'naked');
+      if (rec.outcome !== 'hedged') rec.refusedReason = b.hedgeNote;
+    }
+    rec.totalMs = Date.now() - startedAt;
+    recordAttempt(rec);
+    return out;
+  } catch (err) {
+    rec.outcome = 'error';
+    rec.refusedReason = err instanceof Error ? err.message : String(err);
+    rec.totalMs = Date.now() - startedAt;
+    recordAttempt(rec);
+    throw err;
+  }
+}
+
+async function executeArbInner(req: ExecuteRequest, rec: TradeAttempt): Promise<ExecuteOutcome> {
   const { opportunity, amount } = req;
   if (!opportunity?.pair?.polymarket || !opportunity?.pair?.kalshi || !opportunity.legA || !opportunity.legB) {
     return err('Malformed opportunity payload');
@@ -243,6 +293,14 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
     return err('Missing Polymarket token ID for this side');
   }
 
+  rec.market = {
+    kalshiTicker,
+    question: pair.polymarket.question,
+    category: pair.polymarket.category,
+    kalshiSide: actualKalshiSide,
+    polymarketSide: pmLeg.side,
+  };
+
   const contracts = Math.max(1, Math.round(amount));
   if (contracts > MAX_ORDER_CONTRACTS) {
     return err(`Order size ${contracts} exceeds the server cap (${MAX_ORDER_CONTRACTS}). Set ARB_MAX_ORDER_CONTRACTS to raise it.`);
@@ -283,6 +341,16 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
   // happens, so this is the live book, and using it removes the ~160ms re-read that was
   // costing more than the edges were lasting. If either feed is down or quiet, that side
   // falls back to a fetch and nothing changes but the latency.
+  // Both venues are asked whether they can fund this WHILE the books are being read, not
+  // after. Kalshi's balance is a live round trip, and it sat squarely on the critical path
+  // between seeing an edge and acting on it — pure latency, spent finding out something
+  // that has nothing to do with the price. Overlapped it costs whatever the slower of the
+  // two takes, which is usually the books, and nothing is traded on staler information:
+  // both answers are still awaited before any order is sent.
+  const fundingPromise = Promise.all([testKalshiAuth(), polymarketFundingDollars()]);
+  // An unhandled rejection here would be fatal before the await below is reached.
+  fundingPromise.catch(() => { /* surfaced where it is awaited */ });
+
   const liveKal = getLiveKalshiBook(kalshiTicker);
   const livePm = getLivePolymarketBook(pmYesToken);
   const [kOrderbook, fetchedPmBooks] = await Promise.all([
@@ -291,6 +359,7 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
   ]);
   const revalidateMs = Date.now() - revalStart;
   const bookSource = `${liveKal ? 'live' : 'fetch'}/${livePm ? 'live' : 'fetch'}`;
+  rec.edge.bookSource = bookSource;
 
   // Derive the fee model server-side rather than trusting the posted market.
   const feeKind = pair.polymarket.category === 'politics' ? 'fee_free' : 'sports';
@@ -439,6 +508,20 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
       `No orders were sent.`,
       409);
   }
+  rec.plan = {
+    plannedContracts,
+    kalAtBookCents: kalAtBook,
+    pmAtBookCents: pmAtBook,
+    kalBufferCents: kalBuffer,
+    pmBufferCents: pmBuffer,
+    kalLimitCents: limits.kalLimit,
+    pmLimitCents: limits.pmLimit,
+    netEdgeCents: limits.netEdgeCents,
+    // The depth the ladders CLAIMED. An under-fill is only diagnosable against this:
+    // 102 contracts were requested against a book reporting depth, and 5 arrived.
+    kalDepth: kalLadder[0]?.size,
+    pmDepth: pmLadder[0]?.size,
+  };
   const freshKalPrice = limits.kalLimit;
   // Applied when the Polymarket order is actually sent, below, so the funding check and the
   // recorded edge both reflect what will be paid.
@@ -454,7 +537,10 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
   // is not: 309ms median, 2.7s worst, because it also reads wallet ownership and trading
   // approvals from the chain. Neither is needed to decide whether a leg is affordable, and
   // both sat on the critical path ahead of every order.
-  const [kalAuth, pmDollars] = await Promise.all([testKalshiAuth(), polymarketFundingDollars()]);
+  // Started before the books were read; by now it has almost always already resolved.
+  const _fundStart = Date.now();
+  const [kalAuth, pmDollars] = await fundingPromise;
+  rec.timings = { ...(rec.timings ?? {}), fundingWaitMs: Date.now() - _fundStart };
 
   // Check the SHARD this market trades on, not the account total.
   //
@@ -591,11 +677,18 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
   // Polymarket first makes that miss free: nothing is bought, nothing is unwound. Kalshi is
   // then sized to the shares Polymarket ACTUALLY got, and being the instant, liquid, fully
   // divisible side it is the right one to ask to match an exact quantity.
+  const _pmSentAt = Date.now();
   const pmRaw = await placePolymarketOrder({
     tokenId: pmTokenId,
     count: plannedContracts,
     priceCents: freshPmPrice,
   });
+  rec.legs.push({
+    venue: 'polymarket', side: pmLeg.side, limitCents: freshPmPrice,
+    requested: plannedContracts, reportedFill: pmRaw.filledCount ?? 0,
+    avgPriceCents: pmRaw.avgPriceCents, status: pmRaw.status, orderId: pmRaw.orderId,
+    ok: pmRaw.ok, error: scrubSecrets(pmRaw.error), ms: Date.now() - _pmSentAt,
+  } satisfies LegRecord);
 
   const pmFilled = pmRaw.ok ? (pmRaw.filledCount ?? 0) : 0;
   if (pmFilled <= 0) {
@@ -627,12 +720,19 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
 
   // Match Kalshi to what Polymarket actually got, never to what was hoped for. Kalshi trades
   // fractional contracts, so any Polymarket fill can be mirrored exactly.
+  const _kalSentAt = Date.now();
   const kalshiRaw = await placeKalshiOrder({
     ticker: kalshiTicker,
     side: actualKalshiSide,
     count: pmFilled,
     priceCents: freshKalPrice,
   });
+  rec.legs.push({
+    venue: 'kalshi', side: actualKalshiSide, limitCents: freshKalPrice,
+    requested: pmFilled, reportedFill: kalshiRaw.filledCount ?? 0,
+    avgPriceCents: kalshiRaw.avgPriceCents, status: kalshiRaw.status, orderId: kalshiRaw.orderId,
+    ok: kalshiRaw.ok, error: scrubSecrets(kalshiRaw.error), ms: Date.now() - _kalSentAt,
+  } satisfies LegRecord);
 
   // A fill changes the balance, so drop the cached reading rather than let the next order
   // size itself against money that has already been spent.
@@ -724,6 +824,11 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
       closed += got;
       remaining -= got;
       if (!attemptResult.ok) lastError = scrubSecrets(attemptResult.error);
+      (rec.unwind ??= []).push({
+        venue: onKalshi ? 'kalshi' : 'polymarket', attempt: attempt + 1,
+        limitCents: limit, offered: size, filled: got,
+        ok: attemptResult.ok, error: scrubSecrets(attemptResult.error),
+      });
       console.log('[execute] unwind attempt', JSON.stringify({
         venue, attempt: attempt + 1, offered: size, limit, filled: got, remaining,
         ok: attemptResult.ok, error: scrubSecrets(attemptResult.error),
