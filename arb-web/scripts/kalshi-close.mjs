@@ -48,7 +48,7 @@ const open = positions.positions.filter(p => p.contracts !== 0);
 
 console.log(`\nopen positions: ${open.length}`);
 for (const p of open) {
-  console.log(`  ${p.ticker}  ${p.contracts > 0 ? 'LONG' : 'SHORT'} ${Math.abs(p.contracts)}  exposure $${p.exposureDollars.toFixed(2)}`);
+  console.log(`  ${p.ticker}  ${p.contracts > 0 ? 'YES' : 'NO'} ${Math.abs(p.contracts)}  exposure $${p.exposureDollars.toFixed(2)}`);
 }
 if (open.length === 0) { console.log(); process.exit(0); }
 
@@ -60,24 +60,22 @@ if (targets.length === 0) {
 
 let failures = 0;
 for (const pos of targets) {
-  // A SHORT is closed by buying back, which this script does not do: the app only ever opens
-  // longs, so a short here means something unexpected and a human should look at it.
-  if (pos.contracts < 0) {
-    console.log(`\n${pos.ticker}: SHORT ${Math.abs(pos.contracts)} — buying back is not handled here, close it on Kalshi.`);
-    failures++;
-    continue;
-  }
-  let remaining = pos.contracts;
-  console.log(`\n${pos.ticker}: closing ${remaining}`);
+  // Kalshi reports every position on the YES scale, so a NO position reads as negative.
+  // That is not a short to be bought back: holding -5 YES IS holding 5 NO, and it closes by
+  // selling the NO side into the NO bids. Refusing it meant this script could not close the
+  // one kind of position it was written for.
+  const side = pos.contracts < 0 ? 'no' : 'yes';
+  let remaining = Math.abs(pos.contracts);
+  console.log(`\n${pos.ticker}: closing ${remaining} ${side.toUpperCase()}`);
   for (let attempt = 1; attempt <= 3 && remaining > 0; attempt++) {
     const book = await getKalshiBook(pos.ticker);
-    const ladder = kalshiBidLadder(book, 'yes');
+    const ladder = kalshiBidLadder(book, side);
     const sweep = bidSweep(ladder, remaining);
     if (!sweep || sweep.available <= 0) { console.log('  no bids on the book'); break; }
     const limit = Math.max(1, Math.min(99, sweep.priceCents - 1));
     const size = Math.min(remaining, sweep.available);
     const res = await placeKalshiOrder({
-      ticker: pos.ticker, side: 'yes', count: size, priceCents: limit, action: 'sell',
+      ticker: pos.ticker, side, count: size, priceCents: limit, action: 'sell',
     });
     const got = res.ok ? (res.filledCount ?? 0) : 0;
     remaining -= got;
