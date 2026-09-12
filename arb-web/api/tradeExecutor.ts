@@ -330,11 +330,37 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
   // approvals from the chain. Neither is needed to decide whether a leg is affordable, and
   // both sat on the critical path ahead of every order.
   const [kalAuth, pmDollars] = await Promise.all([testKalshiAuth(), polymarketFundingDollars()]);
-  const kalFunds = (kalAuth.balanceDollars ?? 0) * 100;
+
+  // Check the SHARD this market trades on, not the account total.
+  //
+  // Kalshi funds an order only from the shard its market belongs to. A live account holding
+  // $102.90 entirely on shard 0 was approved for an MLB order — MLB trades on shard 3, which
+  // held nothing — so Kalshi answered "insufficient shard balance" while the Polymarket leg
+  // had already filled. That is the naked position this guard exists to prevent, and the
+  // total balance simply does not answer the question being asked.
+  const shard = (pair.kalshi as { exchangeIndex?: number }).exchangeIndex;
+  const shards = kalAuth.balanceByShard;
+
+  // When the shard is unknown, assume the WORST shard rather than the total.
+  //
+  // Falling back to the account total is precisely the assumption that produced the naked
+  // leg, and a market whose shard has not been recorded yet — a discovery cache written
+  // before shards were tracked, say — must not quietly inherit it. Taking the smallest shard
+  // balance can only refuse a trade that would have been fine; the opposite error sends one
+  // leg to a venue that cannot pay for it.
+  const worstShardDollars = shards ? Math.min(...Object.values(shards)) : undefined;
+  const shardFundsDollars = shard !== undefined ? shards?.[shard] : worstShardDollars;
+  const kalFunds = (shardFundsDollars ?? kalAuth.balanceDollars ?? 0) * 100;
   const pmFunds = (pmDollars ?? 0) * 100;
   const shortfalls: string[] = [];
   if (kalFunds < kalCostCents) {
-    shortfalls.push(`Kalshi has $${(kalFunds / 100).toFixed(2)} but this leg costs $${(kalCostCents / 100).toFixed(2)}`);
+    shortfalls.push(
+      shardFundsDollars !== undefined
+        ? `Kalshi has $${(kalFunds / 100).toFixed(2)} on exchange shard ${shard ?? '(unknown — using the lowest)'} (where this market trades) ` +
+          `but this leg costs $${(kalCostCents / 100).toFixed(2)} — the account total is ` +
+          `$${(kalAuth.balanceDollars ?? 0).toFixed(2)}, held on other shards`
+        : `Kalshi has $${(kalFunds / 100).toFixed(2)} but this leg costs $${(kalCostCents / 100).toFixed(2)}`,
+    );
   }
   if (pmFunds < pmCostCents) {
     shortfalls.push(`Polymarket has $${(pmFunds / 100).toFixed(2)} but this leg costs $${(pmCostCents / 100).toFixed(2)}`);

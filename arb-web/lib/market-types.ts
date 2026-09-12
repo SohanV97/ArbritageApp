@@ -32,6 +32,11 @@ export interface UnifiedMarket {
   // spread/liquidity describe the Polymarket book so thin quotes are visible.
   yesDepth?: number;
   noDepth?: number;
+  /**
+   * Kalshi only: the exchange shard this market trades on. Balance is held per shard, so an
+   * order is funded solely by the shard its market belongs to.
+   */
+  exchangeIndex?: number;
   spreadCents?: number;
   liquidityUsd?: number;
   /** Whether the venue itself still accepts orders on this market. This is the only

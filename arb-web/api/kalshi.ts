@@ -40,6 +40,8 @@ interface KalshiMarket {
   no_ask_dollars?: number | string;
   close_time?: string;
   expiration_time?: string;
+  /** Which Kalshi exchange shard the market trades on. Balance is held PER shard. */
+  exchange_index?: number;
   market?: KalshiMarket;
   [key: string]: unknown;
 }
@@ -480,6 +482,10 @@ export function normalizeKalshiMarkets(markets: KalshiMarket[], category?: Categ
       venue: 'kalshi',
       question,
       symbol: m.ticker,
+      // Kalshi holds balance per exchange shard, and an order is funded only by the shard
+      // its market sits on. MLB trades on shard 3 while a deposit can sit entirely on shard
+      // 0, so an account showing $102 can still be refused "insufficient shard balance".
+      exchangeIndex: typeof m.exchange_index === 'number' ? m.exchange_index : undefined,
       yesPriceCents: yesCents,
       noPriceCents: noCents,
       resolutionTime: gameDate ? `${gameDate}T23:59:00Z` : (m.close_time ?? m.expiration_time),

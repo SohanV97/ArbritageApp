@@ -21,7 +21,16 @@ export interface KalshiOrderResult {
 
 export interface KalshiAuthTest {
   ok: boolean;
+  /** Total across every shard. NOT what funds an order — see balanceByShard. */
   balanceDollars?: number;
+  /**
+   * Dollars available on each exchange shard, keyed by exchange_index.
+   *
+   * Kalshi funds an order solely from the shard its market trades on. MLB sits on shard 3
+   * and college football on shard 0, so a deposit that lands on one leaves the other at
+   * zero — and the total balance says nothing about whether an order can pay.
+   */
+  balanceByShard?: Record<number, number>;
   error?: string;
 }
 
@@ -102,9 +111,26 @@ export async function testKalshiAuth(): Promise<KalshiAuthTest> {
     const res = await fetch(`${KALSHI_API_BASE}/portfolio/balance`, { headers: signed.headers });
     const text = await res.text();
     if (!res.ok) return { ok: false, error: kalshiErrorText(res.status, text) };
-    const data = JSON.parse(text) as { balance?: number };
-    // balance is in cents
-    return { ok: true, balanceDollars: typeof data.balance === 'number' ? data.balance / 100 : undefined };
+    const data = JSON.parse(text) as {
+      balance?: number;
+      balance_breakdown?: { balance?: string; exchange_index?: number }[];
+    };
+    // Kalshi splits a balance across exchange shards, and an order is funded ONLY by the
+    // shard its market sits on. Reporting the total is what let a $102 account be refused
+    // "insufficient shard balance" on an MLB order: MLB trades on shard 3 and every dollar
+    // was on shard 0. The Polymarket leg had already filled by then.
+    const byShard: Record<number, number> = {};
+    for (const b of data.balance_breakdown ?? []) {
+      const dollars = parseFloat(b?.balance ?? '');
+      if (typeof b?.exchange_index === 'number' && Number.isFinite(dollars)) {
+        byShard[b.exchange_index] = dollars;
+      }
+    }
+    return {
+      ok: true,
+      balanceDollars: typeof data.balance === 'number' ? data.balance / 100 : undefined,
+      balanceByShard: Object.keys(byShard).length > 0 ? byShard : undefined,
+    };
   } catch (err) {
     return { ok: false, error: String(err) };
   }
