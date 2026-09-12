@@ -12,7 +12,8 @@
     "check": "npm run test:matching && npm run check:markets && npm run check:links",
     "check:wallet": "node scripts/check-wallet.mjs",
     "setup:approvals": "node --experimental-strip-types --no-warnings scripts/setup-approvals.mjs",
-    "test:pm-order": "node --experimental-strip-types --no-warnings scripts/test-polymarket-order.mjs"
+    "test:pm-order": "node --experimental-strip-types --no-warnings scripts/test-polymarket-order.mjs",
+    "kalshi:allocate": "node --experimental-strip-types --no-warnings scripts/kalshi-allocate.mjs"
   },
   "dependencies": {
     "@polymarket/client": "^0.10.0",

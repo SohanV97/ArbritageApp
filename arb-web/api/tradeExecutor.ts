@@ -12,7 +12,7 @@
  */
 import type { ArbitrageOpportunity } from '@/lib/market-types';
 import { MIN_ORDER_CONTRACTS } from '@/lib/market-types';
-import { placeKalshiOrder, testKalshiAuth } from '@/api/kalshi-trading';
+import { placeKalshiOrder, testKalshiAuth, transferBetweenKalshiShards } from '@/api/kalshi-trading';
 import { placePolymarketOrder, polymarketFundingDollars, invalidatePolymarketFunding } from '@/api/polymarket-trading';
 import { getKalshiOrderbook } from '@/api/kalshi';
 import { getPolymarketBooks } from '@/api/polymarket';
@@ -339,7 +339,48 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
   // had already filled. That is the naked position this guard exists to prevent, and the
   // total balance simply does not answer the question being asked.
   const shard = (pair.kalshi as { exchangeIndex?: number }).exchangeIndex;
-  const shards = kalAuth.balanceByShard;
+  let shards = kalAuth.balanceByShard;
+
+  // Move collateral onto the shard this market trades on, if that is all that is missing.
+  //
+  // Kalshi's website does this silently — you deposit once and can bet on anything — but the
+  // API requires collateral to be preallocated per shard, so a deposit sitting on shard 0
+  // cannot pay for an MLB order on shard 3. Measured as instant, and it is a transfer inside
+  // one account rather than a trade, so doing it here costs a few hundred milliseconds only
+  // on the first trade against a shard and removes a whole class of half-filled position.
+  if (shard !== undefined && shards) {
+    const onShard = (shards[shard] ?? 0) * 100;
+    if (onShard < kalCostCents) {
+      const needDollars = (kalCostCents - onShard) / 100;
+      const [richestShard, richestDollars] = Object.entries(shards)
+        .map(([i, d]) => [Number(i), Number(d)] as [number, number])
+        .filter(([i]) => i !== shard)
+        .sort((a, b) => b[1] - a[1])[0] ?? [undefined, 0];
+      // A 25% buffer so the next trade on this shard does not pay the same round trip, but
+      // never more than the source actually holds.
+      const moveDollars = Math.min(needDollars * 1.25, richestDollars);
+      if (richestShard !== undefined && moveDollars >= needDollars) {
+        const moved = await transferBetweenKalshiShards(richestShard, shard, moveDollars);
+        console.log('[execute] shard top-up', JSON.stringify({
+          from: richestShard, to: shard, dollars: Number(moveDollars.toFixed(2)), ok: moved.ok, error: moved.error,
+        }));
+        // Re-read rather than assume, and give the transfer a moment to settle. Reading
+        // immediately showed the money gone from the source and not yet on the destination,
+        // so the guard refused a trade whose collateral was already on its way. Polling to a
+        // short ceiling costs nothing when the balance is already right, which is every
+        // trade after the first on a given shard.
+        if (moved.ok) {
+          const needOnShard = kalCostCents / 100;
+          for (let attempt = 0; attempt < 6; attempt++) {
+            await new Promise(res => setTimeout(res, 250));
+            const fresh = (await testKalshiAuth()).balanceByShard;
+            if (fresh) shards = fresh;
+            if ((shards?.[shard] ?? 0) >= needOnShard) break;
+          }
+        }
+      }
+    }
+  }
 
   // When the shard is unknown, assume the WORST shard rather than the total.
   //

@@ -213,3 +213,53 @@ export async function placeKalshiOrder(req: KalshiOrderRequest): Promise<KalshiO
     return { ok: false, error: String(err) };
   }
 }
+
+/**
+ * Move collateral between Kalshi exchange shards.
+ *
+ * Kalshi's own interface hides sharding — you deposit once and can bet on anything — but it
+ * is doing this transfer for you behind the scenes. The API does not: "Programmatic traders
+ * must preallocate collateral on a given exchange shard before order placement." A deposit
+ * lands on shard 0, MLB trades on shard 3, and an order there is refused with "insufficient
+ * shard balance" no matter how healthy the account total looks.
+ *
+ * Amounts are in CENTICENTS — hundredths of a cent — so a dollar is 10,000. Getting that
+ * wrong by a factor of a hundred in either direction is the obvious way to move the wrong
+ * amount of real money, which is why the conversion lives here rather than at each call.
+ */
+export async function transferBetweenKalshiShards(
+  fromShard: number,
+  toShard: number,
+  dollars: number,
+): Promise<{ ok: boolean; transferId?: string; error?: string }> {
+  if (!Number.isFinite(dollars) || dollars <= 0) return { ok: false, error: 'Transfer amount must be positive' };
+  if (!Number.isInteger(fromShard) || !Number.isInteger(toShard)) return { ok: false, error: 'Shard indexes must be integers' };
+  if (fromShard === toShard) return { ok: false, error: 'Source and destination shard are the same' };
+
+  const path = '/trade-api/v2/portfolio/intra_exchange_instance_transfer';
+  const signed = signKalshiRequest('POST', path);
+  if ('error' in signed) return { ok: false, error: signed.error };
+
+  const centicents = Math.floor(dollars * 10_000);
+  try {
+    const res = await fetch(`${KALSHI_API_BASE}/portfolio/intra_exchange_instance_transfer`, {
+      method: 'POST',
+      headers: signed.headers,
+      body: JSON.stringify({
+        source: 'event_contract',
+        destination: 'event_contract',
+        amount: centicents,
+        source_exchange_shard: fromShard,
+        destination_exchange_shard: toShard,
+        source_subaccount: 0,
+        destination_subaccount: 0,
+      }),
+    });
+    const text = await res.text();
+    if (!res.ok) return { ok: false, error: kalshiErrorText(res.status, text) };
+    const data = JSON.parse(text) as { transfer_id?: string };
+    return { ok: true, transferId: data.transfer_id };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
