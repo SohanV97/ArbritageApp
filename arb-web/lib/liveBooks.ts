@@ -101,11 +101,51 @@ export function markKalshiUnhealthy(ticker?: string): void {
   for (const e of s.kalshi.values()) e.healthy = false;
 }
 
+/** Highest price with real size, in cents, or undefined for an empty side. */
+function bestBidCents(levels: Map<string, number>): number | undefined {
+  let best: number | undefined;
+  for (const [price, size] of levels) {
+    if (!(size > 0)) continue;
+    const cents = Math.floor(parseFloat(price) * 100 + 1e-9);
+    if (cents < 1 || cents > 99) continue;
+    if (best === undefined || cents > best) best = cents;
+  }
+  return best;
+}
+
+/**
+ * Is this book self-contradictory?
+ *
+ * The two sides of a binary market cannot both be bid above their combined payout: a YES
+ * bid of 93c alongside a NO bid of 27c sums to 120c for something that pays 100c, which
+ * would be free money for anyone selling both. A book like that is not a market, it is
+ * corrupted state, and no amount of staleness produces it — only a mis-applied delta does.
+ *
+ * This is not hypothetical. A position bought at 7c was offered back into a NO bid the book
+ * claimed was 27c, which priced the exit at a level the exchange could never fill; the
+ * order was cancelled three times over and the position was left open. The YES side of the
+ * same book was correct throughout, so nothing else caught it.
+ */
+function kalshiBookIsCrossed(e: KalshiEntry): boolean {
+  const yesBid = bestBidCents(e.yes);
+  const noBid = bestBidCents(e.no);
+  if (yesBid === undefined || noBid === undefined) return false;   // one-sided, not crossed
+  return yesBid + noBid > 100;
+}
+
 /** The live book in the same shape the REST path returns, or undefined if not trustworthy. */
 export function getLiveKalshiBook(ticker: string): KalshiBookShape | undefined {
   const e = store().kalshi.get(ticker);
   if (!e || !e.healthy) return undefined;
   if (Date.now() - e.updatedAt > LIVE_BOOK_MAX_AGE_MS) return undefined;
+  if (kalshiBookIsCrossed(e)) {
+    // Provably wrong, so stop serving it and keep it out until a snapshot rebuilds it. The
+    // caller falls back to a fetch, which is slower and correct. Marking it unhealthy also
+    // feeds the connection watchdog: enough of these and the socket is rebuilt.
+    e.healthy = false;
+    console.warn(`[liveBooks] ${ticker}: crossed book (yes bid + no bid > 100) — dropping it`);
+    return undefined;
+  }
   const out = (m: Map<string, number>): [string, string][] =>
     [...m.entries()].map(([p, s]) => [p, String(s)] as [string, string]);
   return { yes_dollars: out(e.yes), no_dollars: out(e.no) };
@@ -170,4 +210,9 @@ export function forgetLiveBooks(keepKalshi: Set<string>, keepPm: Set<string>): v
   const s = store();
   for (const k of s.kalshi.keys()) if (!keepKalshi.has(k)) s.kalshi.delete(k);
   for (const k of s.pm.keys()) if (!keepPm.has(k)) s.pm.delete(k);
+}
+
+/** Tickers with a stored book, for health checks. */
+export function liveKalshiTickers(): string[] {
+  return [...store().kalshi.keys()];
 }

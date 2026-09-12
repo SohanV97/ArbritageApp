@@ -573,33 +573,37 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
 
   // ── Kalshi first, then Polymarket for exactly what Kalshi filled ───────────
   //
-  // These used to fire together, which treats the two venues as equally likely to fill.
-  // They are not. Every naked position so far has had the same shape: Polymarket filled and
-  // Kalshi did not — an IOC for 101 contracts accepted, filled 0 and cancelled, while the
-  // Polymarket leg went through. Firing in parallel means each miss becomes real exposure.
+  // Leg the venue that MIGHT NOT FILL first, and it is no longer the one it used to be.
   //
-  // Legging the unreliable venue FIRST turns that failure into a no-op: if Kalshi fills
-  // nothing, no Polymarket order is sent and there is nothing to unwind. And because
-  // Polymarket is then sized to the ACTUAL Kalshi fill rather than the intended size, a
-  // partial fill produces a matched pair instead of a lopsided one.
+  // Kalshi went first because every naked position then had the same shape: Polymarket
+  // filled and Kalshi did not. That is no longer true, and the reversal is not subtle — of
+  // the four trades placed after the delay and pricing fixes, Kalshi filled 104/104, 81/103,
+  // 32/105 and 0/105, while Polymarket filled ZERO every time, each order coming back 'live'
+  // rather than matched.
   //
-  // The cost is the Polymarket leg going out ~150ms later, carrying the risk that its price
-  // moves in between. That is the right trade: a miss on the second leg leaves a position
-  // that is immediately sold back below, whereas a miss on a parallel leg was discovered
-  // only afterwards.
-  const kalshiRaw = await placeKalshiOrder({
-    ticker: kalshiTicker,
-    side: actualKalshiSide,
+  // The reason is structural, not luck. Polymarket's sports books impose a matching delay
+  // and its ask often sits above what the pair can profitably pay, so a correctly capped
+  // limit rests instead of crossing. Kalshi fills instantly against a deep book. So the
+  // uncertain leg is Polymarket, and buying Kalshi before knowing Polymarket will fill is
+  // buying a position we then have to sell back: 104 contracts bought at 45c and sold at 37c
+  // cost $8.32, and 81 bought at 14c and sold at 9c cost $4.05, in consecutive trades.
+  //
+  // Polymarket first makes that miss free: nothing is bought, nothing is unwound. Kalshi is
+  // then sized to the shares Polymarket ACTUALLY got, and being the instant, liquid, fully
+  // divisible side it is the right one to ask to match an exact quantity.
+  const pmRaw = await placePolymarketOrder({
+    tokenId: pmTokenId,
     count: plannedContracts,
-    priceCents: freshKalPrice,
+    priceCents: freshPmPrice,
   });
 
-  const kalshiFilled = kalshiRaw.ok ? (kalshiRaw.filledCount ?? 0) : 0;
-  if (kalshiFilled <= 0) {
+  const pmFilled = pmRaw.ok ? (pmRaw.filledCount ?? 0) : 0;
+  if (pmFilled <= 0) {
     // Nothing was bought anywhere, so this is a clean miss rather than a position.
+    invalidatePolymarketFunding();
     const body: ExecuteResponse = {
-      kalshi: { ...kalshiRaw, error: scrubSecrets(kalshiRaw.error) },
-      polymarket: { ok: false, error: 'Not placed — Kalshi leg did not fill' },
+      kalshi: { ok: false, error: 'Not placed — Polymarket leg did not fill' },
+      polymarket: { ...pmRaw, error: scrubSecrets(pmRaw.error) },
       executedAt: new Date().toISOString(),
       bothOk: false,
       hedged: false,
@@ -607,43 +611,28 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
       revalidateMs,
       quotedEdgePercent,
       freshEdgePercent,
-      hedgeNote: kalshiRaw.ok
-        ? `Kalshi accepted the order at ${freshKalPrice}¢ but filled 0 of ${plannedContracts} ` +
-          `— the book moved away before it landed. No Polymarket order was sent, so nothing is at risk.`
-        : `Kalshi rejected the order (${scrubSecrets(kalshiRaw.error) ?? 'error'}). No Polymarket ` +
+      hedgeNote: pmRaw.ok
+        ? `Polymarket accepted the order at ${freshPmPrice}¢ but filled 0 of ${plannedContracts} ` +
+          `— its ask is above what this pair can pay and still profit, so the order rested ` +
+          `instead of crossing and was cancelled. No Kalshi order was sent, so nothing is at risk.`
+        : `Polymarket rejected the order (${scrubSecrets(pmRaw.error) ?? 'error'}). No Kalshi ` +
           `order was sent, so nothing is at risk.`,
     };
-    console.log('[execute] kalshi leg missed, polymarket not sent', JSON.stringify({
-      ticker: kalshiTicker, wanted: plannedContracts, limit: freshKalPrice, ok: kalshiRaw.ok,
+    console.log('[execute] polymarket leg missed, kalshi not sent', JSON.stringify({
+      ticker: kalshiTicker, wanted: plannedContracts, limit: freshPmPrice,
+      ok: pmRaw.ok, status: pmRaw.status,
     }));
     return { body, status: 200 };
   }
 
-  // Match Polymarket to what Kalshi actually got, never to what was hoped for — but only
-  // when that amount is something Polymarket will accept.
-  //
-  // Kalshi fills in FRACTIONS of a contract and Polymarket does not. A Kalshi ask can rest
-  // on 0.01 contracts, and an IOC that sweeps only that dust reports filled = 0.01. Sizing
-  // the hedge to it asked Polymarket for 0.01 shares, far under its five-share floor, and the
-  // order was refused. Nothing about that rejection is recoverable by retrying, so the dust
-  // is sold back by the unwind below instead of being hedged.
-  const hedgeable = kalshiFilled >= MIN_ORDER_CONTRACTS;
-  const pmRaw: LegResult = hedgeable
-    ? await placePolymarketOrder({
-        tokenId: pmTokenId,
-        count: kalshiFilled,
-        priceCents: freshPmPrice,
-      })
-    : {
-        ok: false,
-        error: `Not placed — Kalshi filled only ${kalshiFilled} of ${plannedContracts}, below ` +
-          `Polymarket's ${MIN_ORDER_CONTRACTS}-share minimum. That fill swept a dust-sized resting ` +
-          `order; the Kalshi side is being sold back rather than hedged.`,
-      };
-  if (!hedgeable) {
-    console.log('[execute] kalshi filled below the polymarket minimum, hedge not attempted',
-      JSON.stringify({ ticker: kalshiTicker, filled: kalshiFilled, wanted: plannedContracts }));
-  }
+  // Match Kalshi to what Polymarket actually got, never to what was hoped for. Kalshi trades
+  // fractional contracts, so any Polymarket fill can be mirrored exactly.
+  const kalshiRaw = await placeKalshiOrder({
+    ticker: kalshiTicker,
+    side: actualKalshiSide,
+    count: pmFilled,
+    priceCents: freshKalPrice,
+  });
 
   // A fill changes the balance, so drop the cached reading rather than let the next order
   // size itself against money that has already been spent.

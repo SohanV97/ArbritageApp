@@ -1040,6 +1040,10 @@ function TradesScreen({ log }: { log: ExecLogEntry[] }) {
               ))}
             </div>
 
+            {/* A hedged pair and a one-sided position are different things and are not
+                described the same way. Reporting an open position as "payout $0.00, profit
+                -106%" was simply false: an unhedged leg still pays if its side wins. What
+                matters there is what is at risk and what it turns into. */}
             <div
               className="px-5 py-3 flex flex-wrap gap-x-8 gap-y-2 text-xs font-mono"
               style={{ background: 'var(--card)', borderTop: '1px solid var(--border)' }}
@@ -1050,17 +1054,35 @@ function TradesScreen({ log }: { log: ExecLogEntry[] }) {
               <span className="text-[--text-muted]">
                 Fees <span style={{ color: 'var(--foreground)' }}>{fmtUsd(t.feesDollars)}</span>
               </span>
-              <span className="text-[--text-muted]">
-                Payout <span style={{ color: 'var(--foreground)' }}>{fmtUsd(t.payoutDollars)}</span>
-                {t.status === 'hedged' ? '' : ' (only if hedged)'}
-              </span>
-              <span className="text-[--text-muted]">
-                {t.status === 'hedged' ? 'Profit' : 'If it were hedged'}{' '}
-                <span style={{ color: t.profitDollars >= 0 ? '#4ade80' : '#f87171' }}>
-                  {t.profitDollars < 0 ? '−' : '+'}{fmtUsd(t.profitDollars)} (
-                  {t.profitPercent >= 0 ? '+' : '−'}{Math.abs(t.profitPercent).toFixed(2)}%)
-                </span>
-              </span>
+              {t.status === 'hedged' ? (
+                <>
+                  <span className="text-[--text-muted]">
+                    Payout <span style={{ color: 'var(--foreground)' }}>{fmtUsd(t.payoutDollars)}</span>
+                  </span>
+                  <span className="text-[--text-muted]">
+                    Profit{' '}
+                    <span style={{ color: t.profitDollars >= 0 ? '#4ade80' : '#f87171' }}>
+                      {t.profitDollars < 0 ? '−' : '+'}{fmtUsd(t.profitDollars)} (
+                      {t.profitPercent >= 0 ? '+' : '−'}{Math.abs(t.profitPercent).toFixed(2)}%)
+                    </span>
+                  </span>
+                </>
+              ) : (
+                <>
+                  <span className="text-[--text-muted]">
+                    At risk <span style={{ color: '#f87171' }}>{fmtUsd(t.costDollars + t.feesDollars)}</span>
+                  </span>
+                  {t.legs.length > 0 && (
+                    <span className="text-[--text-muted]">
+                      Pays{' '}
+                      <span style={{ color: 'var(--foreground)' }}>
+                        {fmtUsd(t.legs[0].contracts)}
+                      </span>{' '}
+                      if {t.legs[0].outcome}, nothing otherwise
+                    </span>
+                  )}
+                </>
+              )}
             </div>
 
             {entry.result.hedgeNote && t.status !== 'hedged' && (
@@ -1922,17 +1944,22 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
                     {new Date(entry.ts).toLocaleTimeString()} · +{entry.edgePercent.toFixed(2)}% · {fmtUsd(entry.amount)}
                   </p>
                 </div>
+                {/* Both legs read the same way: whether they FILLED.
+                    Polymarket used to show a tick and an order id whenever the venue accepted
+                    the order, which is not the same thing at all — a trade recorded here as
+                    "KAL filled 32 / PM 0xc0f8bd" had bought nothing on Polymarket and left a
+                    naked Kalshi position. An accepted order is not a position. */}
                 <div className="flex gap-3 text-xs font-mono flex-shrink-0">
-                  <span style={{ color: entry.result.kalshi.ok ? '#4ade80' : '#f87171' }}>
-                    KAL {entry.result.kalshi.ok
-                      ? (legFilled(entry.result.kalshi)
-                        ? `✓ filled ${entry.result.kalshi.filledCount}`
-                        : `✗ filled 0 (accepted, no position)`)
-                      : `✗ ${entry.result.kalshi.error?.slice(0, 30)}`}
-                  </span>
-                  <span style={{ color: entry.result.polymarket.ok ? '#4ade80' : '#f87171' }}>
-                    PM {entry.result.polymarket.ok ? `✓ ${entry.result.polymarket.orderId?.slice(0, 8)}` : `✗ ${entry.result.polymarket.error?.slice(0, 30)}`}
-                  </span>
+                  {([['KAL', entry.result.kalshi], ['PM', entry.result.polymarket]] as const).map(([label, leg]) => (
+                    <span key={label} style={{ color: legFilled(leg) ? '#4ade80' : '#f87171' }}>
+                      {label}{' '}
+                      {leg.ok
+                        ? (legFilled(leg)
+                          ? `✓ filled ${leg.filledCount}`
+                          : '✗ filled 0 (accepted, no position)')
+                        : `✗ ${leg.error?.slice(0, 30)}`}
+                    </span>
+                  ))}
                 </div>
                 {/* Hidden until the row is hovered, per the request — but also revealed on
                     keyboard focus, otherwise the control is unreachable without a mouse. */}
