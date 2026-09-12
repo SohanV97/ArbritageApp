@@ -26,6 +26,10 @@ const POLYMARKET_GAMMA_API = 'https://gamma-api.polymarket.com';
 //
 // Holding the fan-out at the saturation point makes the same work finish far sooner.
 const GAMMA_MAX_INFLIGHT = 8;
+// Gamma rate limits under the full discovery fan-out. Three attempts with 250/500ms backoff
+// clears it well inside the refresh budget.
+const GAMMA_RETRIES = 3;
+const GAMMA_RETRY_BASE_MS = 250;
 let _gammaInflight = 0;
 const _gammaWaiters: Array<() => void> = [];
 
@@ -37,7 +41,21 @@ async function gammaFetch(url: string, init?: RequestInit): Promise<Response> {
   }
   _gammaInflight++;
   try {
-    return await fetch(url, init);
+    // Retry rate limits and transient server errors. Without this a single 429 anywhere in
+    // a page walk ended it silently (pageGamma breaks on !ok), and the caller could not tell
+    // a short season from a truncated fetch — which is how a category dropped to 0 markets.
+    let last: Response | undefined;
+    for (let attempt = 0; attempt < GAMMA_RETRIES; attempt++) {
+      try {
+        const res = await fetch(url, init);
+        if (res.ok || (res.status !== 429 && res.status < 500)) return res;
+        last = res;
+      } catch (err) {
+        if (attempt === GAMMA_RETRIES - 1) throw err;
+      }
+      await new Promise(r => setTimeout(r, GAMMA_RETRY_BASE_MS * 2 ** attempt));
+    }
+    return last ?? await fetch(url, init);
   } finally {
     _gammaInflight--;
     _gammaWaiters.shift()?.();
@@ -111,7 +129,6 @@ interface GammaSportMetadata {
 // /sports and /tags are stable metadata — cache for 5 minutes to avoid re-fetching on every 55s rebuild.
 const PM_META_TTL_MS = 5 * 60_000;
 let _cachedSportsData: { data: GammaSportMetadata[]; ts: number } | null = null;
-let _cachedTags: { data: GammaTag[]; ts: number } | null = null;
 
 async function fetchSportsMetadata(): Promise<GammaSportMetadata[]> {
   if (_cachedSportsData && Date.now() - _cachedSportsData.ts < PM_META_TTL_MS) return _cachedSportsData.data;
@@ -126,18 +143,38 @@ async function fetchSportsMetadata(): Promise<GammaSportMetadata[]> {
   return _cachedSportsData?.data ?? [];
 }
 
-async function fetchAllTags(): Promise<GammaTag[]> {
-  if (_cachedTags && Date.now() - _cachedTags.ts < PM_META_TTL_MS) return _cachedTags.data;
+// Slug -> tag id, resolved and cached one slug at a time (null means "asked, absent").
+const _tagIdBySlug = new Map<string, { id: string | null; ts: number }>();
+
+/**
+ * Resolve ONE tag by its slug.
+ *
+ * The category tags have to be looked up exactly, because scanning a tag list cannot find
+ * them: GET /tags returns 50 tags and takes no limit/offset that widens it, while the ids
+ * that matter sit in the thousands (mlb 100381, nfl 450, cfb 100351, soccer 100350). The
+ * scan therefore matched nothing, sports fell back to series ids alone, and NFL vanished
+ * entirely — its series 10187 holds no active events, so tag 450 is the only route to it.
+ *
+ * /tags/slug/<slug> answers precisely and in one request, so exact lookup replaces the scan.
+ */
+async function fetchTagIdBySlug(slug: string): Promise<string | null> {
+  const key = slug.toLowerCase();
+  const hit = _tagIdBySlug.get(key);
+  if (hit && Date.now() - hit.ts < PM_META_TTL_MS) return hit.id;
+  let id: string | null = null;
   try {
-    const res = await gammaFetch(`${POLYMARKET_GAMMA_API}/tags`, { headers: polymarketHeaders() });
+    const res = await gammaFetch(`${POLYMARKET_GAMMA_API}/tags/slug/${encodeURIComponent(key)}`, { headers: polymarketHeaders() });
     if (res.ok) {
-      const data = await res.json() as GammaTag[];
-      _cachedTags = { data: Array.isArray(data) ? data : [], ts: Date.now() };
-      return _cachedTags.data;
+      const tag = await res.json() as GammaTag;
+      if (tag?.id) id = String(tag.id);
     }
-  } catch { /* ok */ }
-  return _cachedTags?.data ?? [];
+  } catch { /* absent or unreachable: treated as "no such tag" */ }
+  // A miss is cached too — most keywords are league names with no tag of their own, and
+  // re-asking for every one of them on each rediscovery is pure latency.
+  _tagIdBySlug.set(key, { id, ts: Date.now() });
+  return id;
 }
+
 
 function toNum(v: unknown): number | null {
   const n = typeof v === 'number' ? v : typeof v === 'string' ? parseFloat(v) : NaN;
@@ -484,13 +521,17 @@ function normalizeEvents(
 // The limit must match the real cap for the short-page check to mean anything.
 const GAMMA_PAGE_LIMIT = 100;
 
-// Gamma returns events OLDEST-first by default. Combined with a page cap that means the
-// cap truncates exactly the wrong end: for a tag holding 2000+ events we kept the oldest
-// 1200 and threw away the upcoming games — the only ones tradeable. Ordering newest-first
-// puts the games we want on page 0 and turns the cap into a harmless floor.
+// Newest-opened first, so a truncated walk keeps the upcoming games rather than a dead
+// season. Only soccer is large enough for this to matter — its tag spans every league and
+// runs past 2000 active events — but there the cap is hit on every pass, and descending
+// order is what keeps the games being played now on page 0.
 //
-// It also lets paging stop as soon as a page holds nothing inside the window we trade,
-// instead of walking an entire season every rediscovery.
+// Do NOT add start_date_min to bound this instead. Gamma's startDate is when the MARKET
+// OPENED, not when the game is played: a game event for today opened about a week ago, so
+// a "since yesterday" window excluded every real fixture while keeping the same-day prop
+// events (1st Inning Winner, First 5 Innings), which open the night before. Measured: MLB
+// came back as 174 events that were 150 props plus 24 games a week out, and today's 15
+// actual games were all missing. Unwindowed, the same series is 249 events across 3 pages.
 const GAMMA_ORDER = '&order=startDate&ascending=false';
 
 // Games worth keeping: anything from yesterday onward. Yesterday (not today) because a
@@ -576,14 +617,21 @@ function dedupeEvents(events: GammaEvent[]): GammaEvent[] {
 
 // ─── main export ─────────────────────────────────────────────────────────────
 
+
+// Last successful set per category, so a failed or rate-limited pass degrades to slightly
+// stale fixtures instead of silently removing the sport. Kalshi has had this for a while;
+// Polymarket did not, and the dev log shows why it needed it: passes logging
+// "nfl: 0 events" and "cfb: 0 events" published an EMPTY category, which is indistinguishable
+// downstream from a sport being out of season.
+const _lastGoodPmByCategory = new Map<Category, PolymarketMarketWithKind[]>();
+
 export async function getPolymarketMarketsForAllCategories(): Promise<Map<Category, PolymarketMarketWithKind[]>> {
   const result = new Map<Category, PolymarketMarketWithKind[]>();
 
   // Use cached metadata (5-min TTL) — avoids re-fetching on every 55s rebuild.
-  const [sportsData, allTags] = await Promise.all([fetchSportsMetadata(), fetchAllTags()]);
+  const sportsData = await fetchSportsMetadata();
 
   // ── Sports + Politics in parallel ────────────────────────────────────────
-  // Sports and politics both need allTags (already fetched), so run them concurrently.
   const sportCategories: Category[] = SPORT_CATEGORY_LIST;
 
   await Promise.all([
@@ -593,25 +641,27 @@ export async function getPolymarketMarketsForAllCategories(): Promise<Map<Catego
     const seriesIds = new Set<string>();
     const tagIds = new Set<string>();
 
-    // Match sport metadata — compare both the raw keyword and its space-normalized form
-    for (const s of sportsData) {
-      const name = (s.sport ?? '').toLowerCase();
-      if (keywords.some(kw => name.includes(kw) || name.includes(kw.replace(/-/g, ' ')))) {
-        if (s.series) s.series.split(',').forEach(id => { const t = id.trim(); if (t) seriesIds.add(t); });
-        if (s.tags) s.tags.split(',').forEach(t => { const tr = t.trim(); if (tr) tagIds.add(tr); });
-      }
+    // Match sport metadata on the EXACT sport code.
+    //
+    // Substring matching was silently catastrophic: Polymarket's code for Mobile Legends:
+    // Bang Bang is "mlbb", so the keyword "mlb" matched an ESPORTS title and adopted its
+    // tags — which are 1 ("sports") and 100639 ("games"), i.e. everything on the platform.
+    // Real MLB is the separate entry sport="mlb" (series 3, tag 100381). Codes are short and
+    // collide easily, so they are compared whole or not at all.
+    for (const sport of sportsData) {
+      const name = (sport.sport ?? '').toLowerCase();
+      if (!keywords.some(kw => name === kw || name === kw.replace(/-/g, ' '))) continue;
+      // Series ids are sport-specific by construction, so they are always safe to take.
+      if (sport.series) sport.series.split(',').forEach(id => { const t = id.trim(); if (t) seriesIds.add(t); });
+      // Its tag ids are deliberately IGNORED: every entry carries tag 1 ("sports") and
+      // 100639 ("games"), which are the whole platform, and the sport's own tag is resolved
+      // by slug below instead.
     }
 
-    // Match tags by slug — normalize spaces to hyphens to match Polymarket's slug format
-    for (const tag of allTags) {
-      const slug = (tag.slug ?? '').toLowerCase();
-      if (keywords.some(kw => {
-        const kwSlug = kw.replace(/\s+/g, '-');
-        return slug === kwSlug || slug.startsWith(kwSlug + '-') || slug.includes('-' + kwSlug);
-      })) {
-        if (tag.id) tagIds.add(tag.id);
-      }
-    }
+    // Resolve each keyword as a tag slug. This is where the sport's real tag comes from
+    // (soccer 100350, nfl 450, ...); keywords with no tag of their own simply miss.
+    const resolved = await Promise.all(keywords.map(kw => fetchTagIdBySlug(kw.replace(/\s+/g, '-'))));
+    for (const id of resolved) if (id) tagIds.add(id);
 
     // Page all the way through. Gamma orders events oldest-first, so stopping early
     // discards precisely the upcoming games we need — a season's series runs to a few
@@ -629,7 +679,10 @@ export async function getPolymarketMarketsForAllCategories(): Promise<Map<Catego
     const normalized = normalizeEvents(deduped, cat, 'sports');
     const filtered = normalized.filter(m => isSportMoneyline(m, cat));
     console.log(`[Polymarket] ${cat}: ${filtered.length} moneyline markets`);
-    result.set(cat, filtered);
+    if (filtered.length > 0) {
+      result.set(cat, filtered);
+      _lastGoodPmByCategory.set(cat, filtered);
+    }
   })),
 
     // Politics: runs in parallel with sports
@@ -646,9 +699,21 @@ export async function getPolymarketMarketsForAllCategories(): Promise<Map<Catego
       const normalizedPol = normalizeEvents(dedupedPol, 'politics', 'fee_free');
       const filteredPol = normalizedPol.filter(isPoliticsMarket);
       console.log(`[Polymarket] politics: ${filteredPol.length} markets`);
-      result.set('politics', filteredPol);
+      if (filteredPol.length > 0) {
+        result.set('politics', filteredPol);
+        _lastGoodPmByCategory.set('politics', filteredPol);
+      }
     })(),
   ]);
+
+  // Restore any category this pass failed to fetch, so a transient outage costs freshness
+  // rather than removing the sport entirely.
+  for (const [cat, markets] of _lastGoodPmByCategory) {
+    if (!result.has(cat)) {
+      console.warn(`[Polymarket] ${cat}: fetch returned nothing — reusing ${markets.length} markets from the last good pass`);
+      result.set(cat, markets);
+    }
+  }
 
   return result;
 }

@@ -61,16 +61,25 @@ export function kalshiTickerToCategory(ticker: string): Category | null {
   return null;
 }
 
+// Matched against Polymarket's /sports codes (whole-string) and tag slugs. Both are
+// namespaces of short, collision-prone identifiers, so entries here must name the specific
+// competition — never a sport in general.
 export const POLYMARKET_SPORT_KEYWORDS: Partial<Record<Category, string[]>> = {
-  mlb: ['mlb', 'baseball'],
+  // NOT 'baseball': that is tag 678, which is every baseball league on the platform (KBO,
+  // NPB, LMB, LVBP, CPBL). Kalshi lists only MLB, so those can never pair — they would just
+  // enlarge the walk that has to finish before today's games are reached. Tag 100381 ("mlb")
+  // plus series 3 already cover the fixtures completely (174 events, 150 of them today).
+  mlb: ['mlb'],
   // Matched against Polymarket's /sports `sport` names and tag slugs. Their sport codes
   // are exactly "nfl" and "cfb"; deliberately NOT the word "football", which would drag
   // in soccer leagues and every football-adjacent novelty tag.
   nfl: ['nfl'],
   cfb: ['cfb', 'ncaaf'],
   // 'football' excluded — matches American football on Polymarket.
+  // NOT 'fifa': sport="fifa" is the VIDEO GAME (tag 64, esports), not football. The World
+  // Cup is its own code, 'fifwc'.
   soccer: [
-    'soccer', 'world-cup', 'fifa', 'fifwc', 'fif',
+    'soccer', 'world-cup', 'fifwc', 'fif',
     'mls', 'epl', 'uef', 'lal', 'bun', 'fl1',
     'premier-league', 'champions-league', 'euro-2024', 'euro-2025', 'euro-2026',
   ],
