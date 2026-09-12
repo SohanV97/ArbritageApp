@@ -1457,7 +1457,13 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
           >
             <div className="w-2 h-2 rounded-full bg-[#4ade80] animate-pulse" />
             <span className="text-xs text-[#4ade80] font-medium">
+              {/* The server does the trading now, so say whether it actually has the
+                  settings. A failed sync leaves the toggle looking armed while nothing
+                  is watching the markets. */}
               Auto-trading {autoExecScope === 'sports' ? 'sports only' : 'all categories'} · {fmtUsd(riskDollars)}/trade · {execLog.length} executed
+              {autoExec && (autoExecSynced
+                ? <span style={{ color: '#4ade80' }}> · server armed</span>
+                : <span style={{ color: '#f87171' }}> · NOT synced to server — nothing is trading</span>)}
             </span>
           </div>
         )}

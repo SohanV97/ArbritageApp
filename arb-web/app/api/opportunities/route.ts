@@ -271,8 +271,22 @@ function applyDepth(opps: ArbitrageOpportunity[]): void {
  * Deliberately fire-and-forget: the caller is the refresh tick, and blocking it on an order
  * would stall repricing for every other market while one trade completes.
  */
+// Edges seen on the previous tick, so one that only exists for an instant can be told from
+// one both venues agree on.
+let _lastTickEdges = new Set<string>();
+
 function maybeAutoExecute(opps: ArbitrageOpportunity[]): void {
   const cfg = getAutoExecConfig();
+
+  const qualifyingNow = new Set<string>();
+  for (const o of opps) {
+    if (o.edgePercent > 0 && o.edgePercent >= cfg.thresholdPercent) {
+      qualifyingNow.add(`${o.pair.polymarket.id}|${o.pair.kalshi.id}`);
+    }
+  }
+  const seenLastTick = _lastTickEdges;
+  _lastTickEdges = qualifyingNow;
+
   if (!cfg.enabled || opps.length === 0) return;
 
   for (const opp of opps) {
@@ -280,6 +294,19 @@ function maybeAutoExecute(opps: ArbitrageOpportunity[]): void {
     if (cfg.scope === 'sports' && opp.pair.polymarket.category === 'politics') continue;
     const key = `${opp.pair.polymarket.id}|${opp.pair.kalshi.id}`;
     if (!pairIsAvailable(key)) continue;
+
+    // The edge must have been there on the previous tick too.
+    //
+    // Measured on live books: an edge that survives a tick is one both venues agree on, and
+    // it goes on to pass every pre-order check — 36 of 41 such attempts were cleared to
+    // send. An edge present for a single tick is the gap between two feeds rather than a
+    // price: in-play baseball cards reading +0.56/+3.59/+2.55/+0.54% re-checked at
+    // -4.37/-3.31/-2.40/-8.49% about 160ms later, always negative, which is selection bias
+    // and not movement. Those cannot be captured at any latency reachable over HTTP, so
+    // firing at them produces the run of executions that never becomes a trade.
+    //
+    // This costs one tick (~150ms) and still lands far inside the old 450-600ms budget.
+    if (!seenLastTick.has(key)) continue;
 
     const amount = sizeByRisk({
       riskDollars: cfg.riskDollars,
@@ -295,7 +322,7 @@ function maybeAutoExecute(opps: ArbitrageOpportunity[]): void {
     holdPair(key, 30_000);   // provisional; replaced by the outcome-based hold below
 
     const startedAt = Date.now();
-    void executeArb({ opportunity: opp, amount })
+    void executeArb({ opportunity: opp, amount, dryRun: cfg.dryRun === true })
       .then(({ body }) => {
         releasePairAfter(key, body);
         addAutoExecRecord({

@@ -23,6 +23,13 @@ export interface AutoExecConfig {
   riskDollars: number;
   /** 'sports' skips politics, which settle months out and lock capital. */
   scope: 'sports' | 'all';
+  /**
+   * Run the complete pre-order path and record what WOULD have been sent, without sending
+   * it. The only way to learn why a run of executions never becomes a trade is to watch the
+   * checks on live markets at the rate they actually fire, and the alternative is paying for
+   * the answer one rejected order at a time.
+   */
+  dryRun?: boolean;
 }
 
 export interface AutoExecRecord {
@@ -39,6 +46,7 @@ const DEFAULT_CONFIG: AutoExecConfig = {
   thresholdPercent: 1.5,
   riskDollars: 100,
   scope: 'sports',
+  dryRun: false,
 };
 
 // Dev HMR re-evaluates modules, and a fresh module instance would silently forget that
@@ -77,6 +85,7 @@ export function setAutoExecConfig(patch: Partial<AutoExecConfig>): AutoExecConfi
     next.riskDollars = patch.riskDollars as number;
   }
   if (patch.scope === 'sports' || patch.scope === 'all') next.scope = patch.scope;
+  if (typeof patch.dryRun === 'boolean') next.dryRun = patch.dryRun;
   s.config = next;
   return { ...next };
 }
