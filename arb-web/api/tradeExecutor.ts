@@ -332,8 +332,12 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
   // itself so a filled trade can never be a knowingly losing one.
   const edgeCents = Math.max(0, freshEdgePercent);
   const totalBuffer = Math.min(4, Math.floor(edgeCents));
-  const pmBuffer = Math.ceil(totalBuffer / 2);
-  const kalBuffer = Math.floor(totalBuffer / 2);
+  // Weighted toward KALSHI, because that is the leg that misses and it now goes first.
+  // A Kalshi miss costs nothing — no Polymarket order follows it — so buying certainty
+  // there is close to free, while the same cent spent on Polymarket protects a leg that was
+  // already filling reliably.
+  const kalBuffer = Math.ceil(totalBuffer / 2);
+  const pmBuffer = Math.floor(totalBuffer / 2);
   const freshPmPrice = Math.min(99, pmAtBook + pmBuffer);
   const freshKalPrice = Math.min(99, kalAtBook + kalBuffer);
 
@@ -464,22 +468,60 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
     return { body: dry, status: 200 };
   }
 
-  // Place both legs simultaneously — this minimizes price-movement risk between legs.
-  // Limits are the FRESH prices, so a market that moved is quoted at what it is now
-  // rather than at a stale price that would simply fail to fill.
-  const [kalshiRaw, pmRaw] = await Promise.all([
-    placeKalshiOrder({
-      ticker: kalshiTicker,
-      side: actualKalshiSide,
-      count: plannedContracts,
-      priceCents: freshKalPrice,
-    }),
-    placePolymarketOrder({
-      tokenId: pmTokenId,
-      count: plannedContracts,
-      priceCents: freshPmPrice,
-    }),
-  ]);
+  // ── Kalshi first, then Polymarket for exactly what Kalshi filled ───────────
+  //
+  // These used to fire together, which treats the two venues as equally likely to fill.
+  // They are not. Every naked position so far has had the same shape: Polymarket filled and
+  // Kalshi did not — an IOC for 101 contracts accepted, filled 0 and cancelled, while the
+  // Polymarket leg went through. Firing in parallel means each miss becomes real exposure.
+  //
+  // Legging the unreliable venue FIRST turns that failure into a no-op: if Kalshi fills
+  // nothing, no Polymarket order is sent and there is nothing to unwind. And because
+  // Polymarket is then sized to the ACTUAL Kalshi fill rather than the intended size, a
+  // partial fill produces a matched pair instead of a lopsided one.
+  //
+  // The cost is the Polymarket leg going out ~150ms later, carrying the risk that its price
+  // moves in between. That is the right trade: a miss on the second leg leaves a position
+  // that is immediately sold back below, whereas a miss on a parallel leg was discovered
+  // only afterwards.
+  const kalshiRaw = await placeKalshiOrder({
+    ticker: kalshiTicker,
+    side: actualKalshiSide,
+    count: plannedContracts,
+    priceCents: freshKalPrice,
+  });
+
+  const kalshiFilled = kalshiRaw.ok ? (kalshiRaw.filledCount ?? 0) : 0;
+  if (kalshiFilled <= 0) {
+    // Nothing was bought anywhere, so this is a clean miss rather than a position.
+    const body: ExecuteResponse = {
+      kalshi: { ...kalshiRaw, error: scrubSecrets(kalshiRaw.error) },
+      polymarket: { ok: false, error: 'Not placed — Kalshi leg did not fill' },
+      executedAt: new Date().toISOString(),
+      bothOk: false,
+      hedged: false,
+      noOrdersSent: true,
+      revalidateMs,
+      quotedEdgePercent,
+      freshEdgePercent,
+      hedgeNote: kalshiRaw.ok
+        ? `Kalshi accepted the order at ${freshKalPrice}¢ but filled 0 of ${plannedContracts} ` +
+          `— the book moved away before it landed. No Polymarket order was sent, so nothing is at risk.`
+        : `Kalshi rejected the order (${scrubSecrets(kalshiRaw.error) ?? 'error'}). No Polymarket ` +
+          `order was sent, so nothing is at risk.`,
+    };
+    console.log('[execute] kalshi leg missed, polymarket not sent', JSON.stringify({
+      ticker: kalshiTicker, wanted: plannedContracts, limit: freshKalPrice, ok: kalshiRaw.ok,
+    }));
+    return { body, status: 200 };
+  }
+
+  // Match Polymarket to what Kalshi actually got, never to what was hoped for.
+  const pmRaw = await placePolymarketOrder({
+    tokenId: pmTokenId,
+    count: kalshiFilled,
+    priceCents: freshPmPrice,
+  });
 
   // A fill changes the balance, so drop the cached reading rather than let the next order
   // size itself against money that has already been spent.
