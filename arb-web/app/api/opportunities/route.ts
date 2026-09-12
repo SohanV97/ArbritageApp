@@ -6,6 +6,9 @@ import { warmPolymarketTrading } from '@/api/polymarket-trading';
 import { fillableContracts, kalshiAskLadder, polymarketAskLadder } from '@/lib/depth';
 import { estimateKalshiFeeCents, estimatePolymarketFeeCents } from '@/lib/fees';
 import { sizeByRisk } from '@/lib/sizing';
+import { syncLiveFeeds } from '@/api/liveFeeds';
+import { getLiveKalshiBook, getLivePolymarketBook } from '@/lib/liveBooks';
+import { priceForSize } from '@/lib/depth';
 import { executeArb } from '@/api/tradeExecutor';
 import {
   getAutoExecConfig, addAutoExecRecord, tryClaimExecution, releaseExecution,
@@ -165,6 +168,13 @@ function repriceInPlay(): Promise<void> {
   if (!disc) return Promise.resolve();
   const pm = disc.matchedPm.filter(isInPlay);
   const kal = disc.matchedKalshi.filter(isInPlay);
+
+  // Keep the live feeds pointed at exactly these markets. Polling still runs underneath as
+  // the fallback, so a dropped socket costs speed rather than correctness.
+  syncLiveFeeds(
+    kal.map(m => m.symbol ?? '').filter(Boolean),
+    pm.map(m => m.yesTokenId ?? '').filter(Boolean),
+  );
   if (pm.length === 0 && kal.length === 0) return Promise.resolve();
   _fastInFlight = Promise.all([
     refreshKalshiPrices(kal),
@@ -513,7 +523,57 @@ async function discover(): Promise<Discovery> {
 // Pure CPU: rebuild the response from whatever prices the matched markets currently
 // hold. Called after discovery and after every reprice, so both paths run identical
 // alignment, fee and edge logic.
+/**
+ * Price in-play markets from the websocket books before anything is compared.
+ *
+ * The polled quotes are not merely stale here, they are wrong in a way that manufactures
+ * edges. With live books wired into the ORDER path only, cards reading +0.75/+0.25/+0.21/
+ * +0.59% re-checked at -3.44/-0.79/-4.59/-1.54% — in three to four milliseconds. Nothing
+ * moves in 3ms; the polled numbers the card was built from simply did not match the book.
+ *
+ * Kalshi's REST quote is the top of book including resting dust, and it lags a fast in-play
+ * market by a refresh interval. Both errors point the same way, because the scan surfaces a
+ * pair exactly when the error happens to look profitable — which is why every one of those
+ * gaps was negative rather than scattered.
+ *
+ * Pricing the list from the same books the order path uses makes the card's edge the edge
+ * that will be there at execution. Markets without a live feed keep their polled prices.
+ */
+function applyLiveBookPrices(disc: Discovery): number {
+  let priced = 0;
+  for (const m of disc.matchedKalshi) {
+    const live = m.symbol ? getLiveKalshiBook(m.symbol) : undefined;
+    if (!live) continue;
+    const yes = kalshiAskLadder(live, 'yes')[0];
+    const no = kalshiAskLadder(live, 'no')[0];
+    if (!yes || !no) continue;
+    m.yesPriceCents = yes.priceCents;
+    m.noPriceCents = no.priceCents;
+    // Depth at the quoted price, which is what disqualifies a dust-backed quote. The ladder
+    // has already dropped sub-contract levels, so this is real size by construction.
+    m.yesDepth = yes.size;
+    m.noDepth = no.size;
+    priced++;
+  }
+  for (const m of disc.matchedPm) {
+    const live = m.yesTokenId ? getLivePolymarketBook(m.yesTokenId) : undefined;
+    if (!live) continue;
+    // Same basis the polled path uses: the price at which the venue minimum can be filled.
+    const yes = priceForSize(polymarketAskLadder(live, 'yes'), MIN_ORDER_CONTRACTS);
+    const no = priceForSize(polymarketAskLadder(live, 'no'), MIN_ORDER_CONTRACTS);
+    if (yes === null || no === null) continue;
+    m.yesPriceCents = yes;
+    m.noPriceCents = no;
+    priced++;
+  }
+  return priced;
+}
+
 function assemble(disc: Discovery): OpportunitiesResponse {
+  // Live books first: every edge below is then computed from the same data the order path
+  // will price against, so the card and the execution agree by construction.
+  applyLiveBookPrices(disc);
+
   const allOpportunities: ArbitrageOpportunity[] = [];
   const allPairsDetail: PairInfo[] = [];
   const byCategory: OpportunitiesResponse['stats']['byCategory'] = {};

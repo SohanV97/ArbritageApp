@@ -17,6 +17,7 @@ import { placePolymarketOrder, polymarketFundingDollars, invalidatePolymarketFun
 import { getKalshiOrderbook } from '@/api/kalshi';
 import { getPolymarketBooks } from '@/api/polymarket';
 import { fillableContracts, kalshiAskLadder, polymarketAskLadder, priceForSize } from '@/lib/depth';
+import { getLiveKalshiBook, getLivePolymarketBook } from '@/lib/liveBooks';
 import { estimatePolymarketFeeCents, estimateKalshiFeeCents } from '@/lib/fees';
 
 export interface LegResult {
@@ -210,16 +211,25 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
   // leg too low while the Kalshi leg is priced off a fresh book, so Kalshi fills and
   // Polymarket does not. That is a naked position — the exact failure this route exists to
   // prevent — traded for latency. A stale-price abort costs nothing; a naked leg costs money.
+  // Prefer the websocket books. Serving a POLLED cache here would be unsafe — it is stale by
+  // construction, and pricing one leg off a stale ladder while the other is fresh is how a
+  // leg fills alone. A pushed book is different in kind: the venue sends every change as it
+  // happens, so this is the live book, and using it removes the ~160ms re-read that was
+  // costing more than the edges were lasting. If either feed is down or quiet, that side
+  // falls back to a fetch and nothing changes but the latency.
+  const liveKal = getLiveKalshiBook(kalshiTicker);
+  const livePm = getLivePolymarketBook(pmYesToken);
   const [kOrderbook, fetchedPmBooks] = await Promise.all([
-    getKalshiOrderbook(kalshiTicker),
-    getPolymarketBooks([pmYesToken]),
+    liveKal ? Promise.resolve(liveKal) : getKalshiOrderbook(kalshiTicker),
+    livePm ? Promise.resolve(null) : getPolymarketBooks([pmYesToken]),
   ]);
   const revalidateMs = Date.now() - revalStart;
+  const bookSource = `${liveKal ? 'live' : 'fetch'}/${livePm ? 'live' : 'fetch'}`;
 
   // Derive the fee model server-side rather than trusting the posted market.
   const feeKind = pair.polymarket.category === 'politics' ? 'fee_free' : 'sports';
   const kalLadder = kalshiAskLadder(kOrderbook, actualKalshiSide);
-  const pmBook = fetchedPmBooks.get(pmYesToken);
+  const pmBook = livePm ?? fetchedPmBooks?.get(pmYesToken);
   const pmLadder = polymarketAskLadder(pmBook, pmLeg.side);
 
   // An unreadable book is not an empty one. Both produce a zero-length ladder, and
@@ -364,7 +374,7 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
       freshEdgePercent,
       hedgeNote: `Dry run: ${plannedContracts} contracts at ${freshKalPrice}¢ (Kalshi) + ` +
         `${freshPmPrice}¢ (Polymarket), edge ${freshEdgePercent.toFixed(2)}%, confirmed in ` +
-        `${revalidateMs}ms. No orders were sent.`,
+        `${revalidateMs}ms via ${bookSource}. No orders were sent.`,
     };
     return { body: dry, status: 200 };
   }
@@ -413,7 +423,7 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
   // Audit log (server-side only). Order IDs + fill counts, no error bodies with secrets.
   console.log('[execute]', JSON.stringify({
     ticker: kalshiTicker, contracts, bothOk, hedged, hedgeNote: note,
-    revalidateMs, quotedEdgePercent, freshEdgePercent,
+    revalidateMs, bookSource, quotedEdgePercent, freshEdgePercent,
     kalshi: { ok: kalshiResult.ok, filled: kalshiResult.filledCount, orderId: kalshiResult.orderId },
     polymarket: { ok: pmResult.ok, filled: pmResult.filledCount, orderId: pmResult.orderId },
   }));
