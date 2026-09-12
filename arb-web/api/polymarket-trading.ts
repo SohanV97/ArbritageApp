@@ -260,8 +260,17 @@ function mapOrderError(code: string, message: string): string {
     case 'post_only_mode':
       return `${message} — the market is post-only right now, so an immediate-fill order ` +
         `cannot be placed.`;
-    default:
+    default: {
+      // The CLOB reports a malformed or unacceptable order as "order <hash> is invalid".
+      // That hash is the ORDER id, and it is the same 32-byte hex shape as a private key,
+      // so the message invites exactly the wrong conclusion. Say which one it is.
+      if (/is invalid/i.test(message)) {
+        return `${message} — the 0x value there is the ORDER id, not a key. The CLOB refused ` +
+          `the order itself; the usual cause is a size below the ${POLYMARKET_MIN_SHARES}-share minimum or a price ` +
+          `off the market's tick.`;
+      }
       return message || `order rejected (${code})`;
+    }
   }
 }
 
@@ -350,7 +359,31 @@ export async function testPolymarketAuth(): Promise<PolymarketAuthTest> {
   }
 }
 
+/**
+ * Smallest order the CLOB accepts, in shares.
+ *
+ * Kalshi trades fractional contracts and Polymarket does not, so a Kalshi fill can be a
+ * size Polymarket has no way to mirror. Sending it anyway earns a rejection whose text
+ * names the order hash, which reads like a credential failure and is not one.
+ */
+const POLYMARKET_MIN_SHARES = 5;
+
 export async function placePolymarketOrder(req: PolymarketOrderRequest): Promise<PolymarketOrderResult> {
+  // Checked before the client is even built: no amount of retrying makes an undersized
+  // order acceptable, and the caller needs to hear the real reason.
+  //
+  // Opening only. A SELL here is an unwind of a position that already exists, and refusing
+  // one leaves that position open — the failure this guard exists to prevent. If the venue
+  // rejects the sell too, the caller reports a naked leg either way, so attempting costs
+  // nothing and might close it.
+  if (req.action !== 'sell' && (!Number.isFinite(req.count) || req.count < POLYMARKET_MIN_SHARES)) {
+    return {
+      ok: false,
+      error: `Order size ${req.count} is below Polymarket's ${POLYMARKET_MIN_SHARES}-share minimum, so it was not sent. ` +
+        `This is a size limit, not a credential problem.`,
+    };
+  }
+
   const init = await getSecureClient();
   if ('error' in init) return { ok: false, error: init.error };
 

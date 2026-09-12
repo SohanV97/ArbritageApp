@@ -72,11 +72,34 @@ export interface ExecuteOutcome { body: ExecuteResponse; status: number }
 
 // Redact anything that looks like a wallet key or PEM before it can reach the client
 // or logs — defense in depth against an underlying library echoing key material.
+/**
+ * Remove credentials from text that reaches a log or the browser.
+ *
+ * Matching on SHAPE alone was wrong in a way that cost real debugging time. A 32-byte hex
+ * string is a private key, and it is also a Polymarket order hash, so the blanket rule
+ * rewrote a rejection reading "order 0x<hash> is invalid" into "order 0x<redacted-key> is
+ * invalid" — which says the KEY is invalid. The order was refused for its size; the
+ * credentials were never involved.
+ *
+ * So redact what is actually secret: the values this process holds. Any other hex string is
+ * an order or transaction id, which is exactly what you need to look a failure up.
+ */
 function scrubSecrets(s: string | undefined): string | undefined {
   if (!s) return s;
-  return s
-    .replace(/0x[a-fA-F0-9]{64}/g, '0x<redacted-key>')
-    .replace(/-----BEGIN[\s\S]*?END[^-]*-----/g, '<redacted-pem>');
+  let out = s;
+  for (const name of ['POLYMARKET_PRIVATE_KEY', 'KALSHI_PRIVATE_KEY', 'KALSHI_API_KEY', 'POLYMARKET_API_KEY']) {
+    const v = process.env[name];
+    if (!v || v.length < 8) continue;
+    // Keys appear with and without the 0x prefix depending on who formats the message.
+    const bare = v.startsWith('0x') ? v.slice(2) : v;
+    for (const form of [v, bare]) {
+      if (form.length < 8) continue;
+      out = out.split(form).join('<redacted>');
+      out = out.split(form.toLowerCase()).join('<redacted>');
+      out = out.split(form.toUpperCase()).join('<redacted>');
+    }
+  }
+  return out.replace(/-----BEGIN[\s\S]*?END[^-]*-----/g, '<redacted-pem>');
 }
 
 // Every exit path carries the full ExecuteResponse shape, so a validation failure renders
@@ -534,12 +557,31 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
     return { body, status: 200 };
   }
 
-  // Match Polymarket to what Kalshi actually got, never to what was hoped for.
-  const pmRaw = await placePolymarketOrder({
-    tokenId: pmTokenId,
-    count: kalshiFilled,
-    priceCents: freshPmPrice,
-  });
+  // Match Polymarket to what Kalshi actually got, never to what was hoped for — but only
+  // when that amount is something Polymarket will accept.
+  //
+  // Kalshi fills in FRACTIONS of a contract and Polymarket does not. A Kalshi ask can rest
+  // on 0.01 contracts, and an IOC that sweeps only that dust reports filled = 0.01. Sizing
+  // the hedge to it asked Polymarket for 0.01 shares, far under its five-share floor, and the
+  // order was refused. Nothing about that rejection is recoverable by retrying, so the dust
+  // is sold back by the unwind below instead of being hedged.
+  const hedgeable = kalshiFilled >= MIN_ORDER_CONTRACTS;
+  const pmRaw: LegResult = hedgeable
+    ? await placePolymarketOrder({
+        tokenId: pmTokenId,
+        count: kalshiFilled,
+        priceCents: freshPmPrice,
+      })
+    : {
+        ok: false,
+        error: `Not placed — Kalshi filled only ${kalshiFilled} of ${plannedContracts}, below ` +
+          `Polymarket's ${MIN_ORDER_CONTRACTS}-share minimum. That fill swept a dust-sized resting ` +
+          `order; the Kalshi side is being sold back rather than hedged.`,
+      };
+  if (!hedgeable) {
+    console.log('[execute] kalshi filled below the polymarket minimum, hedge not attempted',
+      JSON.stringify({ ticker: kalshiTicker, filled: kalshiFilled, wanted: plannedContracts }));
+  }
 
   // A fill changes the balance, so drop the cached reading rather than let the next order
   // size itself against money that has already been spent.
