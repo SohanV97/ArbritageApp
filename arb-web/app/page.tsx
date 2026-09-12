@@ -927,27 +927,6 @@ const POLL_MS = 150;
 // read in passing, short enough that an unattended session does not sit idle on it.
 const RESULT_AUTODISMISS_MS = 6_000;
 
-// How many consecutive polls an edge must survive before auto-execute will fire on it.
-//
-// Measured against live books: on slow markets the displayed edge and the order-book edge
-// agree to the decimal (a college game read 0.62% on both). On IN-PLAY baseball they
-// diverged every time, and always the same way — cards showing +0.56/+3.59/+2.55/+0.54%
-// re-checked at -4.37/-3.31/-2.40/-8.49% roughly 160ms later. A real move would scatter in
-// both directions; a one-sided gap is selection bias. The scan surfaces a pair at the
-// instant one venue's feed has moved and the other has not, so the "edge" is the lag
-// between two feeds rather than a price anyone can trade.
-//
-// Those artifacts die within about 160ms. An edge still present two polls later is one both
-// venues agree on. Two observations costs ~150ms and turns eight straight wasted attempts
-// into none — and it forfeits nothing, because an edge that cannot survive 150ms is exactly
-// the one the pre-order re-check was already refusing.
-// Set to 1 — OFF by default. Two confirmations reliably filtered the artifacts, but it buys
-// that by never attempting a fleeting edge at all, and a fleeting edge is the only kind a
-// lagging feed ever offers. A wasted attempt costs nothing: no orders are sent, and the
-// pre-order re-check is what refuses them. Trading away capture to reduce log noise is the
-// wrong side of that trade while catching these is the goal. Raise to 2 to suppress the
-// failed attempts once the latency work below makes real captures the common case.
-const EDGE_CONFIRMATIONS = 1;
 
 export default function Home() {
   const [data, setData] = useState<OpportunitiesResponse | null>(null);
@@ -982,8 +961,6 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
   const [execLog, setExecLog] = useState<ExecLogEntry[]>([]);
   const [execPhase, setExecPhase] = useState<ExecPhase | null>(null);
   const [resultCountdown, setResultCountdown] = useState<number | null>(null);
-  // How many consecutive polls each pair has shown a qualifying edge for.
-  const edgeStreak = useRef<Map<string, number>>(new Map());
   const [connTest, setConnTest] = useState<{ state: 'idle' | 'pending' | 'done'; result?: ConnectionTestResponse }>({ state: 'idle' });
 
   async function handleTestConnection() {
@@ -1025,45 +1002,6 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
     try { localStorage.setItem(EXEC_LOG_KEY, JSON.stringify(execLog)); } catch { /* quota/absent */ }
   }, [execLog]);
 
-  const executeOpportunity = useCallback(async (opp: ArbitrageOpportunity, betAmount: number, key: string) => {
-    let result: ExecuteResponse;
-    try {
-      const res = await fetch('/api/execute', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ opportunity: opp, amount: betAmount }),
-      });
-      result = await res.json() as ExecuteResponse;
-    } catch (err) {
-      result = {
-        kalshi: { ok: false, error: String(err) },
-        polymarket: { ok: false, error: String(err) },
-        executedAt: new Date().toISOString(),
-        bothOk: false,
-        hedged: false,
-        hedgeNote: `Request failed: ${String(err)}`,
-      };
-    }
-    setExecPhase({ phase: 'result', opp, amount: betAmount, result });
-    // Always log — successes AND failures — so a naked/failed leg is never silently dropped.
-    setExecLog(prev => [{
-      id: makeExecId(),
-      ts: new Date().toISOString(),
-      question: opp.pair.polymarket.question,
-      edgePercent: opp.edgePercent,
-      amount: betAmount,
-      result,
-    }, ...prev].slice(0, 50));
-    // Re-arm when no position is at risk: a clean hedge, or a price-move abort where
-    // nothing was sent. A naked/partial/failed leg stays blocked so we never auto-fire a
-    // second order onto it. Backing out must not blacklist a pair for five minutes —
-    // the edge often returns within seconds.
-    if (result.hedged) {
-      setTimeout(() => executedPairs.current.delete(key), 5 * 60_000);
-    } else if (result.noOrdersSent) {
-      setTimeout(() => executedPairs.current.delete(key), 10_000);
-    }
-  }, []);
 
   const load = useCallback(async (force = false) => {
     if (isFetching.current && !force) return;
@@ -1142,70 +1080,62 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
     if (view === 'pairs') load();
   }, [view, load]);
 
-  // Auto-exec: fire on a new qualifying opportunity the moment one appears
+  // The SERVER executes now, so it needs the settings. It decides inside the refresh tick,
+  // on the books it just fetched, which removes the poll and the round trip that together
+  // cost 300ms+ of an edge's short life.
+  //
+  // Failing to sync means nothing trades, so track it and say so rather than looking armed.
+  const [autoExecSynced, setAutoExecSynced] = useState(false);
   useEffect(() => {
-    // A trade in flight blocks another, and so does a result that needs a human — a naked or
-    // partial fill must not be scrolled past by the next trade. A HARMLESS result does not
-    // block: it closes itself after a few seconds, and refusing to trade for that whole
-    // countdown is a blind window an unattended run cannot afford. The next execution simply
-    // replaces the screen.
-    const busy = execPhase !== null
-      && (execPhase.phase !== 'result' || resultNeedsAttention(execPhase.result));
-    if (!autoExec || !data || busy) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/autoexec', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            enabled: autoExec,
+            thresholdPercent: execThreshold,
+            riskDollars,
+            scope: autoExecScope,
+          }),
+        });
+        if (!cancelled) setAutoExecSynced(res.ok);
+      } catch { if (!cancelled) setAutoExecSynced(false); }
+    })();
+    return () => { cancelled = true; };
+  }, [autoExec, execThreshold, riskDollars, autoExecScope]);
 
-    // Streaks must count CONSECUTIVE sightings. An edge that flickers in and out is the
-    // artifact this guards against, and without clearing it between polls each flicker would
-    // add to the count until it fired on exactly the wrong kind of edge.
-    const qualifyingNow = new Set<string>();
-    for (const opp of data.opportunities) {
-      if (opp.edgePercent > 0 && opp.edgePercent >= execThreshold) {
-        qualifyingNow.add(`${opp.pair.polymarket.id}|${opp.pair.kalshi.id}`);
-      }
-    }
-    for (const k of edgeStreak.current.keys()) {
-      if (!qualifyingNow.has(k)) edgeStreak.current.delete(k);
-    }
+  // Pull in trades the server made while this tab was not the one deciding.
+  useEffect(() => {
+    if (!autoExec) return;
+    let stop = false;
+    const pull = async () => {
+      try {
+        const { records } = await (await fetch('/api/autoexec')).json() as { records?: ExecLogEntry[] };
+        if (stop || !Array.isArray(records) || records.length === 0) return;
+        setExecLog(prev => {
+          const have = new Set(prev.map(e => e.id));
+          const fresh = records.filter(r => !have.has(r.id));
+          return fresh.length ? [...fresh, ...prev].slice(0, 50) : prev;
+        });
+      } catch { /* transient; the next tick tries again */ }
+    };
+    void pull();
+    const id = setInterval(pull, 1000);
+    return () => { stop = true; clearInterval(id); };
+  }, [autoExec]);
 
-    for (const opp of data.opportunities) {
-      if (opp.edgePercent < execThreshold) break;
-      // Hard floor: never auto-trade a non-profitable edge, whatever the threshold says.
-      // The list now includes near-misses (negative edge) for visibility.
-      if (opp.edgePercent <= 0) break;
-      // Default scope trades sports only — politics settle months out and lock capital
-      if (autoExecScope === 'sports' && opp.pair.polymarket.category === 'politics') continue;
-      const key = `${opp.pair.polymarket.id}|${opp.pair.kalshi.id}`;
-      if (executedPairs.current.has(key)) continue;
-      // Size from the dollar budget, never beyond what the thinner book can fill — an
-      // oversized leg partially fills and cancels, leaving the other one naked. sizeByRisk
-      // returns 0 when the budget cannot reach the venue minimum, which is a skip, not a
-      // small trade: below it the Polymarket leg is rejected while Kalshi fills.
-      const betAmount = sizeByRisk({
-        riskDollars,
-        legAPriceCents: opp.legA.priceCents,
-        legBPriceCents: opp.legB.priceCents,
-        maxContracts: opp.maxContracts,
-        minContracts: MIN_ORDER_CONTRACTS,
-      }).contracts;
-      if (betAmount <= 0) continue;
-
-      // Require the edge to survive consecutive polls before committing real money to it.
-      const streak = (edgeStreak.current.get(key) ?? 0) + 1;
-      edgeStreak.current.set(key, streak);
-      if (streak < EDGE_CONFIRMATIONS) continue;
-
-      executedPairs.current.add(key);
-      edgeStreak.current.delete(key);
-      // Fire immediately. This used to open a 10-second confirmation countdown, which
-      // defeated the point: an arb edge is usually gone within a second or two, so by the
-      // time the prompt was answered the trade no longer existed. Auto-execute means
-      // auto-execute — the toggle itself is the consent, and the safety checks that matter
-      // (depth, funding, and a price re-check) all run server-side inside /api/execute,
-      // which backs out and sends nothing if the edge has moved.
-      setExecPhase({ phase: 'executing', opp, amount: betAmount, key });
-      executeOpportunity(opp, betAmount, key);
-      break; // one at a time
-    }
-  }, [data, autoExec, autoExecScope, execThreshold, riskDollars, execPhase, executeOpportunity]);
+  // Auto-execution is NOT done here any more.
+  //
+  // The browser used to watch for an edge and post it back for the server to act on, which
+  // meant an order landed 450-600ms after the prices that justified it — a poll (~150ms), a
+  // round trip, and the server re-reading books it had just read (~160ms). Live edges were
+  // measured dying inside that window. The refresh loop now decides on its own fetch, and
+  // the settings above are pushed to it.
+  //
+  // Only one side may execute. If this effect also fired, the same pair could be bought on
+  // both venues twice, so it is gone rather than merely disabled.
 
   // Close a harmless result by itself while auto-execute is on.
   //

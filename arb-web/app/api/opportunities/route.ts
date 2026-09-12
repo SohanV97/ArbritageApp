@@ -5,6 +5,12 @@ import { getKalshiMarketsForAllCategories, refreshKalshiPrices, getKalshiOrderbo
 import { warmPolymarketTrading } from '@/api/polymarket-trading';
 import { fillableContracts, kalshiAskLadder, polymarketAskLadder } from '@/lib/depth';
 import { estimateKalshiFeeCents, estimatePolymarketFeeCents } from '@/lib/fees';
+import { sizeByRisk } from '@/lib/sizing';
+import { executeArb } from '@/api/tradeExecutor';
+import {
+  getAutoExecConfig, addAutoExecRecord, tryClaimExecution, releaseExecution,
+  pairIsAvailable, releasePairAfter, holdPair,
+} from '@/lib/autoExec';
 import { loadDiscovery, saveDiscovery } from '@/lib/discoveryCache';
 import { matchMarkets, teamsAreDifferent } from '@/lib/matchMarkets';
 import { findArbitrageOpportunities, type PairWithKind } from '@/lib/arbitrage';
@@ -251,6 +257,64 @@ function applyDepth(opps: ArbitrageOpportunity[]): void {
     // contracts was published as an opportunity with no depth limit at all, right up until
     // the execute path measured the books and refused it.
     if (measured !== undefined) o.maxContracts = measured;
+  }
+}
+
+/**
+ * Trade an edge the moment the loop finds one, rather than waiting for a browser to notice.
+ *
+ * This is where the latency went. The browser had to poll (~150ms), post the opportunity
+ * back, and the server then re-read books it had just read (~160ms) — so an order landed
+ * 450-600ms after the prices that justified it, on edges measured to live under a second.
+ * Deciding here removes the poll and the round trip.
+ *
+ * Deliberately fire-and-forget: the caller is the refresh tick, and blocking it on an order
+ * would stall repricing for every other market while one trade completes.
+ */
+function maybeAutoExecute(opps: ArbitrageOpportunity[]): void {
+  const cfg = getAutoExecConfig();
+  if (!cfg.enabled || opps.length === 0) return;
+
+  for (const opp of opps) {
+    if (opp.edgePercent <= 0 || opp.edgePercent < cfg.thresholdPercent) break;   // sorted desc
+    if (cfg.scope === 'sports' && opp.pair.polymarket.category === 'politics') continue;
+    const key = `${opp.pair.polymarket.id}|${opp.pair.kalshi.id}`;
+    if (!pairIsAvailable(key)) continue;
+
+    const amount = sizeByRisk({
+      riskDollars: cfg.riskDollars,
+      legAPriceCents: opp.legA.priceCents,
+      legBPriceCents: opp.legB.priceCents,
+      maxContracts: opp.maxContracts,
+      minContracts: MIN_ORDER_CONTRACTS,
+    }).contracts;
+    if (amount <= 0) continue;
+
+    // Claim before any await: two ticks can overlap, and both must not trade at once.
+    if (!tryClaimExecution()) return;
+    holdPair(key, 30_000);   // provisional; replaced by the outcome-based hold below
+
+    const startedAt = Date.now();
+    void executeArb({ opportunity: opp, amount })
+      .then(({ body }) => {
+        releasePairAfter(key, body);
+        addAutoExecRecord({
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          ts: new Date().toISOString(),
+          question: opp.pair.polymarket.question,
+          edgePercent: opp.edgePercent,
+          amount,
+          result: body,
+        });
+        console.log('[autoexec] fired', JSON.stringify({
+          ticker: opp.pair.kalshi.symbol, amount, quoted: opp.edgePercent,
+          fresh: body.freshEdgePercent, hedged: body.hedged, sent: !body.noOrdersSent,
+          totalMs: Date.now() - startedAt,
+        }));
+      })
+      .catch(err => console.error('[autoexec] execution threw:', err))
+      .finally(() => releaseExecution());
+    return;   // one at a time
   }
 }
 
@@ -559,6 +623,9 @@ function assemble(disc: Discovery): OpportunitiesResponse {
   // pure CPU — it never waits on the venues.
   applyDepth(allOpportunities);
   void refreshDepth(allOpportunities);
+
+  // Act here, on the books this tick just read, instead of waiting for a browser to poll.
+  maybeAutoExecute(allOpportunities);
 
   // An edge you cannot legally place is not an opportunity. Polymarket rejects anything
   // under MIN_ORDER_CONTRACTS shares, so when the two books together can only fill fewer
