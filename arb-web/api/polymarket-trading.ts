@@ -34,6 +34,8 @@ export interface PolymarketOrderRequest {
   tokenId: string;    // YES or NO CLOB token ID
   count: number;      // shares = max payout in dollars
   priceCents: number; // limit price in cents (1–99)
+  /** 'sell' closes an existing position rather than opening one. */
+  action?: 'buy' | 'sell';
 }
 
 export interface PolymarketOrderResult {
@@ -362,7 +364,7 @@ export async function placePolymarketOrder(req: PolymarketOrderRequest): Promise
       assetId: req.tokenId,
       price: (req.priceCents / 100).toFixed(4),
       size: req.count,
-      side: OrderSide.BUY,
+      side: req.action === 'sell' ? OrderSide.SELL : OrderSide.BUY,
     });
 
     if (!result.ok) {

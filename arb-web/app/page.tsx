@@ -513,12 +513,14 @@ const OpportunityCard = memo(function OpportunityCard({ opp, amount, riskDollars
             <div className="flex gap-4 text-xs font-mono">
               <span style={{ color: (cardExec.result.kalshi.filledCount ?? (cardExec.result.kalshi.ok ? 1 : 0)) > 0 ? '#4ade80' : '#f87171' }}>
                 KAL {cardExec.result.kalshi.ok
-                  ? (cardExec.result.kalshi.filledCount != null ? `✓ filled ${cardExec.result.kalshi.filledCount}` : '✓ placed')
+                  ? (legFilled(cardExec.result.kalshi) ? `✓ filled ${cardExec.result.kalshi.filledCount}`
+                    : cardExec.result.kalshi.filledCount != null ? '✗ filled 0' : '✓ placed')
                   : `✗ ${cardExec.result.kalshi.error?.slice(0, 24) ?? 'error'}`}
               </span>
               <span style={{ color: (cardExec.result.polymarket.filledCount ?? (cardExec.result.polymarket.ok ? 1 : 0)) > 0 ? '#4ade80' : '#f87171' }}>
                 PM {cardExec.result.polymarket.ok
-                  ? (cardExec.result.polymarket.filledCount != null ? `✓ filled ${cardExec.result.polymarket.filledCount}` : '✓ placed')
+                  ? (legFilled(cardExec.result.polymarket) ? `✓ filled ${cardExec.result.polymarket.filledCount}`
+                    : cardExec.result.polymarket.filledCount != null ? '✗ filled 0' : '✓ placed')
                   : `✗ ${cardExec.result.polymarket.error?.slice(0, 24) ?? 'error'}`}
               </span>
             </div>
@@ -712,6 +714,18 @@ function ExecutionPendingScreen({ execPhase }: { execPhase: ExecutingPhase }) {
  * pre-order aborts, which send no orders at all — is informational, and holding the screen
  * open for it stops an unattended session dead.
  */
+/**
+ * Did this leg actually take a position?
+ *
+ * "Accepted" is not "filled". Kalshi accepted an IOC order for 101 contracts, returned an
+ * order id, filled zero and cancelled it — and the log rendered that green next to a
+ * Polymarket leg that really had filled, so a naked position looked like a completed hedge.
+ * An order id proves the venue took the request, nothing more.
+ */
+function legFilled(leg: { ok: boolean; filledCount?: number }): boolean {
+  return leg.ok && (leg.filledCount ?? 0) > 0;
+}
+
 function resultNeedsAttention(r: ExecuteResponse): boolean {
   if (r.noOrdersSent) return false;   // nothing was sent, so nothing is exposed
   return !r.hedged;
@@ -1740,7 +1754,11 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
                 </div>
                 <div className="flex gap-3 text-xs font-mono flex-shrink-0">
                   <span style={{ color: entry.result.kalshi.ok ? '#4ade80' : '#f87171' }}>
-                    KAL {entry.result.kalshi.ok ? `✓ ${entry.result.kalshi.orderId?.slice(0, 8)}` : `✗ ${entry.result.kalshi.error?.slice(0, 30)}`}
+                    KAL {entry.result.kalshi.ok
+                      ? (legFilled(entry.result.kalshi)
+                        ? `✓ filled ${entry.result.kalshi.filledCount}`
+                        : `✗ filled 0 (accepted, no position)`)
+                      : `✗ ${entry.result.kalshi.error?.slice(0, 30)}`}
                   </span>
                   <span style={{ color: entry.result.polymarket.ok ? '#4ade80' : '#f87171' }}>
                     PM {entry.result.polymarket.ok ? `✓ ${entry.result.polymarket.orderId?.slice(0, 8)}` : `✗ ${entry.result.polymarket.error?.slice(0, 30)}`}

@@ -5,9 +5,15 @@ const KALSHI_API_BASE = 'https://api.elections.kalshi.com/trade-api/v2';
 
 export interface KalshiOrderRequest {
   ticker: string;       // e.g. "KXWCGAME-26JUN25BELNZL-BEL"
-  side: 'yes' | 'no';  // which outcome to buy
+  side: 'yes' | 'no';  // which outcome the position is in
   count: number;        // contracts = max payout in dollars
   priceCents: number;   // limit price in cents (1–99)
+  /**
+   * 'sell' closes an existing position rather than opening one. Needed to unwind a leg that
+   * ends up alone: selling YES is the ask side, and selling NO is the bid side — the exact
+   * mirror of buying it.
+   */
+  action?: 'buy' | 'sell';
 }
 
 export interface KalshiOrderResult {
@@ -154,14 +160,18 @@ export async function placeKalshiOrder(req: KalshiOrderRequest): Promise<KalshiO
   const signed = signKalshiRequest('POST', path);
   if ('error' in signed) return { ok: false, error: signed.error };
 
+  const selling = req.action === 'sell';
   const buyingYes = req.side === 'yes';
-  // YES: bid at our price. NO at n cents: ask (sell YES) at (100 - n) cents.
+  // Everything is expressed on the YES book. Buying YES is a bid; buying NO is an ask at
+  // (100 - n). Selling reverses the book side while the price stays on the same scale, so
+  // closing a YES position is an ask and closing a NO position is a bid.
   const yesSidePriceCents = buyingYes ? req.priceCents : 100 - req.priceCents;
+  const bookSide = selling ? (buyingYes ? 'ask' : 'bid') : (buyingYes ? 'bid' : 'ask');
 
   const body: Record<string, unknown> = {
     ticker: req.ticker,
     client_order_id: crypto.randomUUID(),
-    side: buyingYes ? 'bid' : 'ask',
+    side: bookSide,
     count: String(req.count),
     price: (yesSidePriceCents / 100).toFixed(4),
     // Arb legs must never rest one-sided on the book: fill what's available at our

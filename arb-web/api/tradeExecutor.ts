@@ -311,13 +311,31 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
   // quote endpoint instead priced the Kalshi leg through its real ask on 13 of 24 live
   // markets, which rests unfilled — and an unfilled Kalshi leg beside a filled Polymarket
   // leg is precisely the naked position the rest of this route exists to prevent.
-  const freshPmPrice = priceForSize(pmLadder, plannedContracts);
-  const freshKalPrice = priceForSize(kalLadder, plannedContracts);
-  if (freshPmPrice === null || freshKalPrice === null) {
+  const pmAtBook = priceForSize(pmLadder, plannedContracts);
+  const kalAtBook = priceForSize(kalLadder, plannedContracts);
+  if (pmAtBook === null || kalAtBook === null) {
     return err(
       `Book thinned out between measuring depth and pricing the order (${revalidateMs}ms). Nothing was sent; try again.`,
       409);
   }
+
+  // Price THROUGH the book, not exactly at it.
+  //
+  // A limit set precisely at the ask fills only if nothing moves in the time the order takes
+  // to land. On a live market it does: a Kalshi leg was priced at 90c while the ask ticked to
+  // 97c, so the IOC crossed nothing, filled zero and cancelled — beside a Polymarket leg that
+  // had filled. That is a naked position caused by a single cent of tolerance.
+  //
+  // The buffer is nearly free, because a marketable limit fills at the RESTING price rather
+  // than at the limit. It costs something only when the book has actually moved, and in that
+  // case paying a cent or two beats holding one leg of a hedge. It is capped by the edge
+  // itself so a filled trade can never be a knowingly losing one.
+  const edgeCents = Math.max(0, freshEdgePercent);
+  const totalBuffer = Math.min(4, Math.floor(edgeCents));
+  const pmBuffer = Math.ceil(totalBuffer / 2);
+  const kalBuffer = Math.floor(totalBuffer / 2);
+  const freshPmPrice = Math.min(99, pmAtBook + pmBuffer);
+  const freshKalPrice = Math.min(99, kalAtBook + kalBuffer);
 
   // Both legs must be affordable BEFORE either is sent. The legs fire in parallel, so an
   // underfunded venue does not fail cleanly: its leg is rejected while the other one fills,
@@ -439,8 +457,8 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
       revalidateMs,
       quotedEdgePercent,
       freshEdgePercent,
-      hedgeNote: `Dry run: ${plannedContracts} contracts at ${freshKalPrice}¢ (Kalshi) + ` +
-        `${freshPmPrice}¢ (Polymarket), edge ${freshEdgePercent.toFixed(2)}%, confirmed in ` +
+      hedgeNote: `Dry run: ${plannedContracts} contracts at ${freshKalPrice}¢ (Kalshi, book ${kalAtBook}¢) + ` +
+        `${freshPmPrice}¢ (Polymarket, book ${pmAtBook}¢), edge ${freshEdgePercent.toFixed(2)}%, confirmed in ` +
         `${revalidateMs}ms via ${bookSource}. No orders were sent.`,
     };
     return { body: dry, status: 200 };
@@ -472,7 +490,53 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
   const pmResult: LegResult = { ...pmRaw, error: scrubSecrets(pmRaw.error) };
 
   const bothOk = kalshiResult.ok && pmResult.ok;
-  const { hedged, note } = assessHedge(kalshiResult, pmResult);
+  let { hedged, note } = assessHedge(kalshiResult, pmResult);
+
+  // ── unwind a leg that ended up alone ───────────────────────────────────────
+  //
+  // Accepting an order is not taking a position. Kalshi accepted an IOC for 101 contracts,
+  // returned an order id, filled zero and cancelled — while the Polymarket leg really did
+  // fill. That leaves a directional bet nobody chose, and telling the user about it is not
+  // the same as fixing it: they may not be at the screen, and the price moves meanwhile.
+  //
+  // So close it here. Selling back immediately costs the spread, which is a known small loss
+  // against an unbounded one.
+  const kFilled = kalshiResult.ok ? (kalshiResult.filledCount ?? 0) : 0;
+  const pFilled = pmResult.ok ? (pmResult.filledCount ?? 0) : 0;
+  if ((kFilled > 0) !== (pFilled > 0)) {
+    const venue = kFilled > 0 ? 'Kalshi' : 'Polymarket';
+    const qty = kFilled > 0 ? kFilled : pFilled;
+    // Price the exit off the resting BIDS, then cross them. A limit fills at the resting
+    // price rather than the limit, so going through the book buys certainty of closing
+    // rather than paying this number.
+    const exitLimit = (entryCents: number) => Math.max(1, Math.min(99, Math.round(entryCents) - 10));
+    let unwind: { ok: boolean; filledCount?: number; error?: string };
+    if (kFilled > 0) {
+      unwind = await placeKalshiOrder({
+        ticker: kalshiTicker, side: actualKalshiSide, count: qty,
+        priceCents: exitLimit(freshKalPrice), action: 'sell',
+      });
+    } else {
+      unwind = await placePolymarketOrder({
+        tokenId: pmTokenId, count: qty,
+        priceCents: exitLimit(freshPmPrice), action: 'sell',
+      });
+    }
+    const closed = unwind.ok ? (unwind.filledCount ?? 0) : 0;
+    invalidatePolymarketFunding();
+    if (closed >= qty) {
+      hedged = false;
+      note = `${venue} filled ${qty} alone and the position was CLOSED automatically ` +
+        `(sold ${closed} back). No exposure remains, minus the spread paid to exit.`;
+    } else {
+      note = `⚠ NAKED: ${venue} filled ${qty} and the other leg did not. Automatic close ` +
+        `${unwind.ok ? `only sold ${closed} of ${qty}` : `FAILED (${scrubSecrets(unwind.error) ?? 'error'})`}. ` +
+        `Close the remaining ${qty - closed} by hand on ${venue} now.`;
+    }
+    console.log('[execute] unwind', JSON.stringify({
+      venue, qty, closed, ok: unwind.ok, error: scrubSecrets(unwind.error),
+    }));
+  }
 
   const response: ExecuteResponse = {
     kalshi: kalshiResult,
