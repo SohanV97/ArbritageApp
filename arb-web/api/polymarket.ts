@@ -136,7 +136,13 @@ async function fetchSportsMetadata(): Promise<GammaSportMetadata[]> {
     const res = await gammaFetch(`${POLYMARKET_GAMMA_API}/sports`, { headers: polymarketHeaders() });
     if (res.ok) {
       const data = await res.json() as GammaSportMetadata[];
-      _cachedSportsData = { data: Array.isArray(data) ? data : [], ts: Date.now() };
+      const list = Array.isArray(data) ? data : [];
+      // An empty 200 is a degraded answer, not news. Every sport's series ids come from
+      // here, so caching [] would silently empty all four categories until the TTL ran out
+      // — the same way a cached tag-lookup failure emptied NFL.
+      if (list.length > 0 || !_cachedSportsData) {
+        _cachedSportsData = { data: list, ts: Date.now() };
+      }
       return _cachedSportsData.data;
     }
   } catch { /* ok */ }

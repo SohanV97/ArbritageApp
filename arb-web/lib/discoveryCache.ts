@@ -97,6 +97,11 @@ export function loadDiscovery(): {
     for (const m of raw.matchedKalshi) kalById.set(m.id, m);
 
     const pairsByCategory = new Map<Category, MatchedPair[]>();
+    // Seed every category the saved scan KNEW about, including ones that matched nothing.
+    // Pairs are stored as a flat list tagged by category, so rebuilding the map from them
+    // alone loses any category with zero pairs — and the assembled response iterates this
+    // map, so that category vanished from the UI after a restart instead of showing 0.
+    for (const cat of Object.keys(raw.counts ?? {}) as Category[]) pairsByCategory.set(cat, []);
     for (const ref of raw.pairs ?? []) {
       const pm = pmById.get(ref.pmId);
       const kal = kalById.get(ref.kalId);
@@ -105,7 +110,10 @@ export function loadDiscovery(): {
       list.push({ polymarket: pm, kalshi: kal } as MatchedPair);
       pairsByCategory.set(ref.category, list);
     }
-    if (pairsByCategory.size === 0) return null;
+    // Seeding above means size is no longer a proxy for "found anything", so count pairs.
+    let pairCount = 0;
+    for (const list of pairsByCategory.values()) pairCount += list.length;
+    if (pairCount === 0) return null;
 
     return {
       pairsByCategory,
