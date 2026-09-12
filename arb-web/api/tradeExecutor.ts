@@ -22,6 +22,7 @@ import {
 } from '@/lib/depth';
 import { getLiveKalshiBook, getLivePolymarketBook } from '@/lib/liveBooks';
 import { estimatePolymarketFeeCents, estimateKalshiFeeCents } from '@/lib/fees';
+import { pairLimits } from '@/lib/pricing';
 
 export interface LegResult {
   ok: boolean;
@@ -416,10 +417,29 @@ export async function executeArb(req: ExecuteRequest): Promise<ExecuteOutcome> {
   // The buffer is also only ever paid when the book has actually moved — a marketable limit
   // fills at the resting price — so in the ordinary case this costs nothing at all.
   const pmBuffer = Math.min(4, Math.floor(edgeCents) + 2);
-  const freshKalPrice = Math.min(99, kalAtBook + kalBuffer);
+  // Whatever the buffers ask for, the pair must still cost less than it pays.
+  //
+  // Nothing enforced that, and the buffers quietly consumed the whole edge. Live: a 1.05c
+  // edge took a 1c Kalshi buffer and a 3c Polymarket buffer and filled at 9c + 91c against a
+  // 100c payout. Both legs filled, the hedge was perfect, and it was still a guaranteed loss
+  // once fees were counted — the worst kind of bug, because every status reported success.
+  //
+  // The edge check above reads the TOP of each book; these prices are what it costs to fill
+  // the size actually being traded, which is never better. The rule lives in lib/pricing so
+  // it can be tested directly, which is where the invariants are pinned down.
+  const limits = pairLimits({ kalAtBook, pmAtBook, kalBuffer, pmBuffer, feePerContract });
+  if (!limits) {
+    return err(
+      `At ${plannedContracts} contracts this pair costs ${kalAtBook + pmAtBook}c plus fees against ` +
+      `a 100c payout, so there is no price that both fills and profits. The top of book showed ` +
+      `+${freshEdgePercent.toFixed(2)}%, but filling this size reaches deeper than that. ` +
+      `No orders were sent.`,
+      409);
+  }
+  const freshKalPrice = limits.kalLimit;
   // Applied when the Polymarket order is actually sent, below, so the funding check and the
   // recorded edge both reflect what will be paid.
-  const freshPmPrice = Math.min(99, pmAtBook + pmBuffer);
+  const freshPmPrice = limits.pmLimit;
 
   // Both legs must be affordable BEFORE either is sent. The legs fire in parallel, so an
   // underfunded venue does not fail cleanly: its leg is rejected while the other one fills,
