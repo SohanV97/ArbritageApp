@@ -81,33 +81,47 @@ const MIN_PROFIT_EDGE_PERCENT = 0;
 interface CacheEntry {
   body: OpportunitiesResponse;
   builtAt: number;
-  json: string;
-  gzip: Buffer;
-  /** Same payload without pairsDetail. That array is 93% of the bytes (269KB -> 19KB raw,
-   *  49KB -> 4KB gzipped) and only the Matched Pairs tab renders it, yet every client polls
-   *  three times a second. Serving it only when asked cuts the steady-state transfer from
-   *  ~141KB/s to ~12KB/s and, more importantly, the JSON.parse the browser does on each
-   *  poll from 269KB to 19KB. Both variants are built once per build, not per request. */
-  slimJson: string;
-  slimGzip: Buffer;
+  /** Filled the first time this build is actually requested, then reused. */
+  json?: string;
+  gzip?: Buffer;
+  /** Same payload without pairsDetail, which is 93% of the bytes and only one tab needs it. */
+  slimJson?: string;
+  slimGzip?: Buffer;
 }
 let _cache: CacheEntry | null = null;
 
+/**
+ * Serialize a build the first time it is asked for.
+ *
+ * This used to run at BUILD time, which was right when a build meant a full refresh. It is
+ * not right now: the in-play lane rebuilds every 150ms, so the payload — ~200KB of JSON,
+ * twice over, gzipped twice — was being produced about seven times a second whether or not
+ * anyone asked for it. A browser polls roughly once a second, so six of every seven were
+ * pure garbage, and the allocation and GC pressure showed up as multi-second event-loop
+ * stalls that made every price look stale.
+ *
+ * Doing it on demand costs the same work per REQUEST and nothing per build.
+ */
+function materialize(entry: CacheEntry, withPairs: boolean, gzipped: boolean): { json?: string; gzip?: Buffer } {
+  if (withPairs) {
+    entry.json ??= JSON.stringify(entry.body);
+    if (gzipped) entry.gzip ??= gzipSync(entry.json, { level: 6 });
+    return { json: entry.json, gzip: entry.gzip };
+  }
+  entry.slimJson ??= JSON.stringify({ ...entry.body, pairsDetail: [] });
+  if (gzipped) entry.slimGzip ??= gzipSync(entry.slimJson, { level: 6 });
+  return { json: entry.slimJson, gzip: entry.slimGzip };
+}
+
+
 function makeEntry(body: OpportunitiesResponse, builtAt: number): CacheEntry {
-  // builtAt travels IN the payload so the response is byte-identical for the whole
-  // build window; the client derives quote age from it. (A per-request "ageMs" field
-  // would force re-serialization on every hit and defeat the caching.)
+  // builtAt travels IN the payload so the response is byte-identical for the whole build
+  // window; the client derives quote age from it.
   const stamped: OpportunitiesResponse = {
     ...body,
     stats: { ...body.stats, builtAt: new Date(builtAt).toISOString() },
   };
-  const json = JSON.stringify(stamped);
-  // pairsDetail omitted, but stats.matchedPairs still carries the count the tab label needs.
-  const slimJson = JSON.stringify({ ...stamped, pairsDetail: [] });
-  return {
-    body: stamped, builtAt, json, gzip: gzipSync(json, { level: 6 }),
-    slimJson, slimGzip: gzipSync(slimJson, { level: 6 }),
-  };
+  return { body: stamped, builtAt };
 }
 let _rebuilding = false;
 // Last discovery result, reused by the cheap reprice path.
@@ -144,6 +158,31 @@ function reprice(): Promise<OpportunitiesResponse> {
   return _repriceInFlight;
 }
 
+/**
+ * Markets the pushed feed does NOT already cover.
+ *
+ * Polling was running over every market regardless of whether a live book existed for it,
+ * so the websocket and the poller fetched the same 135 in-play markets, and the poller did
+ * it every 150ms. Both venues throttled: a single in-play refresh measured 5-10s on Kalshi
+ * and 9-15s on Polymarket, against a 150ms budget, with 0ms spent on CPU. The refresh was
+ * not slow because there was too much to compute — it was slow because it was asking for
+ * data it already had, often enough to get rate limited.
+ *
+ * The poll is the FALLBACK. Anything with a healthy live book is skipped, so the work
+ * shrinks as feed coverage grows instead of duplicating it.
+ */
+function withoutLiveBooks<T extends { symbol?: string }>(markets: T[], venue: 'kalshi'): T[];
+function withoutLiveBooks<T extends { yesTokenId?: string }>(markets: T[], venue: 'polymarket'): T[];
+function withoutLiveBooks(
+  markets: ({ symbol?: string } & { yesTokenId?: string })[],
+  venue: 'kalshi' | 'polymarket',
+): unknown[] {
+  return markets.filter(m => {
+    if (venue === 'kalshi') return !m.symbol || !getLiveKalshiBook(m.symbol);
+    return !m.yesTokenId || !getLivePolymarketBook(m.yesTokenId);
+  });
+}
+
 // A game that is being played right now. Its synthetic resolutionTime is
 // "<gameDate>T23:59:00Z", so "today or yesterday (UTC)" covers a game in progress and one
 // that started late and ran past midnight, without dragging in tomorrow's fixtures.
@@ -166,21 +205,38 @@ function repriceInPlay(): Promise<void> {
   if (_fastInFlight) return _fastInFlight;
   const disc = _discovery;
   if (!disc) return Promise.resolve();
-  const pm = disc.matchedPm.filter(isInPlay);
-  const kal = disc.matchedKalshi.filter(isInPlay);
+  // The feeds are pointed at every in-play market, whether or not it is polled below.
+  const pmInPlay = disc.matchedPm.filter(isInPlay);
+  const kalInPlay = disc.matchedKalshi.filter(isInPlay);
 
   // Keep the live feeds pointed at exactly these markets. Polling still runs underneath as
   // the fallback, so a dropped socket costs speed rather than correctness.
   syncLiveFeeds(
-    kal.map(m => m.symbol ?? '').filter(Boolean),
-    pm.map(m => m.yesTokenId ?? '').filter(Boolean),
+    kalInPlay.map(m => m.symbol ?? '').filter(Boolean),
+    pmInPlay.map(m => m.yesTokenId ?? '').filter(Boolean),
   );
-  if (pm.length === 0 && kal.length === 0) return Promise.resolve();
+
+  if (pmInPlay.length === 0 && kalInPlay.length === 0) return Promise.resolve();
+
+  // ...but only the ones it does not already cover are fetched.
+  //
+  // Note what this must NOT do: skip the tick when there is nothing to fetch. Re-pricing
+  // from the live books happens inside assemble(), so a tick with full feed coverage is
+  // exactly the tick that has the freshest data — returning early there would freeze every
+  // in-play price until the slow full refresh came round.
+  const pm = withoutLiveBooks(pmInPlay, 'polymarket');
+  const kal = withoutLiveBooks(kalInPlay, 'kalshi');
+  const _t0 = Date.now();
+  let _tKal = 0, _tPm = 0;
   _fastInFlight = Promise.all([
-    refreshKalshiPrices(kal),
-    refreshPolymarketPrices(pm),
+    kal.length > 0 ? refreshKalshiPrices(kal).then(r => { _tKal = Date.now() - _t0; return r; }) : Promise.resolve(0),
+    pm.length > 0 ? refreshPolymarketPrices(pm).then(r => { _tPm = Date.now() - _t0; return r; }) : Promise.resolve(0),
   ])
     .then(() => {
+      const total = Date.now() - _t0;
+      if (total > SLOW_PHASE_MS) {
+        console.warn(`[timing] repriceInPlay parts: kalshi ${_tKal}ms, polymarket ${_tPm}ms, assemble ${total - Math.max(_tKal, _tPm)}ms, markets k=${kal.length} p=${pm.length}`);
+      }
       // Rebuild from the mutated market objects so the cache reflects the new prices.
       _cache = makeEntry(assemble(disc), Date.now());
     })
@@ -365,8 +421,14 @@ function maybeAutoExecute(opps: ArbitrageOpportunity[]): void {
 // small batch per venue (Kalshi's full 319-ticker batch already measures 24ms, and
 // Polymarket's book call is ~120ms of pure network RTT regardless of size).
 const FAST_REPRICE_MS = 150;
-// Full set. Pre-game prices drift slowly, so they do not need the fast lane.
-const REPRICE_MS = 700;
+// Full set. This refreshes every matched market on both venues — roughly 800 of them — and
+// at 700ms it was asking each venue for all of them more than once a second. Both throttled:
+// a single pass measured 5-10s on Kalshi and 9-15s on Polymarket, so the "fast" lane was
+// running ten times slower than its own budget and the whole cache stalled behind it.
+//
+// Nothing needs that rate here. In-play markets are priced from the websocket books on every
+// 150ms tick; this lane exists for pre-game prices, which drift over minutes.
+const REPRICE_MS = 5_000;
 const REDISCOVER_MS = 90_000;
 
 // Dev HMR re-evaluates this module, so a module-local flag would let each reload start
@@ -382,6 +444,25 @@ const REDISCOVER_MS = 90_000;
 const LOOP_FLAG = Symbol.for('arb.opportunities.refreshLoop');
 type LoopTimer = ReturnType<typeof setInterval>;
 type LoopHost = { [LOOP_FLAG]?: LoopTimer };
+
+// A refresh phase this slow is a fault, not a slow network: the in-play lane budgets 150ms
+// and the full lane 5s. Logged so a stall is attributable instead of guessed at.
+const SLOW_PHASE_MS = 3_000;
+
+// Slowest observed duration of each phase of the refresh loop.
+const _phaseMs: Record<string, { last: number; max: number; n: number; overSec: number }> = {};
+export function phaseStats() { return _phaseMs; }
+async function timed<T>(name: string, fn: () => Promise<T>): Promise<T> {
+  const t0 = Date.now();
+  try { return await fn(); }
+  finally {
+    const ms = Date.now() - t0;
+    const e = _phaseMs[name] ??= { last: 0, max: 0, n: 0, overSec: 0 };
+    e.last = ms; e.n++;
+    if (ms > e.max) e.max = ms;
+    if (ms > SLOW_PHASE_MS) { e.overSec++; console.warn(`[timing] ${name} took ${ms}ms`); }
+  }
+}
 
 function startRefreshLoop() {
   const host = globalThis as unknown as LoopHost;
@@ -401,14 +482,14 @@ function startRefreshLoop() {
         // refuses it — which is exactly the abort this work is meant to prevent.
         // rebuild() is single-flighted, so this cannot stack up, and repricing below keeps
         // using the existing discovery until the new one swaps in.
-        void rebuild().catch(err => console.error('[opportunities] rediscovery failed:', err));
+        void timed('rediscover', () => rebuild()).catch(err => console.error('[opportunities] rediscovery failed:', err));
       }
       // Every tick refreshes the games in progress; the full set on the slower cadence.
       if (Date.now() - lastFull >= REPRICE_MS) {
-        await reprice();
+        await timed('reprice', () => reprice());
         lastFull = Date.now();
       } else {
-        await repriceInPlay();
+        await timed('repriceInPlay', () => repriceInPlay());
       }
     } catch (err) {
       console.error('[opportunities] refresh tick failed:', err);
@@ -468,10 +549,12 @@ interface Discovery {
 }
 
 async function discover(): Promise<Discovery> {
+  const _t0 = Date.now();
   const [pmByCategory, kalshiByCategory] = await Promise.all([
     getPolymarketMarketsForAllCategories(),
     getKalshiMarketsForAllCategories(),
   ]);
+  const _tFetch = Date.now();
 
   const pairsByCategory = new Map<Category, MatchedPair[]>();
   const counts: Discovery['counts'] = {};
@@ -511,6 +594,11 @@ async function discover(): Promise<Discovery> {
       if (!seenPm.has(p.polymarket.id)) { seenPm.add(p.polymarket.id); matchedPm.push(p.polymarket as PolymarketMarketWithKind); }
       if (!seenKal.has(p.kalshi.id)) { seenKal.add(p.kalshi.id); matchedKalshi.push(p.kalshi); }
     }
+  }
+
+  const _dFetch = _tFetch - _t0, _dMatch = Date.now() - _tFetch;
+  if (_dFetch + _dMatch > SLOW_PHASE_MS) {
+    console.warn(`[timing] discover: fetch ${_dFetch}ms, match ${_dMatch}ms`);
   }
 
   return {
@@ -745,9 +833,10 @@ function assemble(disc: Discovery): OpportunitiesResponse {
 // Re-quote only the matched markets, then recompute. ~200 ms versus ~1.2 s for a full
 // rediscovery, which is what makes second-by-second freshness affordable.
 async function repriceAndAssemble(disc: Discovery): Promise<OpportunitiesResponse> {
+  // Same rule as the fast tick: a market with a live book is already current.
   await Promise.all([
-    refreshKalshiPrices(disc.matchedKalshi),
-    refreshPolymarketPrices(disc.matchedPm),
+    refreshKalshiPrices(withoutLiveBooks(disc.matchedKalshi, 'kalshi')),
+    refreshPolymarketPrices(withoutLiveBooks(disc.matchedPm, 'polymarket')),
   ]);
   return assemble(disc);
 }
@@ -840,9 +929,8 @@ const cacheHeaders = { 'Cache-Control': 'no-store, max-age=0' };
 // otherwise the cached string. Either way there is no per-request JSON or compression
 // work — the response is a buffer that was produced once when prices last refreshed.
 function send(entry: CacheEntry, acceptsGzip: boolean, withPairs = true): Response {
-  const gzip = withPairs ? entry.gzip : entry.slimGzip;
-  const json = withPairs ? entry.json : entry.slimJson;
-  if (acceptsGzip) {
+  const { json, gzip } = materialize(entry, withPairs, acceptsGzip);
+  if (acceptsGzip && gzip) {
     return new Response(new Uint8Array(gzip), {
       headers: { ...cacheHeaders, 'Content-Type': 'application/json', 'Content-Encoding': 'gzip', 'Vary': 'Accept-Encoding' },
     });

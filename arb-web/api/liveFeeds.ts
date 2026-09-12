@@ -17,6 +17,7 @@ import {
 } from '@/lib/liveBooks';
 
 const KALSHI_WS = 'wss://api.elections.kalshi.com/trade-api/ws/v2';
+
 const KALSHI_WS_PATH = '/trade-api/ws/v2';
 
 function kalshiPem(): string | undefined {
