@@ -44,9 +44,11 @@ export function pairLimits(args: PairLimitArgs): PairLimits | null {
   const maxTotal = 100 - feePerContract(pmLimit, kalLimit);
 
   if (kalLimit + pmLimit > maxTotal) {
-    // Trim Polymarket first: its buffer buys certainty on the second leg, whereas Kalshi's
-    // is capped by the edge already. Neither may be trimmed below its own book price — that
-    // would be a limit that cannot fill.
+    // Trim Polymarket first. It is the leg that goes out FIRST, so missing it costs nothing:
+    // no Kalshi order follows and there is no position to unwind. Kalshi's buffer is the one
+    // buying certainty on a leg that would otherwise leave a naked Polymarket position, so it
+    // is given up last. Neither may be trimmed below its own book price — that would be a
+    // limit that cannot fill.
     pmLimit = Math.floor(maxTotal - kalLimit);
     if (pmLimit < pmAtBook) {
       pmLimit = pmAtBook;

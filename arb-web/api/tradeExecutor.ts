@@ -467,28 +467,34 @@ async function executeArbInner(req: ExecuteRequest, rec: TradeAttempt): Promise<
   // itself so a filled trade can never be a knowingly losing one.
   const edgeCents = Math.max(0, freshEdgePercent);
 
-  // The two legs get different buffers because missing them costs different amounts.
+  // The two legs get different buffers because missing them costs different amounts — and
+  // which leg is which changed when Polymarket moved to going first.
   //
-  // KALSHI goes first, and missing it is free: no Polymarket order follows, nothing is
-  // bought, nothing is unwound. So its buffer stays capped by the edge — there is no reason
-  // to pay for certainty when the downside is simply not trading.
-  const kalBuffer = Math.min(3, Math.floor(edgeCents));
+  // POLYMARKET goes first now, and missing it is free: no Kalshi order follows, nothing is
+  // bought, nothing is unwound. So its buffer is capped by the edge. There is no reason to
+  // pay for certainty when the downside is simply not trading.
+  const pmBuffer = Math.min(3, Math.floor(edgeCents));
 
-  // POLYMARKET goes second, once Kalshi has already filled. At that point the position
-  // exists, and a miss does not mean "no trade" — it means selling the Kalshi leg back and
-  // eating the spread both ways, which is what has been costing a couple of dollars a go.
+  // KALSHI goes second, once Polymarket has already filled. At that point the position
+  // exists, and a miss does not mean "no trade" — it means selling the Polymarket leg back
+  // and eating the spread both ways. So this leg is priced to FILL rather than to protect
+  // the edge, up to the point where filling is still better than not: paying x cents through
+  // the book is worth it while x is under the edge plus what an unwind costs (about 2c of
+  // cross plus the spread). Beyond that a fill is a guaranteed loss LARGER than the unwind
+  // it was meant to avoid.
   //
-  // So this leg is priced to FILL rather than to protect the edge — but only up to the point
-  // where filling is still better than not.
+  // These two were the other way round until now, left over from when Kalshi legged first.
+  // That had it exactly backwards: the leg that could be missed for free was paying up to 4c
+  // for certainty it did not need, while the leg that could leave a naked position was the
+  // one being careful with the edge.
   //
-  // Paying x cents through the book is worth it while x is under the edge plus what an
-  // unwind costs (about 2c of cross plus the spread). Beyond that, a fill is a guaranteed
-  // loss LARGER than the unwind it was meant to avoid, which is the wrong way round: a 5c
-  // buffer on a 1.25c edge prices the pair at 103c, losing 3c to avoid losing 2c.
-  //
-  // The buffer is also only ever paid when the book has actually moved — a marketable limit
-  // fills at the resting price — so in the ordinary case this costs nothing at all.
-  const pmBuffer = Math.min(4, Math.floor(edgeCents) + 2);
+  // Note what the buffer actually costs. It is rarely PAID — a marketable limit fills at the
+  // resting price, and on the Alabama/Kentucky trade both legs filled at or better than book,
+  // returning all of it and turning a planned 0.45c per contract into a realised 2.45c. What
+  // it costs is qualification: a pair only clears the profitability guard if its gross edge
+  // exceeds both buffers plus fees, so every cent here raises the bar for every pair.
+  // npm run trades:report measures budgeted against paid, which is how to tune this.
+  const kalBuffer = Math.min(4, Math.floor(edgeCents) + 2);
   // Whatever the buffers ask for, the pair must still cost less than it pays.
   //
   // Nothing enforced that, and the buffers quietly consumed the whole edge. Live: a 1.05c

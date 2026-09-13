@@ -172,3 +172,58 @@ if (mismatches.length) {
 }
 
 console.log('');
+
+// ── the buffer: planned to be paid, usually returned ──
+//
+// Each leg is priced a little through the book so it still fills if the book moves. That
+// buffer is the dominant cost of qualifying: a pair only clears the profitability guard if
+// its gross edge exceeds both buffers plus fees, so a 4c of buffer means nothing under a
+// ~5.5c edge is ever tradeable. But a marketable limit fills at the RESTING price, so the
+// buffer is usually not actually paid. Measured live on the Alabama/Kentucky win: the Kalshi
+// leg was limited at 68c and filled at 66.9c, returning the whole buffer and turning a
+// planned $0.44 into a realised $1.59.
+//
+// If it comes back most of the time, the buffer is too big, and shrinking it widens the set
+// of tradeable pairs far more than it costs.
+const withFills = rows.filter(a => a.plan && a.legs.some(l => Number.isFinite(l.avgPriceCents) && l.reportedFill > 0));
+if (withFills.length) {
+  console.log('\nBUFFER: PLANNED vs PAID  (' + withFills.length + ' filled attempts)');
+  const paid = [];
+  for (const a of withFills) {
+    for (const l of a.legs) {
+      if (!Number.isFinite(l.avgPriceCents) || l.reportedFill <= 0) continue;
+      const atBook = l.venue === 'kalshi' ? a.plan.kalAtBookCents : a.plan.pmAtBookCents;
+      if (!Number.isFinite(atBook)) continue;
+      const budget = l.limitCents - atBook;        // cents of buffer we were willing to pay
+      const actual = l.avgPriceCents - atBook;     // cents we actually paid through the book
+      paid.push({ venue: l.venue, budget, actual, returned: budget - actual });
+    }
+  }
+  for (const venue of ['polymarket', 'kalshi']) {
+    const v = paid.filter(p => p.venue === venue);
+    if (!v.length) continue;
+    const avgBudget = v.reduce((s, p) => s + p.budget, 0) / v.length;
+    const avgActual = v.reduce((s, p) => s + p.actual, 0) / v.length;
+    const neverPaid = v.filter(p => p.actual <= 0).length;
+    console.log('  ' + venue.padEnd(12) + 'budgeted ' + avgBudget.toFixed(2) + 'c, paid ' +
+      avgActual.toFixed(2) + 'c  |  filled at or better than book ' + neverPaid + '/' + v.length);
+  }
+  console.log('  A buffer that is budgeted and not paid is edge given away at selection time,');
+  console.log('  not at execution: every cent of it raises the edge a pair needs to qualify.');
+
+  // Planned versus realised, per attempt.
+  console.log('\nPLANNED vs REALISED  (per contract, net of fees)');
+  for (const a of withFills.slice(-8)) {
+    const k = a.legs.find(l => l.venue === 'kalshi');
+    const p = a.legs.find(l => l.venue === 'polymarket');
+    if (!k || !p) continue;
+    const plannedNet = 100 - a.plan.kalLimitCents - a.plan.pmLimitCents - (100 - a.plan.kalLimitCents - a.plan.pmLimitCents - a.plan.netEdgeCents);
+    const realKal = Number.isFinite(k.avgPriceCents) ? k.avgPriceCents : k.limitCents;
+    const realPm = Number.isFinite(p.avgPriceCents) ? p.avgPriceCents : p.limitCents;
+    const feeCents = a.plan.kalLimitCents + a.plan.pmLimitCents + a.plan.netEdgeCents - 100;
+    const realisedNet = 100 - realKal - realPm + feeCents;
+    console.log('  ' + a.ts.slice(11, 19) + ' ' + a.market.kalshiTicker.slice(-20).padEnd(22) +
+      'planned ' + a.plan.netEdgeCents.toFixed(2) + 'c  realised ' + realisedNet.toFixed(2) + 'c' +
+      '  (' + k.reportedFill + ' contracts)');
+  }
+}
