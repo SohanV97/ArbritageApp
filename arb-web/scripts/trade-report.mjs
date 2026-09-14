@@ -227,3 +227,28 @@ if (withFills.length) {
       '  (' + k.reportedFill + ' contracts)');
   }
 }
+
+// ── which leg moved between the list and the order path ──
+//
+// An edge that vanishes is either the market moving or the two pricing paths disagreeing,
+// and the totals alone cannot tell them apart. The same pair aborting twice with IDENTICAL
+// quoted and fresh numbers minutes apart is a disagreement, not movement.
+const legMoves = rows.filter(a => a.edge &&
+  Number.isFinite(a.edge.quotedKalCents) && Number.isFinite(a.edge.freshKalCents) &&
+  Number.isFinite(a.edge.quotedPmCents) && Number.isFinite(a.edge.freshPmCents));
+if (legMoves.length) {
+  console.log('\nWHICH LEG MOVED  (quoted price -> price at order time)');
+  const kalD = legMoves.map(a => a.edge.freshKalCents - a.edge.quotedKalCents);
+  const pmD = legMoves.map(a => a.edge.freshPmCents - a.edge.quotedPmCents);
+  const avg = arr => arr.reduce((s, n) => s + n, 0) / arr.length;
+  console.log('  kalshi      p50 ' + fmt(pct(kalD, 0.5), 'c') + '  mean ' + avg(kalD).toFixed(2) + 'c  worst ' + fmt(pct(kalD, 1), 'c'));
+  console.log('  polymarket  p50 ' + fmt(pct(pmD, 0.5), 'c') + '  mean ' + avg(pmD).toFixed(2) + 'c  worst ' + fmt(pct(pmD, 1), 'c'));
+  const biasedK = kalD.filter(d => d > 0).length, biasedP = pmD.filter(d => d > 0).length;
+  console.log('  priced worse at order time: kalshi ' + biasedK + '/' + kalD.length + ', polymarket ' + biasedP + '/' + pmD.length);
+  console.log('  A leg that is consistently worse one way is a pricing disagreement, not movement.');
+  for (const a of legMoves.slice(-5)) {
+    console.log('  ' + a.ts.slice(11, 19) + ' ' + a.market.kalshiTicker.slice(-18).padEnd(20) +
+      'kal ' + a.edge.quotedKalCents + '->' + a.edge.freshKalCents + 'c (depth ' + (a.edge.kalTopDepth ?? '-') + ')  ' +
+      'pm ' + a.edge.quotedPmCents + '->' + a.edge.freshPmCents + 'c (depth ' + (a.edge.pmTopDepth ?? '-') + ')');
+  }
+}

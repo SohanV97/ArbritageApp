@@ -388,6 +388,14 @@ async function executeArbInner(req: ExecuteRequest, rec: TradeAttempt): Promise<
   // Best case available anywhere in either book: the top of both ladders. This separates
   // "the edge is gone" from "the edge exists but is shallow" — without it, a vanished edge
   // reported as zero fillable contracts, which reads as a liquidity problem and is not.
+  // Recorded before any abort can return, so a refused attempt still says which leg moved.
+  rec.edge.quotedKalCents = kalLeg.priceCents;
+  rec.edge.quotedPmCents = pmLeg.priceCents;
+  rec.edge.freshKalCents = kalLadder[0].priceCents;
+  rec.edge.freshPmCents = pmLadder[0].priceCents;
+  rec.edge.kalTopDepth = kalLadder[0].size;
+  rec.edge.pmTopDepth = pmLadder[0].size;
+
   const topCost = pmLadder[0].priceCents + kalLadder[0].priceCents
                 + feePerContract(pmLadder[0].priceCents, kalLadder[0].priceCents);
   const freshEdgePercent = 100 - topCost;

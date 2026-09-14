@@ -94,6 +94,23 @@ export interface TradeAttempt {
     revalidateMs?: number;
     /** "live/live", "live/fetch", ... — which side came from the websocket. */
     bookSource?: string;
+    /**
+     * The per-leg prices behind quotedPercent and freshPercent.
+     *
+     * Recorded even when the attempt is refused for a vanished edge, which is the case that
+     * needs them most: an aborted attempt used to record the two totals and nothing else, so
+     * "the edge went from +1.04% to -4.88%" could not be attributed to a leg without going
+     * back to the venues by hand. The same pair aborting twice five minutes apart with
+     * identical numbers is a disagreement between how the list prices and how the order path
+     * prices, not a market that moved, and only the per-leg figures show which.
+     */
+    quotedKalCents?: number;
+    quotedPmCents?: number;
+    freshKalCents?: number;
+    freshPmCents?: number;
+    /** Size behind the quoted depth, and what the ladder said was there. */
+    kalTopDepth?: number;
+    pmTopDepth?: number;
   };
 
   /** The prices the decision was made from, so a bad fill can be traced to a bad book. */
