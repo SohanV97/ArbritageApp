@@ -168,6 +168,32 @@ export async function getKalshiBook(ticker: string): Promise<
   }
 }
 
+/**
+ * How much of one order actually filled, asked of Kalshi rather than remembered.
+ *
+ * The mirror of the Polymarket check, and needed for the same reason: an order response is
+ * what a venue believed at that instant, and unwinding a hedge on a wrong zero is the
+ * expensive mistake. Polymarket now legs first, so the leg that can strand a position by
+ * reporting a miss it did not have is this one.
+ */
+export async function getKalshiOrderFill(orderId: string): Promise<number | null> {
+  const path = `/trade-api/v2/portfolio/orders/${encodeURIComponent(orderId)}`;
+  const signed = signKalshiRequest('GET', path);
+  if ('error' in signed) return null;
+  try {
+    const res = await fetch(`${KALSHI_API_BASE}/portfolio/orders/${encodeURIComponent(orderId)}`, { headers: signed.headers });
+    if (!res.ok) return null;
+    const data = await res.json() as { order?: { fill_count_fp?: string; fill_count?: number } };
+    const o = data?.order;
+    if (!o) return null;
+    const n = o.fill_count_fp != null ? Number(o.fill_count_fp) : Number(o.fill_count);
+    return Number.isFinite(n) ? n : null;
+  } catch {
+    // Unknown is NOT zero. Returning 0 here would be the very error this guards against.
+    return null;
+  }
+}
+
 export interface KalshiPosition {
   ticker: string;
   /** Signed contract count on the YES side. Negative is short. */

@@ -9,14 +9,15 @@
     "check:links": "node scripts/check-links.mjs",
     "check:markets": "node --experimental-strip-types --no-warnings scripts/check-markets.mjs",
     "test:matching": "node --experimental-strip-types --no-warnings scripts/test-matching.mjs",
-    "check": "npm run test:matching && npm run check:markets && npm run check:links",
+    "check": "npm run test:matching && npm run test:pricing && npm run check:markets && npm run check:links",
     "check:wallet": "node scripts/check-wallet.mjs",
     "setup:approvals": "node --experimental-strip-types --no-warnings scripts/setup-approvals.mjs",
     "test:pm-order": "node --experimental-strip-types --no-warnings scripts/test-polymarket-order.mjs",
     "kalshi:allocate": "node --experimental-strip-types --no-warnings scripts/kalshi-allocate.mjs",
     "kalshi:close": "node --experimental-strip-types --no-warnings scripts/kalshi-close.mjs",
     "trades:report": "node --experimental-strip-types --no-warnings scripts/trade-report.mjs",
-    "trades:reconcile": "node --experimental-strip-types --no-warnings scripts/trade-reconcile.mjs"
+    "trades:reconcile": "node --experimental-strip-types --no-warnings scripts/trade-reconcile.mjs",
+    "test:pricing": "node --experimental-strip-types --no-warnings scripts/test-pricing.mjs"
   },
   "dependencies": {
     "@polymarket/client": "^0.10.0",

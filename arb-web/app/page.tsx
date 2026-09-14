@@ -240,7 +240,8 @@ const OpportunityCard = memo(function OpportunityCard({ opp, amount, riskDollars
   });
   const exceedsDepth = opp.maxContracts != null && amount > opp.maxContracts;
   // Polymarket rejects orders under 5 shares; Kalshi accepts 1. Placing a smaller pair
-  // would fill only the Kalshi leg, so the trade must be blocked entirely.
+  // is refused outright by Polymarket, which is the leg that goes out first, so the trade
+  // cannot happen at all and must be blocked here.
   const belowMinimum = Math.round(amount) < MIN_ORDER_CONTRACTS;
 
   const pmDate = fmtDate(pair.polymarket.resolutionTime);
@@ -465,7 +466,7 @@ const OpportunityCard = memo(function OpportunityCard({ opp, amount, riskDollars
               Amount below Polymarket&apos;s {MIN_ORDER_CONTRACTS}-share minimum
             </p>
             <p className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
-              Raise Amount to at least ${MIN_ORDER_CONTRACTS} — a smaller order fills only the Kalshi leg and leaves it unhedged
+              Raise Amount to at least ${MIN_ORDER_CONTRACTS} — Polymarket refuses anything smaller, and it is the first leg
             </p>
           </div>
         ) : isProfitable ? (

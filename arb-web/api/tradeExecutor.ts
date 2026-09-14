@@ -12,7 +12,9 @@
  */
 import type { ArbitrageOpportunity } from '@/lib/market-types';
 import { MIN_ORDER_CONTRACTS } from '@/lib/market-types';
-import { placeKalshiOrder, testKalshiAuth, transferBetweenKalshiShards } from '@/api/kalshi-trading';
+import {
+  placeKalshiOrder, testKalshiAuth, transferBetweenKalshiShards, getKalshiOrderFill,
+} from '@/api/kalshi-trading';
 import {
   placePolymarketOrder, polymarketFundingDollars, invalidatePolymarketFunding,
   polymarketOrderFill,
@@ -308,7 +310,8 @@ async function executeArbInner(req: ExecuteRequest, rec: TradeAttempt): Promise<
   // Reject BEFORE placing either leg: Polymarket rejects under 5 shares while Kalshi
   // accepts 1, so a smaller order fills only the Kalshi side and leaves it unhedged.
   if (contracts < MIN_ORDER_CONTRACTS) {
-    return err(`Order size ${contracts} is below Polymarket's ${MIN_ORDER_CONTRACTS}-share minimum. A smaller order would fill only the Kalshi leg and leave it unhedged.`);
+    return err(`Order size ${contracts} is below Polymarket's ${MIN_ORDER_CONTRACTS}-share minimum, and Polymarket ` +
+      `is the leg that goes out first. It would be refused, so no trade could happen at this size.`);
   }
 
   // ── pre-order re-check, priced off the books ───────────────────────────────
@@ -663,7 +666,7 @@ async function executeArbInner(req: ExecuteRequest, rec: TradeAttempt): Promise<
     return { body: dry, status: 200 };
   }
 
-  // ── Kalshi first, then Polymarket for exactly what Kalshi filled ───────────
+  // ── Polymarket first, then Kalshi for exactly what Polymarket filled ───────
   //
   // Leg the venue that MIGHT NOT FILL first, and it is no longer the one it used to be.
   //
@@ -760,7 +763,7 @@ async function executeArbInner(req: ExecuteRequest, rec: TradeAttempt): Promise<
   //
   // So close it here. Selling back immediately costs the spread, which is a known small loss
   // against an unbounded one.
-  const kFilled = kalshiResult.ok ? (kalshiResult.filledCount ?? 0) : 0;
+  let kFilled = kalshiResult.ok ? (kalshiResult.filledCount ?? 0) : 0;
   let pFilled = pmResult.ok ? (pmResult.filledCount ?? 0) : 0;
 
   // Ask Polymarket once more before concluding its leg missed.
@@ -771,6 +774,24 @@ async function executeArbInner(req: ExecuteRequest, rec: TradeAttempt): Promise<
   // in the account. Had the unwind below worked, it would have sold a Kalshi leg that was
   // properly hedged and turned a flat trade into a real loss. The read costs one round trip;
   // being wrong about it costs the position.
+  // The same question asked of Kalshi, which is now the leg that can strand a position by
+  // reporting a miss it did not have. Polymarket goes first, so a wrong zero here unwinds a
+  // Polymarket leg that was in fact hedged — the mirror of the Wake Forest mistake, and
+  // just as expensive.
+  if (pFilled > 0 && kFilled <= 0 && kalshiResult.orderId) {
+    const confirmed = await getKalshiOrderFill(kalshiResult.orderId);
+    if (confirmed !== null && confirmed > kFilled) {
+      console.log('[execute] kalshi filled after reporting zero', JSON.stringify({
+        orderId: kalshiResult.orderId, reported: kFilled, actual: confirmed,
+      }));
+      kFilled = confirmed;
+      kalshiResult.filledCount = confirmed;
+      const recheck = assessHedge(kalshiResult, pmResult);
+      hedged = recheck.hedged;
+      note = recheck.note;
+    }
+  }
+
   if (kFilled > 0 && pFilled <= 0 && pmResult.orderId) {
     const confirmed = await polymarketOrderFill(pmResult.orderId);
     if (confirmed !== null && confirmed > pFilled) {

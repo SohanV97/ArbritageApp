@@ -32,6 +32,22 @@ export interface PairLimits {
  * The invariant is the whole point: kalLimit + pmLimit + fees < 100, because 100c is what
  * the winning side pays. A buffer may never push the pair past what it is worth.
  */
+/**
+ * Most of an edge may not be spent on certainty.
+ *
+ * The buffers grow with the edge, so a bigger edge authorised a bigger giveaway, and the
+ * cap only stopped the pair costing more than it paid. The result was that every edge came
+ * out worth about the same: priced through the book, a 6c edge and a 0.5c edge both landed
+ * near 1c of guaranteed profit. Capturing a sixth of a good edge is not a safety property,
+ * it is the good edges paying for the marginal ones.
+ *
+ * At least half of the gross edge is now kept, whatever the buffers ask for — so a thin
+ * edge still trades on a thin buffer, and a fat one is actually worth finding.
+ */
+const MAX_GIVEAWAY_FRACTION = 0.5;
+/** Below this there is nothing to divide; the pair simply has to clear costs. */
+const MIN_RETAINED_CENTS = 0.5;
+
 export function pairLimits(args: PairLimitArgs): PairLimits | null {
   const { kalAtBook, pmAtBook, kalBuffer, pmBuffer, feePerContract } = args;
   if (![kalAtBook, pmAtBook, kalBuffer, pmBuffer].every(n => Number.isFinite(n))) return null;
@@ -41,7 +57,16 @@ export function pairLimits(args: PairLimitArgs): PairLimits | null {
 
   // Fees depend on the prices, so they are estimated at the most expensive prices under
   // consideration. Trimming below that only makes the real fee smaller, never larger.
-  const maxTotal = 100 - feePerContract(pmLimit, kalLimit);
+  const feeAtLimits = feePerContract(pmLimit, kalLimit);
+
+  // What the pair is worth before any buffer is spent.
+  const grossEdge = 100 - kalAtBook - pmAtBook - feePerContract(pmAtBook, kalAtBook);
+  if (grossEdge <= 0) return null;   // nothing to trade at any price
+
+  // Keep at least half of it. This is the whole difference between a buffer that protects
+  // a fill and one that quietly consumes the reason for the trade.
+  const retained = Math.max(MIN_RETAINED_CENTS, grossEdge * MAX_GIVEAWAY_FRACTION);
+  const maxTotal = 100 - feeAtLimits - retained;
 
   if (kalLimit + pmLimit > maxTotal) {
     // Trim Polymarket first. It is the leg that goes out FIRST, so missing it costs nothing:
