@@ -10,7 +10,7 @@
     "check:links": "node scripts/check-links.mjs",
     "check:markets": "node --experimental-strip-types --no-warnings scripts/check-markets.mjs",
     "test:matching": "node --experimental-strip-types --no-warnings scripts/test-matching.mjs",
-    "check": "npm run typecheck && npm run check:contracts && npm run test:matching && npm run test:pricing && npm run check:markets && npm run check:links",
+    "check": "npm run typecheck && npm run check:contracts && npm run test:matching && npm run test:pricing && npm run test:shards && npm run check:markets && npm run check:links",
     "check:wallet": "node scripts/check-wallet.mjs",
     "setup:approvals": "node --experimental-strip-types --no-warnings scripts/setup-approvals.mjs",
     "test:pm-order": "node --experimental-strip-types --no-warnings scripts/test-polymarket-order.mjs",
@@ -21,7 +21,8 @@
     "test:pricing": "node --experimental-strip-types --no-warnings scripts/test-pricing.mjs",
     "typecheck": "tsc --noEmit",
     "check:contracts": "node scripts/check-contracts.mjs",
-    "engine": "tsx server/main.ts"
+    "engine": "tsx server/main.ts",
+    "test:shards": "node --experimental-strip-types --no-warnings scripts/test-shards.mjs"
   },
   "dependencies": {
     "@polymarket/client": "^0.10.0",

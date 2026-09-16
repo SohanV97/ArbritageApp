@@ -33,6 +33,7 @@ import {
   pairIsAvailable, releasePairAfter, holdPair,
 } from '@/lib/autoExec';
 import { loadDiscovery, saveDiscovery } from '@/lib/discoveryCache';
+import { readAttempts } from '@/lib/tradeJournal';
 import { matchMarkets, teamsAreDifferent } from '@/lib/matchMarkets';
 import { findArbitrageOpportunities, type PairWithKind } from '@/lib/arbitrage';
 import type { PolymarketMarketWithKind } from '@/api/polymarket';
@@ -1038,11 +1039,39 @@ export function isWarming(): boolean {
  */
 export function shardsInUse(): number[] {
   const found = new Set<number>();
-  for (const o of _cache?.body.opportunities ?? []) {
-    const idx = (o.pair.kalshi as { exchangeIndex?: number }).exchangeIndex;
-    if (typeof idx === 'number') found.add(idx);
+  // Every MATCHED market, not just the ones showing an edge right now. Collateral has to be
+  // in place BEFORE an opportunity appears: funding only where edges already exist means the
+  // first MLB edge of the day arrives on a shard holding nothing and is refused, which is
+  // the failure this whole mechanism exists to prevent.
+  for (const m of _discovery?.matchedKalshi ?? []) {
+    if (typeof m.exchangeIndex === 'number') found.add(m.exchangeIndex);
   }
   return [...found];
+}
+
+/**
+ * Did the last recorded attempt leave a position open?
+ *
+ * If the engine died, or was killed without draining, between the Polymarket fill and the
+ * Kalshi leg, the journal is the only record that it happened. Arming again on top of an
+ * open one-sided position is how a bad day compounds, so this is surfaced rather than left
+ * for someone to notice.
+ */
+function lastAttemptNeedsAttention(): { needsAttention: boolean; note?: string } {
+  try {
+    const rows = readAttempts();
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const a = rows[i];
+      if (a.outcome === 'no-orders' || a.dryRun) continue;   // nothing was placed
+      if (a.outcome === 'naked' || a.outcome === 'partial') {
+        return { needsAttention: true, note: `${a.ts} ${a.market.kalshiTicker}: ${a.outcome}` };
+      }
+      return { needsAttention: false };   // the most recent real attempt was fine
+    }
+    return { needsAttention: false };
+  } catch {
+    return { needsAttention: false };
+  }
 }
 
 export function engineHealth() {
@@ -1055,5 +1084,6 @@ export function engineHealth() {
     matchedPairs: _cache?.body.stats.matchedPairs ?? 0,
     opportunities: _cache?.body.opportunities.length ?? 0,
     phases: phaseStats(),
+    lastAttempt: lastAttemptNeedsAttention(),
   };
 }

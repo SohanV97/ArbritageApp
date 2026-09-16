@@ -17,10 +17,10 @@
  * but now that check only ever REFUSES; it never tries to fix things while an edge expires.
  */
 import { testKalshiAuth, transferBetweenKalshiShards } from '@/api/kalshi-trading';
+import { planTransfers } from '@/lib/shardAllocation';
 
 const CHECK_MS = 60_000;
-/** Leave at least this much on a shard we trade, so a trade never waits on a transfer. */
-const DEFAULT_FLOOR_DOLLARS = 120;
+/** Never bother moving less than this; the round trip is not worth it. */
 
 let timer: ReturnType<typeof setInterval> | undefined;
 let running = false;
@@ -33,34 +33,12 @@ async function rebalanceOnce(neededShards: number[], floorDollars: number): Prom
   running = true;
   try {
     const auth = await testKalshiAuth();
-    const shards = auth.balanceByShard;
-    if (!auth.ok || !shards) return;
-
-    for (const shard of neededShards) {
-      const have = shards[shard] ?? 0;
-      if (have >= floorDollars) continue;
-
-      const [richest, richestDollars] = Object.entries(shards)
-        .map(([i, d]) => [Number(i), Number(d)] as [number, number])
-        .filter(([i]) => i !== shard)
-        .sort((a, b) => b[1] - a[1])[0] ?? [undefined, 0];
-      if (richest === undefined) continue;
-
-      // Never strip the source below the floor to fill the destination; that just moves the
-      // problem and guarantees the next trade on the source shard is the one that waits.
-      const spare = Math.max(0, richestDollars - floorDollars);
-      const want = floorDollars - have;
-      const move = Math.min(want, spare);
-      if (move < 1) continue;
-
-      const res = await transferBetweenKalshiShards(richest, shard, move);
-      console.log('[shards] top-up', JSON.stringify({
-        from: richest, to: shard, dollars: Number(move.toFixed(2)), ok: res.ok, error: res.error,
-      }));
-      if (res.ok) {
-        shards[shard] = have + move;
-        shards[richest] = richestDollars - move;
-      }
+    if (!auth.ok || !auth.balanceByShard) return;
+    const plan = planTransfers(auth.balanceByShard, neededShards, floorDollars);
+    for (const move of plan) {
+      const res = await transferBetweenKalshiShards(move.from, move.to, move.dollars);
+      console.log('[shards] top-up', JSON.stringify({ ...move, ok: res.ok, error: res.error }));
+      if (!res.ok) break;   // a failure now will fail again; try on the next tick
     }
   } catch (err) {
     console.warn('[shards] maintenance failed:', err instanceof Error ? err.message : String(err));
@@ -68,8 +46,7 @@ async function rebalanceOnce(neededShards: number[], floorDollars: number): Prom
     running = false;
   }
 }
-
-export function startShardMaintenance(shardsInUse: ShardSource, floorDollars = DEFAULT_FLOOR_DOLLARS): void {
+export function startShardMaintenance(shardsInUse: ShardSource, floorDollars = 150): void {
   const tick = () => void rebalanceOnce(shardsInUse(), floorDollars);
   // Not at startup: the first discovery has not happened, so nothing is known to be in use.
   timer = setInterval(tick, CHECK_MS);
