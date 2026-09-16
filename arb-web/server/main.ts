@@ -121,6 +121,33 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
+  // Book health. These are how a corrupted feed is caught before it prices an order, so
+  // they belong with the engine rather than with the UI that used to host them.
+  if (path === '/diag/books' && req.method === 'GET') {
+    const { getLiveKalshiBook, liveBookStats, liveKalshiTickers } = await import('@/lib/liveBooks');
+    const { kalshiBidLadder } = await import('@/lib/depth');
+    const ticker = url.searchParams.get('ticker');
+    if (ticker) {
+      const live = getLiveKalshiBook(ticker);
+      const norm = (l?: [string, string][]) =>
+        Object.fromEntries((l ?? []).map(([p, q]) => [Number(p).toFixed(4), Number(q)]));
+      return json(res, 200, { ticker, haveLive: !!live, yes: norm(live?.yes_dollars), no: norm(live?.no_dollars) });
+    }
+    // A book whose two best bids sum above 100 is not a market, it is corrupted state.
+    const crossed: { ticker: string; yesBid: number; noBid: number }[] = [];
+    let checked = 0;
+    for (const t of liveKalshiTickers()) {
+      const b = getLiveKalshiBook(t);
+      if (!b) continue;
+      const yesBid = kalshiBidLadder(b, 'yes')[0]?.priceCents;
+      const noBid = kalshiBidLadder(b, 'no')[0]?.priceCents;
+      if (yesBid === undefined || noBid === undefined) continue;
+      checked++;
+      if (yesBid + noBid > 100) crossed.push({ ticker: t, yesBid, noBid });
+    }
+    return json(res, 200, { stats: liveBookStats(), checked, crossed: crossed.length, worst: crossed.slice(0, 10) });
+  }
+
   if (path === '/debug/snapshot' && req.method === 'GET') {
     return json(res, 200, getSnapshotBody() ?? { warming: true });
   }

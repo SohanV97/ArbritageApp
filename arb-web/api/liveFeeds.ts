@@ -54,6 +54,16 @@ function kalshiAuthHeaders(): Record<string, string> | undefined {
 }
 
 // One connection per process, surviving dev HMR for the same reason the refresh loop does.
+/**
+ * What subscribe() actually returns.
+ *
+ * The old code called handle.return(), which DOES NOT EXIST on this object — it is close().
+ * So the teardown was a silent no-op: every reconnect left its registry entry in place and
+ * its queue buffering events nobody was reading. Unbounded, and a plausible contributor to
+ * the 5.4GB this process once reached.
+ */
+type PmHandle = { close(): Promise<void> } & AsyncIterable<{ type?: string; payload?: Record<string, unknown> }>;
+
 const FEEDS = Symbol.for('arb.liveFeeds.state');
 interface FeedState {
   kalshiSocket?: WebSocket;
@@ -69,7 +79,17 @@ interface FeedState {
    * arrives once its own generation is no longer current.
    */
   kalshiGeneration: number;
-  pmHandle?: { return?: () => unknown };
+  /**
+   * ONE client, held across reconnects.
+   *
+   * A fresh createPublicClient() per connect was why the subscription could never be
+   * updated incrementally: the SDK only sends a delta when it is reusing an already-open
+   * socket, and a new client is a new manager with a new socket, so that path was dead and
+   * every market addition rebuilt the whole feed instead. Rebuilds are what corrupt books.
+   */
+  pmClient?: { subscribe: (spec: unknown[]) => Promise<PmHandle> };
+  /** One handle per subscribe() call. Each owns its own queue and MUST be drained. */
+  pmHandles: PmHandle[];
   pmAssets: string[];
   pmReconnectAt: number;
   pmGeneration: number;
@@ -81,7 +101,7 @@ function feeds(): FeedState {
   if (!existing) {
     host[FEEDS] = {
       kalshiTickers: [], kalshiReconnectAt: 0, kalshiGeneration: 0,
-      pmAssets: [], pmReconnectAt: 0, pmGeneration: 0,
+      pmAssets: [], pmHandles: [], pmReconnectAt: 0, pmGeneration: 0,
     };
     return host[FEEDS];
   }
@@ -97,6 +117,7 @@ function feeds(): FeedState {
   if (typeof existing.pmGeneration !== 'number' || !Number.isFinite(existing.pmGeneration)) existing.pmGeneration = 0;
   if (!Array.isArray(existing.kalshiTickers)) existing.kalshiTickers = [];
   if (!Array.isArray(existing.pmAssets)) existing.pmAssets = [];
+  if (!Array.isArray(existing.pmHandles)) existing.pmHandles = [];
   if (typeof existing.kalshiReconnectAt !== 'number') existing.kalshiReconnectAt = 0;
   if (typeof existing.pmReconnectAt !== 'number') existing.pmReconnectAt = 0;
   return existing;
@@ -191,25 +212,18 @@ function connectKalshi(tickers: string[]): void {
 
 // ─── Polymarket ──────────────────────────────────────────────────────────────
 
-async function connectPolymarket(assetIds: string[]): Promise<void> {
+/**
+ * Drain one subscription handle into the book store.
+ *
+ * Every handle returned by subscribe() has its OWN queue and its own matcher, so each one
+ * must be consumed or it simply fills up. That is why additions keep their handle rather
+ * than discarding it.
+ */
+function drainPmHandle(handle: PmHandle, generation: number): void {
   const s = feeds();
-  if (assetIds.length === 0) return;
-  try { await s.pmHandle?.return?.(); } catch { /* already gone */ }
-  markPolymarketUnhealthy();
-
-  const { createPublicClient } = await import('@polymarket/client');
-  const client = createPublicClient();
-  const handle = await client.subscribe([{ topic: 'market', assetIds }]);
-  // Same supersede guard as Kalshi: the previous stream is still draining, and its events
-  // must not be applied to books the new one has already refreshed.
-  const generation = ++s.pmGeneration;
-  s.pmHandle = handle as unknown as { return?: () => unknown };
-  s.pmAssets = [...assetIds];
-  console.log(`[livefeed] polymarket connected, ${assetIds.length} tokens`);
-
   void (async () => {
     try {
-      for await (const ev of handle as AsyncIterable<{ type?: string; payload?: Record<string, unknown> }>) {
+      for await (const ev of handle) {
         if (s.pmGeneration !== generation) break;   // superseded: stop feeding the store
         const p = ev.payload as {
           assetId?: string;
@@ -236,15 +250,71 @@ async function connectPolymarket(assetIds: string[]): Promise<void> {
     } catch (err) {
       console.warn('[livefeed] polymarket stream ended:', err instanceof Error ? err.message : String(err));
     } finally {
-      // Only the CURRENT stream ending means the feed is down.
+      // Only the CURRENT generation ending means the feed is down.
       if (s.pmGeneration === generation) {
-        markPolymarketUnhealthy();
-        if (s.pmHandle === (handle as unknown)) s.pmHandle = undefined;
+        s.pmHandles = s.pmHandles.filter(h => h !== handle);
+        if (s.pmHandles.length === 0) markPolymarketUnhealthy();
       }
     }
   })();
 }
 
+/** Close every open handle. close(), not return() — see PmHandle. */
+async function closePmHandles(): Promise<void> {
+  const s = feeds();
+  const open = s.pmHandles;
+  s.pmHandles = [];
+  await Promise.all(open.map(h => h.close().catch(() => { /* already gone */ })));
+}
+
+/**
+ * Add markets to the LIVE subscription without rebuilding it.
+ *
+ * Reusing the existing client is the whole point: the SDK sends an incremental frame when
+ * the socket is already open, and rebuilds are what corrupt books. The Kalshi side has
+ * avoided them since the phantom-depth incident — 102 contracts requested against a book
+ * claiming depth, 5 filled — and the identical failure mode has been live on Polymarket,
+ * which is the leg that goes first.
+ *
+ * Subscribe-then-keep, never close-then-subscribe: removing the last subscription tears the
+ * socket down.
+ */
+async function addPolymarketAssets(assetIds: string[]): Promise<boolean> {
+  const s = feeds();
+  if (!s.pmClient || assetIds.length === 0) return false;
+  try {
+    const handle = await s.pmClient.subscribe([{ topic: 'market', assetIds }]);
+    s.pmHandles.push(handle);
+    s.pmAssets = [...new Set([...s.pmAssets, ...assetIds])].sort();
+    drainPmHandle(handle, s.pmGeneration);
+    console.log(`[livefeed] polymarket +${assetIds.length} tokens (${s.pmAssets.length} tracked)`);
+    return true;
+  } catch (err) {
+    console.warn('[livefeed] polymarket incremental subscribe failed:', err instanceof Error ? err.message : String(err));
+    return false;
+  }
+}
+
+async function connectPolymarket(assetIds: string[]): Promise<void> {
+  const s = feeds();
+  if (assetIds.length === 0) return;
+
+  // Supersede first so in-flight drains stop writing, then close them for real.
+  s.pmGeneration++;
+  await closePmHandles();
+  markPolymarketUnhealthy();
+
+  const { createPublicClient } = await import('@polymarket/client');
+  const client = createPublicClient() as unknown as { subscribe: (spec: unknown[]) => Promise<PmHandle> };
+  s.pmClient = client;
+
+  const generation = s.pmGeneration;
+  const handle = await client.subscribe([{ topic: 'market', assetIds }]);
+  s.pmHandles = [handle];
+  s.pmAssets = [...assetIds];
+  console.log(`[livefeed] polymarket connected, ${assetIds.length} tokens`);
+  drainPmHandle(handle, generation);
+}
 // ─── driver ──────────────────────────────────────────────────────────────────
 
 const RECONNECT_COOLDOWN_MS = 5_000;
@@ -329,13 +399,27 @@ export function syncLiveFeeds(kalshiTickers: string[], pmAssetIds: string[]): vo
   const pmTargets = [...new Set(pmAssetIds)].sort();
   const pmKnown = new Set(s.pmAssets);
   const pmAdded = pmTargets.filter(t => !pmKnown.has(t));
-  const pmDown = !s.pmHandle;
-  if ((pmDown || pmAdded.length > 0 || s.pmAssets.length > MAX_TRACKED_MARKETS) && now >= s.pmReconnectAt) {
-    s.pmReconnectAt = now + RECONNECT_COOLDOWN_MS;
-    const union = s.pmAssets.length > MAX_TRACKED_MARKETS
-      ? pmTargets
-      : [...new Set([...s.pmAssets, ...pmTargets])].sort();
-    void connectPolymarket(union).catch(err =>
-      console.warn('[livefeed] polymarket connect failed:', err instanceof Error ? err.message : String(err)));
+  const pmDown = !s.pmClient || s.pmHandles.length === 0;
+
+  if (pmDown || s.pmAssets.length > MAX_TRACKED_MARKETS) {
+    if (now >= s.pmReconnectAt) {
+      s.pmReconnectAt = now + RECONNECT_COOLDOWN_MS;
+      const union = s.pmAssets.length > MAX_TRACKED_MARKETS
+        ? pmTargets
+        : [...new Set([...s.pmAssets, ...pmTargets])].sort();
+      void connectPolymarket(union).catch(err =>
+        console.warn('[livefeed] polymarket connect failed:', err instanceof Error ? err.message : String(err)));
+    }
+  } else if (pmAdded.length > 0) {
+    // Add to the open subscription. This is the path that did not exist before: the client
+    // was rebuilt on every change, so the SDK never saw an already-open socket and never
+    // sent a delta — and each rebuild dropped the updates between the close and the new
+    // snapshot, which is exactly how a book ends up claiming depth that is not there.
+    void addPolymarketAssets(pmAdded).then(ok => {
+      if (!ok && now >= s.pmReconnectAt) {
+        s.pmReconnectAt = now + RECONNECT_COOLDOWN_MS;
+        void connectPolymarket([...new Set([...s.pmAssets, ...pmTargets])].sort()).catch(() => { /* logged */ });
+      }
+    });
   }
 }
