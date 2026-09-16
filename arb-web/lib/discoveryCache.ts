@@ -15,7 +15,9 @@ import { readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { UnifiedMarket, MatchedPair, Category } from './market-types';
 
-const CACHE_PATH = join(process.cwd(), '.next', 'cache', 'arb-discovery.json');
+// Not .next/cache: that directory belongs to Next, which deletes it on a build, and the
+// engine no longer runs inside Next at all. data/ is the engine's own, and gitignored.
+const CACHE_PATH = join(process.cwd(), 'data', 'arb-discovery.json');
 
 // Beyond this the fixture list is too likely to have moved on (games finished, new ones
 // listed) to be worth serving even for the few seconds before rediscovery replaces it.
