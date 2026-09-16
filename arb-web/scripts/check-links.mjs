@@ -3,7 +3,7 @@
  * Validates every venue link the app produces.
  *
  *   npm run check:links          (dev server must be running on :3000)
- *   BASE_URL=http://host:port npm run check:links
+ *   BASE_URL=http://host:port npm run check:links    (engine defaults to :4311)
  *
  * Why this exists: a card's link is built from a slug/ticker, and a value from the
  * wrong namespace still *looks* fine in the UI while 404-ing when clicked. That
@@ -19,7 +19,8 @@
  * Exits non-zero if any link is broken, so it can gate a deploy.
  */
 
-const BASE = process.env.BASE_URL || 'http://localhost:3000';
+// The engine serves this now; Next is the UI only.
+const BASE = process.env.BASE_URL || 'http://localhost:4311';
 const GAMMA = 'https://gamma-api.polymarket.com';
 const KALSHI = 'https://api.elections.kalshi.com/trade-api/v2';
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));

@@ -69,6 +69,32 @@ interface CacheEntry {
 let _cache: CacheEntry | null = null;
 
 /**
+ * Notified every time a build lands.
+ *
+ * The browser polled for this every 150ms and mostly received a buffer it already had.
+ * Pushing removes that 150ms of pure added staleness and, more to the point, removes ~7
+ * requests a second of serialize-and-send work from the process that places orders.
+ */
+type BuildListener = (body: OpportunitiesResponse) => void;
+const _buildListeners = new Set<BuildListener>();
+
+export function onBuild(cb: BuildListener): () => void {
+  _buildListeners.add(cb);
+  return () => { _buildListeners.delete(cb); };
+}
+
+/** Replace the published build and tell anyone listening. */
+function publish(body: OpportunitiesResponse, builtAt: number): void {
+  _cache = makeEntry(body, builtAt);
+  if (_buildListeners.size === 0) return;
+  for (const cb of _buildListeners) {
+    // A listener must never be able to break the engine, nor slow it down: a subscriber
+    // that throws is its own problem, and this runs on the refresh tick.
+    try { cb(body); } catch (err) { console.warn('[engine] build listener threw:', err); }
+  }
+}
+
+/**
  * Serialize a build the first time it is asked for.
  *
  * This used to run at BUILD time, which was right when a build meant a full refresh. It is
@@ -118,7 +144,7 @@ function rebuild(): Promise<OpportunitiesResponse> {
   if (_inFlight) return _inFlight;
   _rebuilding = true;
   _inFlight = buildOpportunities()
-    .then(body => { _cache = makeEntry(body, Date.now()); return body; })
+    .then(body => { publish(body, Date.now()); return body; })
     .finally(() => { _inFlight = null; _rebuilding = false; });
   return _inFlight;
 }
@@ -131,7 +157,7 @@ function reprice(): Promise<OpportunitiesResponse> {
   const disc = _discovery;
   if (!disc) return rebuild();               // nothing discovered yet
   _repriceInFlight = repriceAndAssemble(disc)
-    .then(body => { _cache = makeEntry(body, Date.now()); return body; })
+    .then(body => { publish(body, Date.now()); return body; })
     .finally(() => { _repriceInFlight = null; });
   return _repriceInFlight;
 }
@@ -216,7 +242,7 @@ function repriceInPlay(): Promise<void> {
         console.warn(`[timing] repriceInPlay parts: kalshi ${_tKal}ms, polymarket ${_tPm}ms, assemble ${total - Math.max(_tKal, _tPm)}ms, markets k=${kal.length} p=${pm.length}`);
       }
       // Rebuild from the mutated market objects so the cache reflects the new prices.
-      _cache = makeEntry(assemble(disc), Date.now());
+      publish(assemble(disc), Date.now());
     })
     .catch(err => console.error('[opportunities] in-play reprice failed:', err))
     .finally(() => { _fastInFlight = null; });

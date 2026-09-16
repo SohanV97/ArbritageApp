@@ -3,7 +3,7 @@
  * Validates the live opportunity feed: correct fixtures, sane prices, valid hedges.
  *
  *   npm run check:markets        (dev server must be running on :3000)
- *   BASE_URL=http://host:port npm run check:markets
+ *   BASE_URL=http://host:port npm run check:markets   (engine defaults to :4311)
  *
  * The check that matters most is CROSS-FIXTURE matching. Kalshi titles game markets one
  * team at a time ("San Diego FC wins"), so only half a fixture is named. Comparing that
@@ -16,7 +16,8 @@
  * Exits non-zero on any violation so it can gate a deploy.
  */
 
-const BASE = process.env.BASE_URL || 'http://localhost:3000';
+// The engine serves this now; Next is the UI only.
+const BASE = process.env.BASE_URL || 'http://localhost:4311';
 
 // Club-name boilerplate — shared by unrelated teams, so it can't identify a fixture.
 const GENERIC = new Set([

@@ -20,7 +20,7 @@ const env = loadEnv();
 console.log(`[engine] loaded ${env.loaded.length} vars from ${env.path}` +
   (env.skipped.length ? ` (${env.skipped.length} already set in the environment)` : ''));
 
-const { startEngine, stopEngine, getServablePayload, getSnapshotBody, engineHealth } =
+const { startEngine, stopEngine, getServablePayload, getSnapshotBody, engineHealth, onBuild } =
   await import('./engine');
 
 const PORT = Number(process.env.ARB_ENGINE_PORT ?? 4311);
@@ -146,6 +146,96 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       if (yesBid + noBid > 100) crossed.push({ ticker: t, yesBid, noBid });
     }
     return json(res, 200, { stats: liveBookStats(), checked, crossed: crossed.length, worst: crossed.slice(0, 10) });
+  }
+
+  // ── the stream ─────────────────────────────────────────────────────────────
+  //
+  // Replaces a 150ms poll of a ~200KB payload. SSE rather than a websocket because every
+  // write the UI makes is a discrete RPC that wants a status code and a body, and
+  // EventSource reconnects on its own with backoff.
+  if (path === '/stream' && req.method === 'GET') {
+    const wantsPairs = url.searchParams.get('pairs') === '1';
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-store, no-transform',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
+    });
+
+    // NEVER await a write, and drop rather than buffer. A paused tab or a devtools
+    // breakpoint must not be able to apply backpressure to the process that places orders,
+    // and a stale quote frame has no value anyway — the next one is along in 150ms.
+    let dropped = 0;
+    const send = (event: string, data: unknown): void => {
+      if (res.writableEnded) return;
+      if (res.writableNeedDrain) { dropped++; return; }
+      res.write('event: ' + event + '\ndata: ' + JSON.stringify(data) + '\n\n');
+    };
+
+    const slim = (body: unknown) => {
+      const b = body as { pairsDetail?: unknown[] };
+      // pairsDetail is 93% of the bytes and only one tab renders it.
+      return wantsPairs ? b : { ...b, pairsDetail: [] };
+    };
+
+    const first = getSnapshotBody();
+    if (first) send('quotes', slim(first));
+    else send('warming', { warming: true });
+
+    const unsubscribe = onBuild(body => send('quotes', slim(body)));
+    // Carries the auto-exec state too, which is what retires the UI's second poll: it was
+    // asking for records once a second whenever trading was armed.
+    const ready = setInterval(() => {
+      void (async () => {
+        const { getAutoExecConfig, getAutoExecRecords } = await import('@/lib/autoExec');
+        send('ready', {
+          ...engineHealth(),
+          droppedFrames: dropped,
+          autoExec: { config: getAutoExecConfig(), records: getAutoExecRecords() },
+        });
+      })();
+    }, 1000);
+    // Comment line: keeps the connection alive through any idle proxy.
+    const ping = setInterval(() => { if (!res.writableEnded) res.write(': ping\n\n'); }, 15_000);
+
+    const cleanup = () => { unsubscribe(); clearInterval(ready); clearInterval(ping); };
+    req.on('close', cleanup);
+    req.on('error', cleanup);
+    return;
+  }
+
+  // ── trading RPCs ───────────────────────────────────────────────────────────
+  if (path === '/execute' || path === '/api/execute') {
+    const { executeArb } = await import('@/api/tradeExecutor');
+    if (req.method === 'GET') {
+      const [{ testKalshiAuth }, { testPolymarketAuth }] = await Promise.all([
+        import('@/api/kalshi-trading'),
+        import('@/api/polymarket-trading'),
+      ]);
+      const [kalshi, polymarket] = await Promise.all([testKalshiAuth(), testPolymarketAuth()]);
+      return json(res, 200, { kalshi, polymarket, testedAt: new Date().toISOString() });
+    }
+    if (req.method === 'POST') {
+      let body: { opportunity?: unknown; amount?: number; dryRun?: boolean };
+      try { body = JSON.parse(await readBody(req)); }
+      catch { return json(res, 400, { error: 'invalid JSON body' }); }
+      const result = await executeArb(body as Parameters<typeof executeArb>[0]);
+      return json(res, result.status, result.body);
+    }
+  }
+
+  if (path === '/autoexec' || path === '/api/autoexec') {
+    const { getAutoExecConfig, setAutoExecConfig, getAutoExecRecords } = await import('@/lib/autoExec');
+    if (req.method === 'GET') {
+      return json(res, 200, { config: getAutoExecConfig(), records: getAutoExecRecords() });
+    }
+    if (req.method === 'POST') {
+      let patch: Record<string, unknown>;
+      try { patch = JSON.parse(await readBody(req)); }
+      catch { return json(res, 400, { error: 'invalid JSON body' }); }
+      const config = setAutoExecConfig(patch);
+      return json(res, 200, { config, records: getAutoExecRecords() });
+    }
   }
 
   if (path === '/debug/snapshot' && req.method === 'GET') {

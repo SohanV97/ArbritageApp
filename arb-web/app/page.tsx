@@ -4,7 +4,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ArbitrageOpportunity, Category } from '@/lib/market-types';
 import { MIN_ORDER_CONTRACTS } from '@/lib/market-types';
 import type { OpportunitiesResponse, PairInfo } from '@/lib/contracts';
-import type { ExecuteResponse, ConnectionTestResponse } from './api/execute/route';
+import type { ExecuteResponse, ConnectionTestResponse } from '@/lib/contracts';
 import { CATEGORY_LABELS, CATEGORY_COLORS } from '@/lib/categories';
 import { sizeByRisk } from '@/lib/sizing';
 
@@ -281,7 +281,7 @@ const OpportunityCard = memo(function OpportunityCard({ opp, amount, riskDollars
     onExecuteStart(opp);
     setCardExec({ state: 'pending' });
     try {
-      const res = await fetch('/api/execute', {
+      const res = await fetch(`${ENGINE_URL}/execute`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ opportunity: opp, amount }),
@@ -1124,7 +1124,14 @@ const ALL_CATEGORIES: Category[] = ['mlb', 'nfl', 'cfb', 'soccer', 'politics'];
 // Responses are a memory read (~10ms), so the poll interval is pure added staleness on
 // top of the server's own refresh. At 350ms a price could be a third of a second old before
 // it even reached the screen, which is most of the window an in-play edge lives in.
-const POLL_MS = 150;
+/**
+ * Where the engine lives.
+ *
+ * It is a separate process now, so this is cross-origin in development. Everything the UI
+ * reads arrives over one SSE stream; everything it writes is still a normal request,
+ * because each write wants a status code and a body back.
+ */
+const ENGINE_URL = process.env.NEXT_PUBLIC_ENGINE_URL ?? 'http://localhost:4311';
 // How long a harmless result stays on screen while auto-execute is running. Long enough to
 // read in passing, short enough that an unattended session does not sit idle on it.
 const RESULT_AUTODISMISS_MS = 6_000;
@@ -1134,6 +1141,9 @@ export default function Home() {
   const [data, setData] = useState<OpportunitiesResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [lastFetch, setLastFetch] = useState<string | null>(null);
+  // Whether the engine's stream is live. A drop must never blank the prices — the last ones
+  // are still the best information available, and this drives a badge that says they are old.
+  const [connected, setConnected] = useState(false);
   // 'sports' is the default view: politics settles months out, so those markets dominate
   // the list by count while being the least actionable day to day.
   const [view, setView] = useState<'sports' | 'opportunities' | 'pairs' | 'trades'>('sports');
@@ -1168,7 +1178,7 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
   async function handleTestConnection() {
     setConnTest({ state: 'pending' });
     try {
-      const res = await fetch('/api/execute');
+      const res = await fetch(`${ENGINE_URL}/execute`);
       const result = await res.json() as ConnectionTestResponse;
       setConnTest({ state: 'done', result });
     } catch {
@@ -1228,7 +1238,7 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
       if (force) params.set('fresh', '1');
       if (viewRef.current === 'pairs') params.set('pairs', '1');
       const qs = params.toString();
-      const res = await fetch(`/api/opportunities${qs ? `?${qs}` : ''}`, {
+      const res = await fetch(`${ENGINE_URL}/snapshot${qs ? `?${qs}` : ''}`, {
         signal: abortRef.current.signal,
         cache: 'no-store',
       });
@@ -1270,17 +1280,59 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
   // The server keeps quotes hot in memory and answers in ~15 ms, so polling can run
   // near real time — an edge that appears is on screen within about a second instead
   // of after a multi-second fetch, by which point it has usually already gone.
+  // The engine pushes every build instead of being asked ~7 times a second for a payload it
+  // had already produced. That removes 150ms of pure added staleness from every quote, and
+  // takes the serialize-and-send work off the process that places orders.
+  //
+  // pairsDetail is 93% of the bytes and only this one tab renders it, so it is opted into
+  // per connection: switching tabs reopens the stream, which costs one reconnect on
+  // loopback and keeps every other tab cheap.
   useEffect(() => {
-    load();
-    const id = setInterval(() => load(), POLL_MS);
-    return () => clearInterval(id);
-  }, [load]);
+    const url = `${ENGINE_URL}/stream${view === 'pairs' ? '?pairs=1' : ''}`;
+    const es = new EventSource(url);
 
-  // Switching to Matched Pairs changes what the request must ask for, so fetch straight
-  // away instead of waiting up to a poll for the tab to fill in.
-  useEffect(() => {
-    if (view === 'pairs') load();
-  }, [view, load]);
+    es.addEventListener('quotes', ev => {
+      try {
+        const json = JSON.parse((ev as MessageEvent).data) as OpportunitiesResponse;
+        setData(json);
+        setLastFetch(new Date().toISOString());
+        setConnected(true);
+        setPersistMap(prev => {
+          const next = new Map<string, number>();
+          for (const opp of (json.opportunities ?? [])) {
+            const k = `${opp.pair.polymarket.id}|${opp.pair.kalshi.id}`;
+            next.set(k, prev.get(k) ?? Date.now());
+          }
+          return next;
+        });
+      } catch { /* a truncated frame; the next one is 150ms away */ }
+    });
+
+    es.addEventListener('ready', ev => {
+      setConnected(true);
+      try {
+        const h = JSON.parse((ev as MessageEvent).data) as {
+          autoExec?: { records?: ExecLogEntry[] };
+        };
+        // Trades the engine made while this tab was not the one deciding. This is what
+        // replaces the second poll, which asked for records once a second while armed.
+        const records = h.autoExec?.records;
+        if (Array.isArray(records) && records.length) {
+          setExecLog(prev => {
+            const have = new Set(prev.map(e => e.id));
+            const fresh = records.filter(r => !have.has(r.id));
+            return fresh.length ? [...fresh, ...prev].slice(0, 50) : prev;
+          });
+        }
+      } catch { /* ignore a bad frame */ }
+    });
+
+    // EventSource reconnects on its own with backoff. Never blank the data on a drop — the
+    // last prices are still the best information available, and the badge says they are old.
+    es.onerror = () => setConnected(false);
+
+    return () => es.close();
+  }, [view]);
 
   // The SERVER executes now, so it needs the settings. It decides inside the refresh tick,
   // on the books it just fetched, which removes the poll and the round trip that together
@@ -1292,7 +1344,7 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
     let cancelled = false;
     (async () => {
       try {
-        const res = await fetch('/api/autoexec', {
+        const res = await fetch(`${ENGINE_URL}/autoexec`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1308,25 +1360,8 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
     return () => { cancelled = true; };
   }, [autoExec, execThreshold, riskDollars, autoExecScope]);
 
-  // Pull in trades the server made while this tab was not the one deciding.
-  useEffect(() => {
-    if (!autoExec) return;
-    let stop = false;
-    const pull = async () => {
-      try {
-        const { records } = await (await fetch('/api/autoexec')).json() as { records?: ExecLogEntry[] };
-        if (stop || !Array.isArray(records) || records.length === 0) return;
-        setExecLog(prev => {
-          const have = new Set(prev.map(e => e.id));
-          const fresh = records.filter(r => !have.has(r.id));
-          return fresh.length ? [...fresh, ...prev].slice(0, 50) : prev;
-        });
-      } catch { /* transient; the next tick tries again */ }
-    };
-    void pull();
-    const id = setInterval(pull, 1000);
-    return () => { stop = true; clearInterval(id); };
-  }, [autoExec]);
+  // Trades the engine made are delivered on the 'ready' event above, so the separate
+  // once-a-second poll for them is gone.
 
   // Auto-execution is NOT done here any more.
   //
@@ -1665,6 +1700,11 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
               {/* The server does the trading now, so say whether it actually has the
                   settings. A failed sync leaves the toggle looking armed while nothing
                   is watching the markets. */}
+              {!connected && (
+                <span style={{ color: '#f87171' }} title="The engine is not reachable. Start it with: npm run engine">
+                  ENGINE DISCONNECTED · showing last known prices ·{' '}
+                </span>
+              )}
               Auto-trading {autoExecScope === 'sports' ? 'sports only' : 'all categories'} · {fmtUsd(riskDollars)}/trade · {execLog.length} executed
               {autoExec && (autoExecSynced
                 ? <span style={{ color: '#4ade80' }}> · server armed</span>

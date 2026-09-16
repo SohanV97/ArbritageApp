@@ -47,3 +47,20 @@ export interface OpportunitiesResponse {
    *  The client keeps polling and fills in as soon as the first build lands. */
   warming?: boolean;
 }
+
+// ─── the trading RPCs ────────────────────────────────────────────────────────
+//
+// Re-exported rather than duplicated. These are `export type`, so they erase completely at
+// build time and pull no runtime code into the browser — the guard in npm run check allows
+// type-only re-exports for exactly this reason.
+
+export type { LegResult, ExecuteResponse, TradeSummary, TradeLegSummary } from '@/api/tradeExecutor';
+export type { KalshiAuthTest } from '@/api/kalshi-trading';
+export type { PolymarketAuthTest } from '@/api/polymarket-trading';
+
+/** What GET /execute answers: can we reach and authenticate against both venues? */
+export interface ConnectionTestResponse {
+  kalshi: import('@/api/kalshi-trading').KalshiAuthTest;
+  polymarket: import('@/api/polymarket-trading').PolymarketAuthTest;
+  testedAt: string;
+}
