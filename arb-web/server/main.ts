@@ -14,13 +14,17 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { loadEnv } from './loadEnv';
+import { installHttpAgent, startConnectionWarmth, stopConnectionWarmth } from './httpAgent';
+import { startShardMaintenance, stopShardMaintenance } from './shardMaintenance';
 
 // Before ANY module that reads process.env at import time.
+// Before any request is made, including the SDK's: it uses global fetch, which reads this.
+installHttpAgent();
 const env = loadEnv();
 console.log(`[engine] loaded ${env.loaded.length} vars from ${env.path}` +
   (env.skipped.length ? ` (${env.skipped.length} already set in the environment)` : ''));
 
-const { startEngine, stopEngine, getServablePayload, getSnapshotBody, engineHealth, onBuild } =
+const { startEngine, stopEngine, getServablePayload, getSnapshotBody, engineHealth, onBuild, shardsInUse } =
   await import('./engine');
 
 const PORT = Number(process.env.ARB_ENGINE_PORT ?? 4311);
@@ -258,6 +262,9 @@ const server = createServer((req, res) => {
 server.listen(PORT, HOST, () => {
   console.log(`[engine] listening on http://${HOST}:${PORT}`);
   console.log(`[engine] trading ${process.env.ARB_TRADING_ENABLED === 'false' ? 'DISABLED' : 'ENABLED'}`);
+  startConnectionWarmth();
+  // Keeps collateral where orders will need it, so the order path never waits on a transfer.
+  startShardMaintenance(shardsInUse);
   void startEngine().then(() => console.log('[engine] first build complete'));
 });
 
@@ -276,6 +283,8 @@ async function shutdown(signal: string): Promise<void> {
   }, 30_000);
   hard.unref?.();
   try {
+    stopConnectionWarmth();
+    stopShardMaintenance();
     server.close();
     await stopEngine();
     console.log('[engine] stopped cleanly');

@@ -1030,6 +1030,21 @@ export function isWarming(): boolean {
   return _cache === null;
 }
 
+/**
+ * Exchange shards the tradeable markets currently sit on.
+ *
+ * Kalshi funds an order only from the shard its market belongs to, so these are the shards
+ * that must hold collateral BEFORE a trade arrives rather than while one is waiting.
+ */
+export function shardsInUse(): number[] {
+  const found = new Set<number>();
+  for (const o of _cache?.body.opportunities ?? []) {
+    const idx = (o.pair.kalshi as { exchangeIndex?: number }).exchangeIndex;
+    if (typeof idx === 'number') found.add(idx);
+  }
+  return [...found];
+}
+
 export function engineHealth() {
   return {
     started: _started,
