@@ -3,7 +3,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ArbitrageOpportunity, Category } from '@/lib/market-types';
 import { MIN_ORDER_CONTRACTS } from '@/lib/market-types';
-import type { OpportunitiesResponse, PairInfo } from './api/opportunities/route';
+import type { OpportunitiesResponse, PairInfo } from '@/lib/contracts';
 import type { ExecuteResponse, ConnectionTestResponse } from './api/execute/route';
 import { CATEGORY_LABELS, CATEGORY_COLORS } from '@/lib/categories';
 import { sizeByRisk } from '@/lib/sizing';
