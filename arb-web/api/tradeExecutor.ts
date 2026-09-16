@@ -548,8 +548,9 @@ async function executeArbInner(req: ExecuteRequest, rec: TradeAttempt): Promise<
   // underfunded venue does not fail cleanly: its leg is rejected while the other one fills,
   // leaving exactly the naked, unhedged position this app exists to avoid. Checking after
   // the fact is too late — the money is already committed.
-  const kalCostCents = freshKalPrice * plannedContracts;
-  const pmCostCents = freshPmPrice * plannedContracts;
+  let sizedContracts = plannedContracts;
+  let kalCostCents = freshKalPrice * sizedContracts;
+  let pmCostCents = freshPmPrice * sizedContracts;
   // Kalshi's check is free (measured 0ms, it is already cached). Polymarket's full auth test
   // is not: 309ms median, 2.7s worst, because it also reads wallet ownership and trading
   // approvals from the chain. Neither is needed to decide whether a leg is affordable, and
@@ -593,20 +594,21 @@ async function executeArbInner(req: ExecuteRequest, rec: TradeAttempt): Promise<
   const shardFundsDollars = shard !== undefined ? shards?.[shard] : worstShardDollars;
   const kalFunds = (shardFundsDollars ?? kalAuth.balanceDollars ?? 0) * 100;
   const pmFunds = (pmDollars ?? 0) * 100;
-  const shortfalls: string[] = [];
-  if (kalFunds < kalCostCents) {
-    shortfalls.push(
-      shardFundsDollars !== undefined
-        ? `Kalshi has $${(kalFunds / 100).toFixed(2)} on exchange shard ${shard ?? '(unknown — using the lowest)'} (where this market trades) ` +
-          `but this leg costs $${(kalCostCents / 100).toFixed(2)} — the account total is ` +
-          `$${(kalAuth.balanceDollars ?? 0).toFixed(2)}, held on other shards`
-        : `Kalshi has $${(kalFunds / 100).toFixed(2)} but this leg costs $${(kalCostCents / 100).toFixed(2)}`,
-    );
-  }
-  if (pmFunds < pmCostCents) {
-    shortfalls.push(`Polymarket has $${(pmFunds / 100).toFixed(2)} but this leg costs $${(pmCostCents / 100).toFixed(2)}`);
-  }
-  if (shortfalls.length > 0) {
+  // Trade what the account can afford, rather than refusing what it cannot.
+  //
+  // This used to refuse outright whenever either leg cost more than that venue held, and
+  // which venue binds FLIPS with the pair: measured on live opportunities, Kalshi allowed 84
+  // contracts where Polymarket allowed 158, and on the next pair Polymarket allowed 48 where
+  // Kalshi allowed 2815. A single risk setting therefore either refuses half the
+  // opportunities or leaves most of the account unused on the other half.
+  //
+  // Sizing down costs nothing: a smaller hedge is still a hedge, and the edge is per
+  // contract. Refusing is reserved for the case where even the venue minimum does not fit.
+  const affordableKal = freshKalPrice > 0 ? Math.floor(kalFunds / freshKalPrice) : 0;
+  const affordablePm = freshPmPrice > 0 ? Math.floor(pmFunds / freshPmPrice) : 0;
+  const affordable = Math.min(affordableKal, affordablePm);
+
+  if (affordable < MIN_ORDER_CONTRACTS) {
     const body: ExecuteResponse = {
       kalshi: { ok: false, error: 'Not placed — insufficient funds' },
       polymarket: { ok: false, error: 'Not placed — insufficient funds' },
@@ -617,21 +619,35 @@ async function executeArbInner(req: ExecuteRequest, rec: TradeAttempt): Promise<
       revalidateMs,
       quotedEdgePercent,
       freshEdgePercent,
-      hedgeNote: `No orders were sent. ${shortfalls.join('; ')}. Both venues must cover their own ` +
-        `leg — funding only one would fill that side alone and leave it unhedged.`,
+      hedgeNote: `No orders were sent. At ${freshKalPrice}¢ + ${freshPmPrice}¢ the most this account ` +
+        `can hedge is ${affordable} contracts (Kalshi $${(kalFunds / 100).toFixed(2)} on ` +
+        `${shard !== undefined ? `shard ${shard}` : 'the lowest shard'} allows ${affordableKal}, ` +
+        `Polymarket $${(pmFunds / 100).toFixed(2)} allows ${affordablePm}), which is below the ` +
+        `${MIN_ORDER_CONTRACTS}-contract minimum. Both venues must cover their own leg.`,
     };
-    console.log('[execute] aborted on funding', JSON.stringify({ ticker: kalshiTicker, shortfalls }));
+    console.log('[execute] aborted on funding', JSON.stringify({
+      ticker: kalshiTicker, affordableKal, affordablePm, wanted: plannedContracts,
+    }));
     return { body, status: 409 };
   }
 
+  if (affordable < sizedContracts) {
+    console.log('[execute] sized down to what the account covers', JSON.stringify({
+      ticker: kalshiTicker, wanted: sizedContracts, affordable, affordableKal, affordablePm,
+    }));
+    sizedContracts = affordable;
+    kalCostCents = freshKalPrice * sizedContracts;
+    pmCostCents = freshPmPrice * sizedContracts;
+    if (rec.plan) rec.plan.plannedContracts = sizedContracts;
+  }
   // dryRun stops here: every check above has run against live books, so this reports what
   // WOULD be sent, and how long confirming it took, without sending it. That makes the
   // pre-order path measurable and testable at any time — otherwise the only way to time it
   // is to spend money, and the only way to prove it works is to place a real trade.
   if (req.dryRun === true) {
     const dry: ExecuteResponse = {
-      kalshi: { ok: false, error: `Dry run — would buy ${plannedContracts} @ ${freshKalPrice}¢` },
-      polymarket: { ok: false, error: `Dry run — would buy ${plannedContracts} @ ${freshPmPrice}¢` },
+      kalshi: { ok: false, error: `Dry run — would buy ${sizedContracts} @ ${freshKalPrice}¢` },
+      polymarket: { ok: false, error: `Dry run — would buy ${sizedContracts} @ ${freshPmPrice}¢` },
       executedAt: new Date().toISOString(),
       bothOk: false,
       hedged: false,
@@ -639,7 +655,7 @@ async function executeArbInner(req: ExecuteRequest, rec: TradeAttempt): Promise<
       revalidateMs,
       quotedEdgePercent,
       freshEdgePercent,
-      hedgeNote: `Dry run: ${plannedContracts} contracts at ${freshKalPrice}¢ (Kalshi, book ${kalAtBook}¢) + ` +
+      hedgeNote: `Dry run: ${sizedContracts} contracts at ${freshKalPrice}¢ (Kalshi, book ${kalAtBook}¢) + ` +
         `${freshPmPrice}¢ (Polymarket, book ${pmAtBook}¢), edge ${freshEdgePercent.toFixed(2)}%, confirmed in ` +
         `${revalidateMs}ms via ${bookSource}. No orders were sent.`,
     };
@@ -669,12 +685,12 @@ async function executeArbInner(req: ExecuteRequest, rec: TradeAttempt): Promise<
   const _pmSentAt = Date.now();
   const pmRaw = await placePolymarketOrder({
     tokenId: pmTokenId,
-    count: plannedContracts,
+    count: sizedContracts,
     priceCents: freshPmPrice,
   });
   rec.legs.push({
     venue: 'polymarket', side: pmLeg.side, limitCents: freshPmPrice,
-    requested: plannedContracts, reportedFill: pmRaw.filledCount ?? 0,
+    requested: sizedContracts, reportedFill: pmRaw.filledCount ?? 0,
     avgPriceCents: pmRaw.avgPriceCents, status: pmRaw.status, orderId: pmRaw.orderId,
     ok: pmRaw.ok, error: scrubSecrets(pmRaw.error), ms: Date.now() - _pmSentAt,
   } satisfies LegRecord);
@@ -694,14 +710,14 @@ async function executeArbInner(req: ExecuteRequest, rec: TradeAttempt): Promise<
       quotedEdgePercent,
       freshEdgePercent,
       hedgeNote: pmRaw.ok
-        ? `Polymarket accepted the order at ${freshPmPrice}¢ but filled 0 of ${plannedContracts} ` +
+        ? `Polymarket accepted the order at ${freshPmPrice}¢ but filled 0 of ${sizedContracts} ` +
           `— its ask is above what this pair can pay and still profit, so the order rested ` +
           `instead of crossing and was cancelled. No Kalshi order was sent, so nothing is at risk.`
         : `Polymarket rejected the order (${scrubSecrets(pmRaw.error) ?? 'error'}). No Kalshi ` +
           `order was sent, so nothing is at risk.`,
     };
     console.log('[execute] polymarket leg missed, kalshi not sent', JSON.stringify({
-      ticker: kalshiTicker, wanted: plannedContracts, limit: freshPmPrice,
+      ticker: kalshiTicker, wanted: sizedContracts, limit: freshPmPrice,
       ok: pmRaw.ok, status: pmRaw.status,
     }));
     return { body, status: 200 };
