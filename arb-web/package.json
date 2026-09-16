@@ -20,7 +20,8 @@
     "trades:reconcile": "node --experimental-strip-types --no-warnings scripts/trade-reconcile.mjs",
     "test:pricing": "node --experimental-strip-types --no-warnings scripts/test-pricing.mjs",
     "typecheck": "tsc --noEmit",
-    "check:contracts": "node scripts/check-contracts.mjs"
+    "check:contracts": "node scripts/check-contracts.mjs",
+    "engine": "tsx server/main.ts"
   },
   "dependencies": {
     "@polymarket/client": "^0.10.0",
