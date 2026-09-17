@@ -634,18 +634,40 @@ async function discover(): Promise<Discovery> {
  */
 function applyLiveBookPrices(disc: Discovery): number {
   let priced = 0;
+  // Price Kalshi at a size that can actually be traded, exactly as Polymarket is priced.
+  //
+  // This used to take the TOP of the ladder, and the asymmetry showed up precisely where it
+  // hurts. Over 14 recorded attempts, Polymarket's price at order time differed from the
+  // advertised one by a mean of 0.00c and never once moved against us, while Kalshi differed
+  // by a mean of 2.07c and was worse on 5 of 5 aborts — with fresh depth at that top price
+  // measuring ONE CONTRACT in two of them. The list was advertising an edge nobody could
+  // trade, the pre-order check correctly refused it, and every such attempt was wasted.
+  //
+  // Pricing both legs at the venue minimum makes the advertised edge one that survives
+  // contact with the order path.
+  const cumulativeDepth = (ladder: { priceCents: number; size: number }[], upTo: number): number => {
+    let total = 0;
+    for (const level of ladder) {
+      if (level.priceCents > upTo) break;
+      total += level.size;
+    }
+    return total;
+  };
+
   for (const m of disc.matchedKalshi) {
     const live = m.symbol ? getLiveKalshiBook(m.symbol) : undefined;
     if (!live) continue;
-    const yes = kalshiAskLadder(live, 'yes')[0];
-    const no = kalshiAskLadder(live, 'no')[0];
-    if (!yes || !no) continue;
-    m.yesPriceCents = yes.priceCents;
-    m.noPriceCents = no.priceCents;
-    // Depth at the quoted price, which is what disqualifies a dust-backed quote. The ladder
-    // has already dropped sub-contract levels, so this is real size by construction.
-    m.yesDepth = yes.size;
-    m.noDepth = no.size;
+    const yesLadder = kalshiAskLadder(live, 'yes');
+    const noLadder = kalshiAskLadder(live, 'no');
+    const yes = priceForSize(yesLadder, MIN_ORDER_CONTRACTS);
+    const no = priceForSize(noLadder, MIN_ORDER_CONTRACTS);
+    if (yes === null || no === null) continue;   // cannot fill the minimum: not a quote
+    m.yesPriceCents = yes;
+    m.noPriceCents = no;
+    // Everything available AT OR BETTER THAN the quoted price, which is what a trade of that
+    // size would actually sweep — not just the single best level.
+    m.yesDepth = cumulativeDepth(yesLadder, yes);
+    m.noDepth = cumulativeDepth(noLadder, no);
     priced++;
   }
   for (const m of disc.matchedPm) {
