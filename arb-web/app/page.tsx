@@ -1215,6 +1215,29 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
   }, [execLog]);
 
 
+  // Dismissing a row has to outlive the row. The engine re-broadcasts its last 50
+  // auto-execute records on every 'ready' frame (1/s), so an entry removed from state
+  // alone is merged straight back in within a second — which is exactly what made the
+  // × button look broken. Remember what was dismissed and filter incoming records
+  // through it. The cap sits well above the server's 50-record window, so a dismissal
+  // can never be forgotten while its record is still being sent.
+  const DISMISSED_KEY = 'arb-exec-dismissed';
+  const DISMISSED_MAX = 500;
+  const dismissedRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(DISMISSED_KEY);
+      if (saved) dismissedRef.current = new Set(JSON.parse(saved) as string[]);
+    } catch { /* ignore corrupt/absent storage */ }
+  }, []);
+  const rememberDismissed = useCallback((ids: (string | undefined)[]) => {
+    const seen = dismissedRef.current;
+    // delete-then-add moves an id to the end, so trimming drops the oldest first.
+    for (const id of ids) { if (!id) continue; seen.delete(id); seen.add(id); }
+    while (seen.size > DISMISSED_MAX) seen.delete(seen.values().next().value as string);
+    try { localStorage.setItem(DISMISSED_KEY, JSON.stringify([...seen])); } catch { /* quota/absent */ }
+  }, []);
+
   const load = useCallback(async (force = false) => {
     if (isFetching.current && !force) return;
     // Cancel any in-flight request so a manual Refresh always wins
@@ -1320,7 +1343,7 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
         if (Array.isArray(records) && records.length) {
           setExecLog(prev => {
             const have = new Set(prev.map(e => e.id));
-            const fresh = records.filter(r => !have.has(r.id));
+            const fresh = records.filter(r => !have.has(r.id) && !(r.id && dismissedRef.current.has(r.id)));
             return fresh.length ? [...fresh, ...prev].slice(0, 50) : prev;
           });
         }
@@ -1408,8 +1431,16 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
   // an order that was actually placed; the position (if any) still stands at the venue.
   const dismissExecEntry = useCallback((id: string | undefined) => {
     if (!id) return;
+    rememberDismissed([id]);
     setExecLog(prev => prev.filter(e => e.id !== id));
-  }, []);
+  }, [rememberDismissed]);
+
+  // Same rule for the whole log: every id currently shown has to be remembered, or the
+  // engine's next frame refills the list.
+  const clearExecLog = useCallback(() => {
+    rememberDismissed(execLog.map(e => e.id));
+    setExecLog([]);
+  }, [execLog, rememberDismissed]);
 
   const handleCardExecuted = useCallback((opp: ArbitrageOpportunity, betAmount: number, result: ExecuteResponse) => {
     setExecLog(prev => [{
@@ -1966,7 +1997,20 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
       {/* Execution log */}
       {execLog.length > 0 && view !== 'trades' && (
         <div className="mt-10">
-          <h2 className="text-sm font-semibold mb-3">Execution Log</h2>
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-semibold">Execution Log</h2>
+            {/* Clearing is display-only, like the per-row ×: it removes the history from
+                this tab, it does not cancel or undo anything at the venues. */}
+            <button
+              type="button"
+              onClick={clearExecLog}
+              title="Clear the log (does not cancel any order)"
+              className="text-xs text-[--text-muted] px-2 py-1 rounded
+                         hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+            >
+              Clear all
+            </button>
+          </div>
           <div className="flex flex-col gap-2">
             {execLog.map((entry, i) => (
               <div
