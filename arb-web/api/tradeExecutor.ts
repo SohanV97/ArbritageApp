@@ -354,8 +354,16 @@ async function executeArbInner(req: ExecuteRequest, rec: TradeAttempt): Promise<
   // An unhandled rejection here would be fatal before the await below is reached.
   fundingPromise.catch(() => { /* surfaced where it is awaited */ });
 
-  const liveKal = getLiveKalshiBook(kalshiTicker);
-  const livePm = getLivePolymarketBook(pmYesToken);
+  // A live book that EXISTS but carries no asks on the side being bought is not a book, and
+  // treating it as one is how this failed: a present-but-empty websocket book suppressed the
+  // REST fetch below, left a zero-length ladder, and refused the trade for "unverified depth"
+  // 1ms later — with a perfectly readable book available over HTTP the whole time. A feed can
+  // be subscribed and connected and still hold an empty side, so presence is the wrong test.
+  // Qualify each feed on the side actually being bought, and fall back to the fetch otherwise.
+  const liveKalRaw = getLiveKalshiBook(kalshiTicker);
+  const livePmRaw = getLivePolymarketBook(pmYesToken);
+  const liveKal = kalshiAskLadder(liveKalRaw, actualKalshiSide).length ? liveKalRaw : undefined;
+  const livePm = polymarketAskLadder(livePmRaw, pmLeg.side).length ? livePmRaw : undefined;
   const [kOrderbook, fetchedPmBooks] = await Promise.all([
     liveKal ? Promise.resolve(liveKal) : getKalshiOrderbook(kalshiTicker),
     livePm ? Promise.resolve(null) : getPolymarketBooks([pmYesToken]),

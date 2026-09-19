@@ -262,6 +262,11 @@ function repriceInPlay(): Promise<void> {
 // profitable (a handful) and on its own slow cadence — depth is for sizing, not for the
 // abort decision, which re-quotes prices independently at order time.
 const DEPTH_REFRESH_MS = 3_000;
+// Polymarket markets whose live feed is healthy and updated within the last 15s but carries
+// no offer that can fill the venue minimum on EITHER side. Rebuilt on every repricing pass
+// and read by assemble(), so an edge computed from a leftover polled quote never reaches the
+// list. Keyed by market id because that is what the pair carries.
+const _pmNoOffer = new Set<string>();
 const _depthByKey = new Map<string, number>();
 let _depthAt = 0;
 let _depthInFlight: Promise<void> | null = null;
@@ -679,11 +684,21 @@ function applyLiveBookPrices(disc: Discovery): number {
   }
   for (const m of disc.matchedPm) {
     const live = m.yesTokenId ? getLivePolymarketBook(m.yesTokenId) : undefined;
-    if (!live) continue;
+    if (!live) { _pmNoOffer.delete(m.id); continue; }   // no feed: the polled quote is all there is
     // Same basis the polled path uses: the price at which the venue minimum can be filled.
     const yes = priceForSize(polymarketAskLadder(live, 'yes'), MIN_ORDER_CONTRACTS);
     const no = priceForSize(polymarketAskLadder(live, 'no'), MIN_ORDER_CONTRACTS);
-    if (yes === null || no === null) continue;
+    if (yes === null || no === null) {
+      // Neither side can fill even the venue minimum, on a feed that is healthy and was
+      // updated within the last 15s. That is not missing data to paper over with the last
+      // polled quote — it is Polymarket saying there is nothing to buy. Leaving the stale
+      // quote standing is what advertised "+22.30%, spread 20c, $0k book" on a game whose
+      // book had emptied out, and the order path then refused it 1ms later.
+      if (yes === null && no === null) _pmNoOffer.add(m.id);
+      else _pmNoOffer.delete(m.id);
+      continue;
+    }
+    _pmNoOffer.delete(m.id);
     m.yesPriceCents = yes;
     m.noPriceCents = no;
     priced++;
@@ -781,7 +796,10 @@ function assemble(disc: Discovery): OpportunitiesResponse {
       // both legs pay on the same outcome, which the identity gate above now prevents.
       const untradeableBook = pmSum > 200 || kalSum > 200 || pmSum < 90 || kalSum < 90;
 
-      const filteredOut = dateTooFar || priceTooFar || unhedgeableDraw || untradeableBook;
+      // The live feed says this Polymarket book is empty, so the quote driving this edge is
+      // a leftover from the last poll rather than a price anyone is offering.
+      const pmNoOffer = _pmNoOffer.has(p.polymarket.id);
+      const filteredOut = dateTooFar || priceTooFar || unhedgeableDraw || untradeableBook || pmNoOffer;
 
       allPairsDetail.push({
         category: cat,
