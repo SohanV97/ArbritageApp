@@ -20,7 +20,7 @@
 import { gzipSync } from 'node:zlib';
 import { getPolymarketMarketsForAllCategories, refreshPolymarketPrices, getPolymarketBooks } from '@/api/polymarket';
 import { getKalshiMarketsForAllCategories, refreshKalshiPrices, getKalshiOrderbook } from '@/api/kalshi';
-import { warmPolymarketTrading } from '@/api/polymarket-trading';
+import { warmPolymarketTrading, polymarketPause } from '@/api/polymarket-trading';
 import { fillableContracts, kalshiAskLadder, polymarketAskLadder } from '@/lib/depth';
 import { estimateKalshiFeeCents, estimatePolymarketFeeCents } from '@/lib/fees';
 import { sizeByRisk } from '@/lib/sizing';
@@ -359,6 +359,13 @@ function maybeAutoExecute(opps: ArbitrageOpportunity[]): void {
   _lastTickEdges = qualifyingNow;
 
   if (!cfg.enabled || opps.length === 0) return;
+
+  // Polymarket is refusing every new order exchange-wide. Attempting anyway signs an order,
+  // pays a round trip to London, burns the pair's hold and writes a record that tells a
+  // trader nothing they can act on — five of those landed in four seconds during the
+  // 2026-09-19 cancel-only incident. Sit it out instead: the pause lifts on its own and the
+  // next tick picks straight back up, with the edge re-checked against fresh books.
+  if (polymarketPause().paused) return;
 
   for (const opp of opps) {
     if (opp.edgePercent <= 0 || opp.edgePercent < cfg.thresholdPercent) break;   // sorted desc
@@ -1107,5 +1114,8 @@ export function engineHealth() {
     opportunities: _cache?.body.opportunities.length ?? 0,
     phases: phaseStats(),
     lastAttempt: lastAttemptNeedsAttention(),
+    // Surfaced so a venue-wide outage reads as one banner rather than as a stream of
+    // identical per-trade failures.
+    polymarket: polymarketPause(),
   };
 }

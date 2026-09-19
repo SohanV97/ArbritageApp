@@ -1144,6 +1144,9 @@ export default function Home() {
   // Whether the engine's stream is live. A drop must never blank the prices — the last ones
   // are still the best information available, and this drives a badge that says they are old.
   const [connected, setConnected] = useState(false);
+  // Polymarket pauses its whole exchange during incidents. Held as a plain boolean so the
+  // once-a-second health frame re-renders only when the state actually changes.
+  const [pmPaused, setPmPaused] = useState(false);
   // 'sports' is the default view: politics settles months out, so those markets dominate
   // the list by count while being the least actionable day to day.
   const [view, setView] = useState<'sports' | 'opportunities' | 'pairs' | 'trades'>('sports');
@@ -1336,7 +1339,10 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
       try {
         const h = JSON.parse((ev as MessageEvent).data) as {
           autoExec?: { records?: ExecLogEntry[] };
+          polymarket?: { paused?: boolean };
         };
+        const paused = h.polymarket?.paused === true;
+        setPmPaused(prev => (prev === paused ? prev : paused));
         // Trades the engine made while this tab was not the one deciding. This is what
         // replaces the second poll, which asked for records once a second while armed.
         const records = h.autoExec?.records;
@@ -1759,6 +1765,32 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
           </button>
         </div>
       </div>
+
+      {/* A venue-wide pause is not a per-trade failure, and showing it as one sends you
+          looking through .env.local for a setting that was never wrong. Say it once, here. */}
+      {pmPaused && (
+        <div
+          style={{ background: '#f8717111', border: '1px solid #f8717144' }}
+          className="mt-3 rounded-lg px-4 py-2.5 flex items-start gap-2"
+        >
+          <span className="text-sm">⏸</span>
+          <p className="text-xs text-[#f87171]">
+            <span className="font-semibold">Polymarket has paused trading exchange-wide.</span>{' '}
+            Every market is refusing new orders, for every account — this is not your keys,
+            your balance or this app. Auto-execute is holding off and resumes by itself the
+            moment orders are accepted again. Kalshi is unaffected, and because the Polymarket
+            leg is attempted first, nothing is left exposed.{' '}
+            <a
+              href="https://status.polymarket.com"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline hover:text-white"
+            >
+              status.polymarket.com
+            </a>
+          </p>
+        </div>
+      )}
 
       {/* Connection test results */}
       {connTest.state === 'done' && connTest.result && (

@@ -238,11 +238,59 @@ function explainGeoblock(raw: string): string | undefined {
     `implement. Kalshi is already US-regulated, so the Kalshi leg is unaffected.`;
 }
 
+/**
+ * Polymarket pauses the WHOLE exchange during incidents — not one market. While it is paused
+ * the CLOB refuses every new order with "trading is disabled" (or "cancel-only"), whatever
+ * the market, the key or the balance.
+ *
+ * Verified on 2026-09-19: five different games were rejected identically inside four seconds,
+ * a $1 probe order on a sixth market was rejected the same way, and every one of those
+ * markets read accepting_orders: true. status.polymarket.com showed "Trading Degraded —
+ * cancel-only mode" across exactly that window.
+ *
+ * There is no reason to keep firing at a venue in that state: each attempt signs an order and
+ * pays a round trip, burns the opportunity it was called on, and walks toward a rate limit. So
+ * the first rejection latches a short pause and the attempts behind it are refused locally,
+ * for free, until it lifts.
+ */
+const EXCHANGE_PAUSE_MS = 20_000;
+let pausedUntil = 0;
+let pausedReason = '';
+
+function isExchangePause(code: string, message: string): boolean {
+  const both = `${code} ${message}`;
+  return /trading is (currently )?disabled|cancel[-\s]?only|post[-\s]?only mode/i.test(both)
+    || /trading_disabled|cancel_only|post_only_mode/i.test(both);
+}
+
+/** Read by the engine so the UI can name the venue's state instead of a per-trade error. */
+export function polymarketPause(): { paused: boolean; msRemaining: number; reason: string } {
+  const msRemaining = Math.max(0, pausedUntil - Date.now());
+  return { paused: msRemaining > 0, msRemaining, reason: pausedReason };
+}
+
+/**
+ * Says plainly that this one is not a configuration problem. Without it the venue's four-word
+ * rejection reads exactly like our own ARB_TRADING_ENABLED kill switch, and the obvious next
+ * move is to go hunting through .env.local for a setting that was never wrong.
+ */
+function explainExchangePause(raw: string): string {
+  return `${raw}
+
+` +
+    `Polymarket has paused trading across the whole exchange. This is not your keys, your ` +
+    `balance or this app: every market refuses new orders while it lasts, for every account. ` +
+    `Check status.polymarket.com — it lifts on its own, and this app retries by itself once ` +
+    `it does. The Polymarket leg is attempted first precisely so this costs nothing: no ` +
+    `Kalshi order was sent, so nothing is exposed.`;
+}
+
 // The venue rejects with a machine-readable code; turn the ones a trader can act on into
 // instructions rather than passing the bare enum through to the UI.
 function mapOrderError(code: string, message: string): string {
   const mismatch = explainSignerMismatch(message) ?? explainGeoblock(message);
   if (mismatch) return mismatch;
+  if (isExchangePause(code, message)) return explainExchangePause(message);
   switch (code) {
     case 'insufficient_balance_or_allowance':
       return `${message} — either the wallet is short of collateral, or it has not granted the ` +
@@ -416,6 +464,20 @@ export async function placePolymarketOrder(req: PolymarketOrderRequest): Promise
     };
   }
 
+  // Opening orders only. A SELL is an unwind of a position that already exists, and refusing
+  // one on a local guess about the venue would leave it open — the same reasoning as the size
+  // guard above. Attempting a sell into a paused venue costs nothing and might close it.
+  if (req.action !== 'sell') {
+    const pause = polymarketPause();
+    if (pause.paused) {
+      return {
+        ok: false,
+        error: `Not sent — Polymarket is paused exchange-wide; retrying in ` +
+          `${Math.ceil(pause.msRemaining / 1000)}s. ${explainExchangePause(pause.reason)}`,
+      };
+    }
+  }
+
   const init = await getSecureClient();
   if ('error' in init) return { ok: false, error: init.error };
 
@@ -433,8 +495,19 @@ export async function placePolymarketOrder(req: PolymarketOrderRequest): Promise
     });
 
     if (!result.ok) {
+      if (isExchangePause(result.code, result.message)) {
+        // The venue tells us how long to wait when it knows; 20s is the fallback.
+        const hint = Number((result as { retryAfter?: number }).retryAfter);
+        pausedUntil = Date.now() + (Number.isFinite(hint) && hint > 0 ? hint * 1000 : EXCHANGE_PAUSE_MS);
+        pausedReason = result.message;
+      }
       return { ok: false, error: mapOrderError(result.code, result.message) };
     }
+
+    // An accepted order proves the exchange is back, so stop refusing locally at once rather
+    // than sitting out the rest of a pause that has already lifted.
+    pausedUntil = 0;
+    pausedReason = '';
 
     // takingAmount counts fills AT PLACEMENT ONLY. Polymarket's own note on it: "Later fills
     // of a resting order create new trades that are not listed here." So an order accepted
@@ -512,6 +585,16 @@ export async function placePolymarketOrder(req: PolymarketOrderRequest): Promise
     };
   } catch (err) {
     const raw = describeError(err);
+    // The SDK THROWS a venue rejection rather than returning one, so an exchange-wide pause
+    // arrives here and never reaches the !result.ok branch above. Both paths have to latch,
+    // or the breaker never trips: the first version of this fix only handled the returned
+    // form, and a live probe against the paused venue still printed the bare message.
+    if (isExchangePause('', raw)) {
+      const hint = Number((err as { retryAfter?: number } | null)?.retryAfter);
+      pausedUntil = Date.now() + (Number.isFinite(hint) && hint > 0 ? hint * 1000 : EXCHANGE_PAUSE_MS);
+      pausedReason = raw;
+      return { ok: false, error: explainExchangePause(raw) };
+    }
     return { ok: false, error: explainSignerMismatch(raw) ?? explainGeoblock(raw) ?? raw };
   }
 }
