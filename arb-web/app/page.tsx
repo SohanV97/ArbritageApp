@@ -931,6 +931,126 @@ const STATUS_STYLE: Record<string, { label: string; color: string; bg: string }>
  * venue only could read as a success. Status here is derived from the FILLS, and anything
  * that is not a hedge is labelled as what it actually is.
  */
+interface KalshiPositionRow { ticker: string; contracts: number; exposureDollars: number; exchangeIndex?: number }
+interface PolymarketPositionRow {
+  asset: string; title: string; outcome: string; size: number;
+  avgPriceCents: number; curPriceCents: number; slug?: string;
+}
+interface PositionsResponse {
+  kalshi: KalshiPositionRow[];
+  polymarket: PolymarketPositionRow[];
+  kalshiError?: string;
+  polymarketError?: string;
+  at?: string;
+}
+
+/**
+ * What is actually held, at both venues, side by side.
+ *
+ * This screen exists because of a specific, expensive confusion. A hedge went on correctly —
+ * 89 shares on Polymarket against 89 contracts on Kalshi — and then could not be found: a
+ * FILLED Polymarket order is no longer an order, it is a position, so looking under "orders"
+ * shows an empty list. The trade read as naked on Kalshi, was closed by hand 46 seconds
+ * later, and a hedge that was going to clear about 47c was unwound for roughly $4 of fees
+ * and spread. Showing both legs in one place is the entire point.
+ */
+function PositionsScreen({ data, busy, onRefresh }: {
+  data: PositionsResponse | null;
+  busy: boolean;
+  onRefresh: () => void;
+}) {
+  const kal = data?.kalshi ?? [];
+  const pm = data?.polymarket ?? [];
+  const nothing = data && kal.length === 0 && pm.length === 0 && !data.kalshiError && !data.polymarketError;
+
+  const Panel = ({ title, note, error, children }: {
+    title: string; note: string; error?: string; children: React.ReactNode;
+  }) => (
+    <div style={{ background: 'var(--surface)', border: '1px solid var(--border)' }} className="rounded-xl p-4 flex-1 min-w-0">
+      <div className="flex items-baseline justify-between gap-2 mb-1">
+        <h3 className="text-sm font-semibold">{title}</h3>
+      </div>
+      <p className="text-xs text-[--text-muted] mb-3">{note}</p>
+      {error
+        ? <p className="text-xs text-[#f87171]">{error}</p>
+        : <div className="flex flex-col gap-2">{children}</div>}
+    </div>
+  );
+
+  return (
+    <div className="mt-2">
+      <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
+        <div>
+          <h2 className="text-sm font-semibold">Open positions</h2>
+          <p className="text-xs text-[--text-muted]">
+            Read live from both venues{data?.at ? ` · ${new Date(data.at).toLocaleTimeString()}` : ''}. Refreshes every 15s.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={onRefresh}
+          disabled={busy}
+          style={{ background: 'var(--card)', border: '1px solid var(--border)' }}
+          className="px-3 py-1.5 rounded-lg text-sm font-medium hover:border-[#8b949e] transition-colors disabled:opacity-50"
+        >
+          {busy ? 'Reading…' : 'Refresh'}
+        </button>
+      </div>
+
+      {nothing && (
+        <div style={{ background: 'var(--surface)', border: '1px solid var(--border)' }} className="rounded-xl px-4 py-6 mb-3">
+          <p className="text-sm">Nothing open at either venue.</p>
+          <p className="text-xs text-[--text-muted] mt-1">
+            Settled trades disappear from here — the Trades tab keeps the history.
+          </p>
+        </div>
+      )}
+
+      <div className="flex gap-3 flex-wrap">
+        <Panel
+          title="Kalshi"
+          note="Contracts held. Settles automatically when the game finishes."
+          error={data?.kalshiError}
+        >
+          {kal.length === 0 && !data?.kalshiError && <p className="text-xs text-[--text-muted]">No open contracts.</p>}
+          {kal.map(p => (
+            <div key={p.ticker} className="flex items-center justify-between gap-3 text-xs font-mono">
+              <span className="truncate">{p.ticker}</span>
+              <span className="flex-shrink-0">{p.contracts} · {fmtUsd(p.exposureDollars)}</span>
+            </div>
+          ))}
+        </Panel>
+
+        <Panel
+          title="Polymarket"
+          note="Shares held. A filled order shows up HERE, not under Orders — an order that filled is not an order any more."
+          error={data?.polymarketError}
+        >
+          {pm.length === 0 && !data?.polymarketError && <p className="text-xs text-[--text-muted]">No open shares.</p>}
+          {pm.map(p => (
+            <div key={p.asset} className="flex items-center justify-between gap-3 text-xs">
+              <span className="truncate">
+                <span className="font-medium">{p.outcome}</span>
+                <span className="text-[--text-muted]"> · {p.title}</span>
+              </span>
+              <span className="flex-shrink-0 font-mono">
+                {p.size} @ {p.avgPriceCents}¢
+                <span className="text-[--text-muted]"> → {p.curPriceCents}¢</span>
+              </span>
+            </div>
+          ))}
+        </Panel>
+      </div>
+
+      <p className="text-xs text-[--text-muted] mt-3">
+        A hedged trade shows one line on each side. If only one side is listed, that leg is
+        unhedged — check the Trades tab for what the app thinks it did before closing anything
+        by hand, because closing a hedge that was fine costs the spread and the fees on both legs.
+      </p>
+    </div>
+  );
+}
+
 function TradesScreen({ log }: { log: ExecLogEntry[] }) {
   const traded = log.filter(e => e.result.trade && e.result.trade.legs.length > 0);
 
@@ -1147,9 +1267,24 @@ export default function Home() {
   // Polymarket pauses its whole exchange during incidents. Held as a plain boolean so the
   // once-a-second health frame re-renders only when the state actually changes.
   const [pmPaused, setPmPaused] = useState(false);
+  // What is actually held at both venues. Fetched on demand rather than streamed: it is a
+  // two-venue round trip, and it only matters when someone is looking at it.
+  const [positions, setPositions] = useState<PositionsResponse | null>(null);
+  const [positionsBusy, setPositionsBusy] = useState(false);
+  const loadPositions = useCallback(async () => {
+    setPositionsBusy(true);
+    try {
+      const res = await fetch(`${ENGINE_URL}/positions`);
+      setPositions(await res.json() as PositionsResponse);
+    } catch {
+      setPositions({ kalshi: [], polymarket: [], kalshiError: 'Engine unreachable', polymarketError: 'Engine unreachable' });
+    } finally {
+      setPositionsBusy(false);
+    }
+  }, []);
   // 'sports' is the default view: politics settles months out, so those markets dominate
   // the list by count while being the least actionable day to day.
-  const [view, setView] = useState<'sports' | 'opportunities' | 'pairs' | 'trades'>('sports');
+  const [view, setView] = useState<'sports' | 'opportunities' | 'pairs' | 'trades' | 'positions'>('sports');
   // Every listed opportunity is already profitable, so the bands narrow by size only.
   const [edgeFilter, setEdgeFilter] = useState<'all' | 'strong' | 'arb'>('all');
   const [catFilter, setCatFilter] = useState<Category | 'all'>('all');
@@ -1471,6 +1606,15 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
 
 
   // Both opportunity tabs share the same controls and card list; only their scope differs.
+  // Only while the tab is open: two venue round trips are not worth paying for a screen
+  // nobody is looking at, and Polymarket's data API rate-limits a caller that asks too often.
+  useEffect(() => {
+    if (view !== 'positions') return;
+    void loadPositions();
+    const t = setInterval(() => { void loadPositions(); }, 15_000);
+    return () => clearInterval(t);
+  }, [view, loadPositions]);
+
   const isOppView = view === 'sports' || view === 'opportunities';
   // Only executions that actually placed something are trades; refused attempts are not.
   const tradeCount = execLog.filter(e => e.result.trade && e.result.trade.legs.length > 0).length;
@@ -1581,12 +1725,13 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
 
       {/* View tabs */}
       <div className="flex gap-1 mb-5 p-1 rounded-xl w-fit" style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}>
-        {(['sports', 'opportunities', 'pairs', 'trades'] as const).map(v => {
+        {(['sports', 'opportunities', 'pairs', 'trades', 'positions'] as const).map(v => {
           const sportsCount = data ? data.opportunities.filter(o => o.pair.polymarket.category !== 'politics').length : 0;
           const label =
             v === 'sports' ? `Sports${data ? ` (${sportsCount})` : ''}` :
             v === 'opportunities' ? `All${data ? ` (${data.opportunities.length})` : ''}` :
             v === 'trades' ? `Trades${tradeCount ? ` (${tradeCount})` : ''}` :
+            v === 'positions' ? `Positions${positions ? ` (${positions.kalshi.length + positions.polymarket.length})` : ''}` :
             // stats.matchedPairs is always sent; pairsDetail only when this tab is open.
             `Matched Pairs${data ? ` (${data.stats?.matchedPairs ?? 0})` : ''}`;
           return (
@@ -1990,6 +2135,10 @@ const [persistMap, setPersistMap] = useState<Map<string, number>>(new Map());
       )}
 
       {view === 'trades' && <TradesScreen log={execLog} />}
+
+      {view === 'positions' && (
+        <PositionsScreen data={positions} busy={positionsBusy} onRefresh={loadPositions} />
+      )}
 
       {view === 'pairs' && (
         <>

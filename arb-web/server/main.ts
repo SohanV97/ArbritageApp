@@ -125,6 +125,27 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
+  // What is actually held, at both venues, right now.
+  //
+  // A filled Polymarket order stops being an order and becomes a position, so a hedge that
+  // went on perfectly well can look like nothing happened if you go looking under "orders".
+  // That is not hypothetical: it is how a good 89-share hedge got unwound by hand for about
+  // $4 in fees and spread. Both legs, one request, so the question never has to be guessed at.
+  if (path === '/positions' && req.method === 'GET') {
+    const [{ getKalshiPositions }, { getPolymarketPositions }] = await Promise.all([
+      import('@/api/kalshi-trading'),
+      import('@/api/polymarket-trading'),
+    ]);
+    const [kal, pm] = await Promise.all([getKalshiPositions(), getPolymarketPositions()]);
+    return json(res, 200, {
+      kalshi: kal.ok ? kal.positions : [],
+      kalshiError: kal.ok ? undefined : kal.error,
+      polymarket: pm.ok ? pm.positions : [],
+      polymarketError: pm.ok ? undefined : pm.error,
+      at: new Date().toISOString(),
+    });
+  }
+
   // Book health. These are how a corrupted feed is caught before it prices an order, so
   // they belong with the engine rather than with the UI that used to host them.
   if (path === '/diag/books' && req.method === 'GET') {

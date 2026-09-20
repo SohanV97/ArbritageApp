@@ -612,6 +612,71 @@ export async function placePolymarketOrder(req: PolymarketOrderRequest): Promise
  * warm-up or order placement. It is invoked only by `npm run setup:approvals`. Polymarket's
  * relayer pays the gas, so the wallet needs no MATIC.
  */
+export interface PolymarketPosition {
+  /** CLOB token id of the outcome held. */
+  asset: string;
+  title: string;
+  outcome: string;
+  /** Shares held. Fractional is normal. */
+  size: number;
+  avgPriceCents: number;
+  /** Current mark, in cents. 0 on a resolved loser, 100 on a resolved winner. */
+  curPriceCents: number;
+  slug?: string;
+}
+
+/**
+ * What this wallet actually holds on Polymarket right now.
+ *
+ * This exists because not having it cost real money. A hedge went on correctly — 89 shares
+ * bought on Polymarket, 89 contracts on Kalshi — and then could not be SEEN: a filled
+ * Polymarket order stops being an order and becomes a position, so looking under "orders"
+ * shows nothing at all. The trade looked naked on Kalshi, was unwound by hand 46 seconds
+ * later, and a hedge that was going to clear ~$0.47 was closed for about $4 in fees and
+ * spread. Being able to see both legs at once is the whole fix.
+ *
+ * Read from the public data API rather than the SDK: it needs no signing, it reports the
+ * proxy wallet's holdings directly, and it stays readable when the CLOB is paused.
+ */
+export async function getPolymarketPositions(): Promise<
+  { ok: true; positions: PolymarketPosition[] } | { ok: false; error: string }
+> {
+  const wallet = process.env.POLYMARKET_FUNDER_ADDRESS;
+  if (!wallet) return { ok: false, error: 'POLYMARKET_FUNDER_ADDRESS not set' };
+  try {
+    const res = await fetch(
+      `https://data-api.polymarket.com/positions?user=${encodeURIComponent(wallet)}&sizeThreshold=0.01`,
+      { signal: AbortSignal.timeout(8000) },
+    );
+    // A rate limit is a wait, not a failure, and saying so keeps it from reading like
+    // a broken hedge at exactly the moment someone is checking whether their hedge is intact.
+    if (res.status === 429) return { ok: false, error: `Polymarket rate-limited this read; positions are unchanged — retry in a moment.` };
+    if (!res.ok) return { ok: false, error: `data API returned HTTP ${res.status}` };
+    const raw = await res.json() as {
+      asset?: string; title?: string; outcome?: string; size?: number;
+      avgPrice?: number; curPrice?: number; slug?: string;
+    }[];
+    if (!Array.isArray(raw)) return { ok: false, error: 'data API returned an unexpected shape' };
+    const positions: PolymarketPosition[] = [];
+    for (const p of raw) {
+      const size = Number(p?.size);
+      if (!Number.isFinite(size) || size <= 0) continue;
+      positions.push({
+        asset: String(p?.asset ?? ''),
+        title: String(p?.title ?? ''),
+        outcome: String(p?.outcome ?? ''),
+        size,
+        avgPriceCents: Math.round((Number(p?.avgPrice) || 0) * 100),
+        curPriceCents: Math.round((Number(p?.curPrice) || 0) * 100),
+        slug: p?.slug ? String(p.slug) : undefined,
+      });
+    }
+    return { ok: true, positions };
+  } catch (err) {
+    return { ok: false, error: describeError(err) };
+  }
+}
+
 export async function setupPolymarketApprovals(): Promise<{ ok: boolean; alreadyApproved?: boolean; error?: string }> {
   const init = await getSecureClient();
   if ('error' in init) return { ok: false, error: init.error };
