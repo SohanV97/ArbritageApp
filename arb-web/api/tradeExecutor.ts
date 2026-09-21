@@ -14,7 +14,9 @@ import type { ArbitrageOpportunity } from '@/lib/market-types';
 import { MIN_ORDER_CONTRACTS } from '@/lib/market-types';
 import {
   placeKalshiOrder, testKalshiAuth, getKalshiOrderFill,
+  cachedKalshiAuth, invalidateKalshiAuth,
 } from '@/api/kalshi-trading';
+import type { KalshiAuthTest } from '@/api/kalshi-trading';
 import {
   placePolymarketOrder, polymarketFundingDollars, invalidatePolymarketFunding,
   polymarketOrderFill,
@@ -128,6 +130,15 @@ export interface ExecuteOutcome { body: ExecuteResponse; status: number }
 // How many times to try closing a leg that ended up alone. Three passes with a fresh book
 // each time covers liquidity that moved between the read and the order; past that, the
 // book genuinely cannot absorb it and a human needs to know.
+// How old a cached Kalshi balance may be and still size an order, and how far inside that
+// balance the order must sit before the cached reading is trusted at all. Two seconds is well
+// inside the 3s refresh, and 2x means an order never consumes more than half of what the
+// cache claims — anything closer re-reads live, because the Polymarket leg is already
+// committed by the time Kalshi could refuse. 2.5s clears the 1.5s refresh with room for
+// jitter, so a healthy poller keeps the fast path armed while two failed refreshes drop it.
+const KALSHI_BALANCE_MAX_AGE_MS = 2_500;
+const KALSHI_CACHE_TRUST_FACTOR = 2;
+
 const UNWIND_ATTEMPTS = 3;
 
 function scrubSecrets(s: string | undefined): string | undefined {
@@ -350,7 +361,13 @@ async function executeArbInner(req: ExecuteRequest, rec: TradeAttempt): Promise<
   // that has nothing to do with the price. Overlapped it costs whatever the slower of the
   // two takes, which is usually the books, and nothing is traded on staler information:
   // both answers are still awaited before any order is sent.
-  const fundingPromise = Promise.all([testKalshiAuth(), polymarketFundingDollars()]);
+  // A recent reading resolves instantly instead of paying a round trip. Whether it is good
+  // enough to SIZE from is decided after the books, once the order's cost is known.
+  const cachedAuth = cachedKalshiAuth(KALSHI_BALANCE_MAX_AGE_MS);
+  const fundingPromise = Promise.all([
+    cachedAuth ? Promise.resolve(cachedAuth) : testKalshiAuth(),
+    polymarketFundingDollars(),
+  ]);
   // An unhandled rejection here would be fatal before the await below is reached.
   fundingPromise.catch(() => { /* surfaced where it is awaited */ });
 
@@ -598,9 +615,26 @@ async function executeArbInner(req: ExecuteRequest, rec: TradeAttempt): Promise<
   // before shards were tracked, say — must not quietly inherit it. Taking the smallest shard
   // balance can only refuse a trade that would have been fine; the opposite error sends one
   // leg to a venue that cannot pay for it.
-  const worstShardDollars = shards ? Math.min(...Object.values(shards)) : undefined;
-  const shardFundsDollars = shard !== undefined ? shards?.[shard] : worstShardDollars;
-  const kalFunds = (shardFundsDollars ?? kalAuth.balanceDollars ?? 0) * 100;
+  const fundsFrom = (auth: KalshiAuthTest, by: Record<number, number> | undefined): number => {
+    const worst = by ? Math.min(...Object.values(by)) : undefined;
+    const onShard = shard !== undefined ? by?.[shard] : worst;
+    return (onShard ?? auth.balanceDollars ?? 0) * 100;
+  };
+  let kalFunds = fundsFrom(kalAuth, shards);
+
+  // The cache may only PERMIT what it clearly covers. If this order would take more than half
+  // of what the cached reading claims, that reading is not a safe basis for sizing: a balance
+  // that dropped since it was taken — a manual trade, a shard transfer — would size this leg
+  // too big, and Kalshi refusing AFTER the Polymarket leg filled is a naked position. Only
+  // that case pays the round trip; a comfortable balance never does.
+  if (cachedAuth && kalFunds < kalCostCents * KALSHI_CACHE_TRUST_FACTOR) {
+    const liveAuth = await testKalshiAuth();
+    if (liveAuth.ok) {
+      shards = liveAuth.balanceByShard;
+      kalFunds = fundsFrom(liveAuth, shards);
+    }
+    rec.timings = { ...(rec.timings ?? {}), balanceRecheckMs: Date.now() - _fundStart };
+  }
   const pmFunds = (pmDollars ?? 0) * 100;
   // Trade what the account can afford, rather than refusing what it cannot.
   //
@@ -707,6 +741,7 @@ async function executeArbInner(req: ExecuteRequest, rec: TradeAttempt): Promise<
   if (pmFilled <= 0) {
     // Nothing was bought anywhere, so this is a clean miss rather than a position.
     invalidatePolymarketFunding();
+    invalidateKalshiAuth();
     const body: ExecuteResponse = {
       kalshi: { ok: false, error: 'Not placed — Polymarket leg did not fill' },
       polymarket: { ...pmRaw, error: scrubSecrets(pmRaw.error) },
@@ -750,6 +785,7 @@ async function executeArbInner(req: ExecuteRequest, rec: TradeAttempt): Promise<
   // A fill changes the balance, so drop the cached reading rather than let the next order
   // size itself against money that has already been spent.
   invalidatePolymarketFunding();
+  invalidateKalshiAuth();
 
   // Scrub any secret material from error strings before they reach the client/logs.
   const kalshiResult: LegResult = { ...kalshiRaw, error: scrubSecrets(kalshiRaw.error) };
@@ -870,6 +906,7 @@ async function executeArbInner(req: ExecuteRequest, rec: TradeAttempt): Promise<
     }
 
     invalidatePolymarketFunding();
+    invalidateKalshiAuth();
     if (remaining <= 0) {
       hedged = false;
       note = `${venue} filled ${qty} alone and the position was CLOSED automatically ` +

@@ -136,6 +136,8 @@ export interface TradeAttempt {
   timings?: {
     /** Time still spent waiting on the funding check after the books were read. */
     fundingWaitMs?: number;
+    /** Set only when a cached balance was too thin to size from and a live read was paid for. */
+    balanceRecheckMs?: number;
   };
 
   /** Wall time from the start of executeArb to the response. */

@@ -16,6 +16,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { loadEnv } from './loadEnv';
 import { installHttpAgent, startConnectionWarmth, stopConnectionWarmth } from './httpAgent';
 import { startShardMaintenance, stopShardMaintenance } from './shardMaintenance';
+import { startKalshiBalanceRefresh, stopKalshiBalanceRefresh } from '@/api/kalshi-trading';
 
 // Before ANY module that reads process.env at import time.
 // Before any request is made, including the SDK's: it uses global fetch, which reads this.
@@ -327,6 +328,9 @@ server.listen(PORT, HOST, () => {
   console.log(`[engine] listening on http://${HOST}:${PORT}`);
   console.log(`[engine] trading ${process.env.ARB_TRADING_ENABLED === 'false' ? 'DISABLED' : 'ENABLED'}`);
   startConnectionWarmth();
+  // Keeps the Kalshi balance warm so the order path reads it instead of waiting on it. It was
+  // measured at p90 198ms and 5.4s at worst, sitting between seeing an edge and sending.
+  startKalshiBalanceRefresh();
   // Keeps collateral where orders will need it, so the order path never waits on a transfer.
   startShardMaintenance(shardsInUse);
   void startEngine().then(() => console.log('[engine] first build complete'));
@@ -348,6 +352,7 @@ async function shutdown(signal: string): Promise<void> {
   hard.unref?.();
   try {
     stopConnectionWarmth();
+    stopKalshiBalanceRefresh();
     stopShardMaintenance();
     server.close();
     await stopEngine();

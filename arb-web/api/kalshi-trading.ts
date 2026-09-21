@@ -109,6 +109,54 @@ function kalshiErrorText(status: number, body: string): string {
 }
 
 // Verifies key + signature + account access without placing any order.
+// ─── balance, kept warm off the critical path ────────────────────────────────
+//
+// The balance read is a live round trip to Kalshi, and it sat between seeing an edge and
+// sending the first order. Overlapping it with the book reads hid it while those were slow,
+// but as the websocket books took over the books stopped being slow — measured p50 2ms on
+// live/live — and the balance became the whole latency: p90 198ms, and 5461ms at its worst.
+//
+// So read it on a timer instead, and let the order path use that reading when it is recent.
+// The cache may only ever PERMIT a trade it clearly covers; the caller re-reads live when
+// the margin is thin, because sizing off a balance that has since dropped is how a Kalshi
+// leg gets refused AFTER the Polymarket leg has already filled. It is invalidated the
+// moment anything known to move money happens — our own fills, and shard transfers.
+let _authCache: { at: number; value: KalshiAuthTest } | null = null;
+let _authTimer: ReturnType<typeof setInterval> | null = null;
+
+/** Drop the cached balance. Call after anything that moves money on Kalshi. */
+export function invalidateKalshiAuth(): void {
+  _authCache = null;
+}
+
+/** How old the cached balance is, in ms, or undefined if there is none. Diagnostics only. */
+export function kalshiAuthCacheAgeMs(): number | undefined {
+  return _authCache ? Date.now() - _authCache.at : undefined;
+}
+
+/** The last good reading, if it is younger than maxAgeMs. */
+export function cachedKalshiAuth(maxAgeMs: number): KalshiAuthTest | undefined {
+  if (!_authCache) return undefined;
+  return Date.now() - _authCache.at <= maxAgeMs ? _authCache.value : undefined;
+}
+
+export function startKalshiBalanceRefresh(intervalMs = 1_500): void {
+  if (_authTimer) return;
+  const run = (): void => {
+    void testKalshiAuth()
+      .then(v => { if (v.ok) _authCache = { at: Date.now(), value: v }; })
+      .catch(() => { /* a failed refresh just leaves the previous reading to age out */ });
+  };
+  run();
+  _authTimer = setInterval(run, intervalMs);
+  // Never hold the process open for a balance poll.
+  _authTimer.unref?.();
+}
+
+export function stopKalshiBalanceRefresh(): void {
+  if (_authTimer) { clearInterval(_authTimer); _authTimer = null; }
+}
+
 export async function testKalshiAuth(): Promise<KalshiAuthTest> {
   const path = '/trade-api/v2/portfolio/balance';
   const signed = signKalshiRequest('GET', path);

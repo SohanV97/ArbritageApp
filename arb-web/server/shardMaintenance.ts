@@ -18,6 +18,7 @@
  */
 import { testKalshiAuth, transferBetweenKalshiShards } from '@/api/kalshi-trading';
 import { planTransfers } from '@/lib/shardAllocation';
+import { invalidateKalshiAuth } from '@/api/kalshi-trading';
 
 const CHECK_MS = 60_000;
 /** Never bother moving less than this; the round trip is not worth it. */
@@ -38,6 +39,9 @@ async function rebalanceOnce(neededShards: number[], floorDollars: number): Prom
     for (const move of plan) {
       const res = await transferBetweenKalshiShards(move.from, move.to, move.dollars);
       console.log('[shards] top-up', JSON.stringify({ ...move, ok: res.ok, error: res.error }));
+      // Per-shard balances just changed; a cached reading would size the next order against
+      // money that is no longer on that shard.
+      invalidateKalshiAuth();
       if (!res.ok) break;   // a failure now will fail again; try on the next tick
     }
   } catch (err) {

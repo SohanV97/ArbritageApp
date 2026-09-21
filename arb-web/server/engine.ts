@@ -21,6 +21,7 @@ import { gzipSync } from 'node:zlib';
 import { getPolymarketMarketsForAllCategories, refreshPolymarketPrices, getPolymarketBooks } from '@/api/polymarket';
 import { getKalshiMarketsForAllCategories, refreshKalshiPrices, getKalshiOrderbook } from '@/api/kalshi';
 import { warmPolymarketTrading, polymarketPause } from '@/api/polymarket-trading';
+import { kalshiAuthCacheAgeMs } from '@/api/kalshi-trading';
 import { fillableContracts, kalshiAskLadder, polymarketAskLadder } from '@/lib/depth';
 import { estimateKalshiFeeCents, estimatePolymarketFeeCents } from '@/lib/fees';
 import { sizeByRisk } from '@/lib/sizing';
@@ -214,11 +215,28 @@ function repriceInPlay(): Promise<void> {
   const pmInPlay = disc.matchedPm.filter(isInPlay);
   const kalInPlay = disc.matchedKalshi.filter(isInPlay);
 
+  // Plus whatever is currently showing an edge, in-play or not.
+  //
+  // Subscribing to in-play markets alone left the order path fetching books over HTTP for the
+  // markets it was actually trading: measured across 83 recorded attempts, Kalshi came from a
+  // live book in only 13 of them. That costs real time — revalidation is p50 143ms on
+  // fetch/fetch against p50 2ms on live/live — and it is spent in the exact window where the
+  // edge is disappearing. These are the markets an order is most likely to be sent to next,
+  // so they are the ones worth holding a socket open for.
+  const edgeKal: string[] = [];
+  const edgePm: string[] = [];
+  for (const o of (_cache?.body.opportunities ?? []).slice(0, FEED_EDGE_MARKETS)) {
+    const k = (o.pair.kalshi as { symbol?: string }).symbol;
+    const p = (o.pair.polymarket as { yesTokenId?: string }).yesTokenId;
+    if (k) edgeKal.push(k);
+    if (p) edgePm.push(p);
+  }
+
   // Keep the live feeds pointed at exactly these markets. Polling still runs underneath as
   // the fallback, so a dropped socket costs speed rather than correctness.
   syncLiveFeeds(
-    kalInPlay.map(m => m.symbol ?? '').filter(Boolean),
-    pmInPlay.map(m => m.yesTokenId ?? '').filter(Boolean),
+    [...kalInPlay.map(m => m.symbol ?? '').filter(Boolean), ...edgeKal],
+    [...pmInPlay.map(m => m.yesTokenId ?? '').filter(Boolean), ...edgePm],
   );
 
   if (pmInPlay.length === 0 && kalInPlay.length === 0) return Promise.resolve();
@@ -262,6 +280,10 @@ function repriceInPlay(): Promise<void> {
 // profitable (a handful) and on its own slow cadence — depth is for sizing, not for the
 // abort decision, which re-quotes prices independently at order time.
 const DEPTH_REFRESH_MS = 3_000;
+// How many of the current opportunities to hold live sockets for, on top of everything
+// in play. Bounded well under the feeds' own MAX_TRACKED_MARKETS, and it only ever adds the
+// markets an order might actually be sent to next.
+const FEED_EDGE_MARKETS = 25;
 // Polymarket markets whose live feed is healthy and updated within the last 15s but carries
 // no offer that can fill the venue minimum on EITHER side. Rebuilt on every repricing pass
 // and read by assemble(), so an edge computed from a leftover polled quote never reaches the
@@ -1135,5 +1157,8 @@ export function engineHealth() {
     // Surfaced so a venue-wide outage reads as one banner rather than as a stream of
     // identical per-trade failures.
     polymarket: polymarketPause(),
+    // Age of the cached Kalshi balance. Present means the order path reads it instead of
+    // waiting on a round trip; undefined means every order is paying for one.
+    kalshiBalanceAgeMs: kalshiAuthCacheAgeMs(),
   };
 }
