@@ -278,6 +278,49 @@ const server = createServer((req, res) => {
   });
 });
 
+// An engine is already running more often than not — a second terminal, a previous session
+// that was never stopped, an editor that restarted it. That is an ordinary situation and not
+// a crash, so answer it with what is there and what to do about it. Left to reach the
+// uncaughtException handler below it printed a listen stack trace and then kept the process
+// alive with no server attached, which is the worst of both: it looks broken AND it lingers.
+server.on('error', (err: NodeJS.ErrnoException) => {
+  if (err.code !== 'EADDRINUSE') {
+    console.error('[engine] server error:', err);
+    process.exit(1);
+  }
+  void (async () => {
+    // Ask whoever holds the port who they are, so "already in use" can distinguish a working
+    // engine you should just use from an unrelated process you need to go and find.
+    let who = 'Something that is not an arb engine is holding that port.';
+    try {
+      const res = await fetch(`http://${HOST}:${PORT}/health`, { signal: AbortSignal.timeout(2000) });
+      const h = await res.json() as {
+        matchedPairs?: number; opportunities?: number; tradingEnabled?: boolean;
+      };
+      if (typeof h.matchedPairs === 'number') {
+        who =
+          `An engine is ALREADY RUNNING there and healthy: ${h.matchedPairs} pairs, ` +
+          `${h.opportunities ?? 0} opportunities, trading ${h.tradingEnabled === false ? 'DISABLED' : 'ENABLED'}.
+` +
+          `    Nothing to do — that is the one the UI is talking to.
+` +
+          `    To replace it:  curl -X POST http://${HOST}:${PORT}/shutdown   then run this again.`;
+      }
+    } catch { /* not ours, or not answering — the default line covers it */ }
+    console.error(
+      `
+[engine] port ${PORT} is already in use.
+
+    ${who}
+
+` +
+      `    To run a second engine alongside it:  ARB_ENGINE_PORT=4312 npm run engine
+`,
+    );
+    process.exit(1);
+  })();
+});
+
 // Start listening BEFORE the first build so the UI can connect and render its warming state
 // immediately rather than waiting on a cold discovery.
 server.listen(PORT, HOST, () => {
